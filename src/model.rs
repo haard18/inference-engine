@@ -1,5 +1,6 @@
 use crate::tensor::{apply_rope, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
+use std::mem::size_of;
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -78,6 +79,27 @@ impl Model {
         &self.config
     }
 
+    /// Bytes held by weight values, excluding allocation and model metadata.
+    pub fn stored_weight_bytes(&self) -> usize {
+        let mut total = self.weights.token_embeddings.storage_bytes()
+            + self.weights.final_norm.len() * size_of::<f32>();
+        if let Some(output) = &self.weights.output {
+            total += output.storage_bytes();
+        }
+        for layer in &self.weights.layers {
+            total += layer.attention_norm.len() * size_of::<f32>();
+            total += layer.feed_forward_norm.len() * size_of::<f32>();
+            total += layer.query.storage_bytes();
+            total += layer.key.storage_bytes();
+            total += layer.value.storage_bytes();
+            total += layer.attention_output.storage_bytes();
+            total += layer.gate.storage_bytes();
+            total += layer.up.storage_bytes();
+            total += layer.down.storage_bytes();
+        }
+        total
+    }
+
     pub(crate) fn forward_token(
         &self,
         token_id: usize,
@@ -96,7 +118,7 @@ impl Model {
         let head_size = hidden_size / head_count;
         let kv_size = kv_head_count * head_size;
         let heads_per_kv_head = head_count / kv_head_count;
-        let mut hidden = self.weights.token_embeddings.row(token_id)?.to_vec();
+        let mut hidden = self.weights.token_embeddings.row(token_id)?;
         let mut new_keys = Vec::with_capacity(self.config.num_layers);
         let mut new_values = Vec::with_capacity(self.config.num_layers);
 

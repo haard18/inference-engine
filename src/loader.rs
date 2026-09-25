@@ -171,7 +171,33 @@ fn read_matrix(tensors: &SafeTensors<'_>, name: &str) -> Result<Matrix, LoadErro
             "{name} must have two dimensions, got {shape:?}"
         )));
     }
-    Matrix::new(shape[0], shape[1], read_values(&tensor, name)?).map_err(LoadError::from)
+    let matrix = match tensor.dtype() {
+        Dtype::F32 => Matrix::new(shape[0], shape[1], read_values(&tensor, name)?)?,
+        Dtype::F16 => Matrix::from_f16_bits(shape[0], shape[1], read_half_bits(&tensor, name)?)?,
+        Dtype::BF16 => Matrix::from_bf16_bits(shape[0], shape[1], read_half_bits(&tensor, name)?)?,
+        dtype => {
+            return Err(LoadError::Unsupported(format!(
+                "{name} has numeric type {dtype:?}"
+            )))
+        }
+    };
+    Ok(matrix)
+}
+
+fn read_half_bits(
+    tensor: &safetensors::tensor::TensorView<'_>,
+    name: &str,
+) -> Result<Vec<u16>, LoadError> {
+    let (chunks, remainder) = tensor.data().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(LoadError::InvalidTensor(format!(
+            "{name} has incomplete 16-bit data"
+        )));
+    }
+    Ok(chunks
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
+        .collect())
 }
 
 fn read_vector(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>, LoadError> {

@@ -12,6 +12,10 @@ fn smollm2_matches_independent_numpy_reference() {
         directory.join("model.safetensors"),
     )
     .expect("load SmolLM2-135M");
+    assert!(
+        model.stored_weight_bytes() < 300_000_000,
+        "bf16 weights should stay compact in memory"
+    );
     let mut session = GenerationSession::new(&model);
     session.prefill(&[1, 2, 3]).unwrap();
     let expected = [

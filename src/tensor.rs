@@ -1,29 +1,57 @@
 use crate::EngineError;
+use half::{bf16, f16};
+use std::mem::size_of;
+
+#[derive(Clone, Debug)]
+enum MatrixData {
+    F32(Vec<f32>),
+    F16(Vec<u16>),
+    Bf16(Vec<u16>),
+}
 
 /// A contiguous row-major tensor with two dimensions.
 #[derive(Clone, Debug)]
 pub struct Matrix {
     rows: usize,
     cols: usize,
-    data: Vec<f32>,
+    data: MatrixData,
 }
 
 impl Matrix {
     pub fn new(rows: usize, cols: usize, data: Vec<f32>) -> Result<Self, EngineError> {
-        let expected = rows
-            .checked_mul(cols)
-            .ok_or(EngineError::InvalidConfig("matrix dimensions overflow"))?;
-        if data.len() != expected {
-            return Err(EngineError::InvalidShape {
-                name: "matrix",
-                expected: vec![rows, cols],
-                actual: vec![data.len()],
-            });
-        }
+        validate_length(rows, cols, data.len())?;
         if !data.iter().all(|value| value.is_finite()) {
             return Err(EngineError::InvalidValue("matrix"));
         }
-        Ok(Self { rows, cols, data })
+        Ok(Self {
+            rows,
+            cols,
+            data: MatrixData::F32(data),
+        })
+    }
+
+    pub fn from_f16_bits(rows: usize, cols: usize, data: Vec<u16>) -> Result<Self, EngineError> {
+        validate_length(rows, cols, data.len())?;
+        if !data.iter().all(|&bits| f16::from_bits(bits).is_finite()) {
+            return Err(EngineError::InvalidValue("matrix"));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            data: MatrixData::F16(data),
+        })
+    }
+
+    pub fn from_bf16_bits(rows: usize, cols: usize, data: Vec<u16>) -> Result<Self, EngineError> {
+        validate_length(rows, cols, data.len())?;
+        if !data.iter().all(|&bits| bf16::from_bits(bits).is_finite()) {
+            return Err(EngineError::InvalidValue("matrix"));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            data: MatrixData::Bf16(data),
+        })
     }
 
     pub fn rows(&self) -> usize {
@@ -34,12 +62,30 @@ impl Matrix {
         self.cols
     }
 
-    pub fn row(&self, index: usize) -> Result<&[f32], EngineError> {
+    /// Bytes used by the matrix values, excluding Vec capacity and metadata.
+    pub fn storage_bytes(&self) -> usize {
+        match &self.data {
+            MatrixData::F32(values) => values.len() * size_of::<f32>(),
+            MatrixData::F16(values) | MatrixData::Bf16(values) => values.len() * size_of::<u16>(),
+        }
+    }
+
+    pub fn row(&self, index: usize) -> Result<Vec<f32>, EngineError> {
         if index >= self.rows {
             return Err(EngineError::InvalidToken(index));
         }
         let start = index * self.cols;
-        Ok(&self.data[start..start + self.cols])
+        Ok(match &self.data {
+            MatrixData::F32(values) => values[start..start + self.cols].to_vec(),
+            MatrixData::F16(values) => values[start..start + self.cols]
+                .iter()
+                .map(|&bits| f16::from_bits(bits).to_f32())
+                .collect(),
+            MatrixData::Bf16(values) => values[start..start + self.cols]
+                .iter()
+                .map(|&bits| bf16::from_bits(bits).to_f32())
+                .collect(),
+        })
     }
 
     pub fn mul_vec(&self, input: &[f32]) -> Result<Vec<f32>, EngineError> {
@@ -51,16 +97,54 @@ impl Matrix {
             });
         }
         let mut result = vec![0.0; self.rows];
-        for (row, output) in result.iter_mut().enumerate() {
-            let start = row * self.cols;
-            *output = self.data[start..start + self.cols]
-                .iter()
-                .zip(input)
-                .map(|(weight, value)| weight * value)
-                .sum();
+        if self.cols == 0 {
+            return Ok(result);
+        }
+        match &self.data {
+            MatrixData::F32(values) => {
+                for (output, row) in result.iter_mut().zip(values.chunks_exact(self.cols)) {
+                    *output = row
+                        .iter()
+                        .zip(input)
+                        .map(|(weight, value)| weight * value)
+                        .sum();
+                }
+            }
+            MatrixData::F16(values) => {
+                for (output, row) in result.iter_mut().zip(values.chunks_exact(self.cols)) {
+                    *output = row
+                        .iter()
+                        .zip(input)
+                        .map(|(&bits, value)| f16::from_bits(bits).to_f32() * value)
+                        .sum();
+                }
+            }
+            MatrixData::Bf16(values) => {
+                for (output, row) in result.iter_mut().zip(values.chunks_exact(self.cols)) {
+                    *output = row
+                        .iter()
+                        .zip(input)
+                        .map(|(&bits, value)| bf16::from_bits(bits).to_f32() * value)
+                        .sum();
+                }
+            }
         }
         Ok(result)
     }
+}
+
+fn validate_length(rows: usize, cols: usize, actual: usize) -> Result<(), EngineError> {
+    let expected = rows
+        .checked_mul(cols)
+        .ok_or(EngineError::InvalidConfig("matrix dimensions overflow"))?;
+    if actual != expected {
+        return Err(EngineError::InvalidShape {
+            name: "matrix",
+            expected: vec![rows, cols],
+            actual: vec![actual],
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn rms_norm(

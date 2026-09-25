@@ -1,3 +1,4 @@
+use half::{bf16, f16};
 use inference_engine::{
     EngineError, GenerationSession, LayerWeights, Matrix, Model, ModelConfig, ModelWeights,
 };
@@ -115,4 +116,29 @@ fn mismatched_weights_are_rejected() {
             ..
         })
     ));
+}
+
+#[test]
+fn half_precision_matrices_keep_compact_weights_and_compute_in_f32() {
+    let values = [1.0, -2.0, 0.5, 3.0];
+    let bf16_bits = values
+        .iter()
+        .map(|&value| bf16::from_f32(value).to_bits())
+        .collect();
+    let f16_bits = values
+        .iter()
+        .map(|&value| f16::from_f32(value).to_bits())
+        .collect();
+    for matrix in [
+        Matrix::from_bf16_bits(2, 2, bf16_bits).unwrap(),
+        Matrix::from_f16_bits(2, 2, f16_bits).unwrap(),
+    ] {
+        assert_eq!(matrix.storage_bytes(), 8);
+        assert_eq!(matrix.row(1).unwrap(), [0.5, 3.0]);
+        assert_eq!(matrix.mul_vec(&[2.0, 1.0]).unwrap(), [0.0, 4.0]);
+    }
+    assert_eq!(
+        Matrix::from_bf16_bits(1, 1, vec![bf16::NAN.to_bits()]).unwrap_err(),
+        EngineError::InvalidValue("matrix")
+    );
 }

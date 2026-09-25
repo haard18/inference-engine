@@ -28,6 +28,12 @@ Build the model execution core before device pooling. The core must produce corr
 - [x] Run a text prompt through an existing tokenizer, then a project-owned tokenizer.
 - [x] Compare real-model next-token scores and token choice with an independent NumPy reference.
 
+## Compact-weight layer
+
+- [x] Retain f16 and bf16 matrix weights without expanding them to f32 at load time.
+- [x] Preserve real-model numerical parity and measure the memory change.
+- [ ] Reduce load-time file buffering, then add quantized execution and Metal.
+
 ## Risks
 
 - Floating-point operation order can cause small differences. Record tolerances and compare intermediate outputs when needed.

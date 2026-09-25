@@ -6,7 +6,7 @@ A Rust inference engine for language models on user-owned devices. The engine lo
 
 - **Engine library:** Tensor storage, CPU operations, a direct Llama-style model executor, a per-request KV cache, and token selection.
 - **Model input:** Safetensors and its separate configuration first. GGUF and quantized weights follow as additional input and execution layers. A project-owned byte-level BPE tokenizer handles the first real model.
-- **Device backends:** A 32-bit CPU path checks numerical correctness. Metal and 16-bit execution add Mac GPU support. Quantized execution supports compact models.
+- **Device backends:** A 32-bit CPU path checks numerical correctness. CPU execution can keep f16 or bf16 matrix weights compact while accumulating in f32. Metal and quantized execution are additional layers.
 - **Serving:** A per-device server exposes an authenticated, streaming chat API. It limits queues and memory use and reports overload clearly.
 - **Device pool:** An owner pairs devices explicitly. A coordinator routes whole requests to capable devices and handles device loss. Reusable conversation state and model splitting are additional layers.
 
@@ -14,7 +14,7 @@ The first real checkpoint target is SmolLM2-135M. We will carry one model family
 
 ## Current milestone
 
-The Rust library runs a Llama-style decoder on the CPU. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, greedy token selection, and a byte-level BPE tokenizer for the supported SmolLM2 layout. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. The loader converts weights to f32 in memory. The command-line probes accept token IDs or text.
+The Rust library runs a Llama-style decoder on the CPU. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, greedy token selection, and a byte-level BPE tokenizer for the supported SmolLM2 layout. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. Matrix weights retain their source precision in memory, while activations and accumulations use f32. The command-line probes accept token IDs or text.
 
 The small fixed-weight fixture and the real SmolLM2-135M checkpoint each have an independent NumPy reference. The real-model test compares next-token scores within `1e-3` and checks the selected token. The checkpoint test is opt-in because it needs the model files.
 
@@ -38,4 +38,4 @@ cargo run --release --bin text-probe -- \
   "The capital of France is" 8
 ```
 
-The current decoder is a correctness baseline, not a production serving runtime. It uses f32 CPU calculations, greedy token selection, and one supported model and tokenizer layout. The next engine layers add more execution modes, GGUF, and Metal. Serving and device pooling build on this library.
+The current decoder is a correctness baseline, not a production serving runtime. It uses f32 CPU calculations, greedy token selection, and one supported model and tokenizer layout. On one Apple Silicon Mac, the one-token SmolLM2 probe used 543 MB peak resident memory with compact bf16 matrix weights, compared with 812 MB when the loader expanded those matrices to f32. This is a local measurement, not a device-wide guarantee. The loader still reads the whole Safetensors file during startup. The next engine layers add quantized execution, GGUF, and Metal. Serving and device pooling build on this library.
