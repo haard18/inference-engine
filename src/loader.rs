@@ -1,9 +1,12 @@
 use std::fmt;
 use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use half::{bf16, f16};
-use safetensors::{Dtype, SafeTensors};
+use safetensors::tensor::{Metadata, TensorView};
+use safetensors::{Dtype, SafeTensorError};
 use serde::Deserialize;
 
 use crate::{EngineError, LayerWeights, Matrix, Model, ModelConfig, ModelWeights};
@@ -90,7 +93,7 @@ struct LlamaConfig {
 }
 
 /// Load a Llama-style model from a configuration file and Safetensors weights.
-/// The first implementation converts weights to f32 and holds them in memory.
+/// Matrix weights keep their source precision. Tensor payloads are read one at a time.
 pub fn load_safetensors(
     config_path: impl AsRef<Path>,
     weights_path: impl AsRef<Path>,
@@ -130,41 +133,127 @@ pub fn load_safetensors(
         rms_norm_epsilon: config.rms_norm_eps,
         rope_theta: config.rope_theta,
     };
-    let bytes = fs::read(weights_path)?;
-    let tensors = SafeTensors::deserialize(&bytes)?;
+    let mut tensors = TensorArchive::new(File::open(weights_path)?)?;
     let mut layers = Vec::with_capacity(engine_config.num_layers);
     for index in 0..engine_config.num_layers {
         let prefix = format!("model.layers.{index}");
         layers.push(LayerWeights {
-            attention_norm: read_vector(&tensors, &format!("{prefix}.input_layernorm.weight"))?,
-            query: read_matrix(&tensors, &format!("{prefix}.self_attn.q_proj.weight"))?,
-            key: read_matrix(&tensors, &format!("{prefix}.self_attn.k_proj.weight"))?,
-            value: read_matrix(&tensors, &format!("{prefix}.self_attn.v_proj.weight"))?,
-            attention_output: read_matrix(&tensors, &format!("{prefix}.self_attn.o_proj.weight"))?,
+            attention_norm: read_vector(&mut tensors, &format!("{prefix}.input_layernorm.weight"))?,
+            query: read_matrix(&mut tensors, &format!("{prefix}.self_attn.q_proj.weight"))?,
+            key: read_matrix(&mut tensors, &format!("{prefix}.self_attn.k_proj.weight"))?,
+            value: read_matrix(&mut tensors, &format!("{prefix}.self_attn.v_proj.weight"))?,
+            attention_output: read_matrix(
+                &mut tensors,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+            )?,
             feed_forward_norm: read_vector(
-                &tensors,
+                &mut tensors,
                 &format!("{prefix}.post_attention_layernorm.weight"),
             )?,
-            gate: read_matrix(&tensors, &format!("{prefix}.mlp.gate_proj.weight"))?,
-            up: read_matrix(&tensors, &format!("{prefix}.mlp.up_proj.weight"))?,
-            down: read_matrix(&tensors, &format!("{prefix}.mlp.down_proj.weight"))?,
+            gate: read_matrix(&mut tensors, &format!("{prefix}.mlp.gate_proj.weight"))?,
+            up: read_matrix(&mut tensors, &format!("{prefix}.mlp.up_proj.weight"))?,
+            down: read_matrix(&mut tensors, &format!("{prefix}.mlp.down_proj.weight"))?,
         });
     }
     let weights = ModelWeights {
-        token_embeddings: read_matrix(&tensors, "model.embed_tokens.weight")?,
+        token_embeddings: read_matrix(&mut tensors, "model.embed_tokens.weight")?,
         layers,
-        final_norm: read_vector(&tensors, "model.norm.weight")?,
+        final_norm: read_vector(&mut tensors, "model.norm.weight")?,
         output: if config.tie_word_embeddings {
             None
         } else {
-            Some(read_matrix(&tensors, "lm_head.weight")?)
+            Some(read_matrix(&mut tensors, "lm_head.weight")?)
         },
     };
     Model::new(engine_config, weights).map_err(LoadError::from)
 }
 
-fn read_matrix(tensors: &SafeTensors<'_>, name: &str) -> Result<Matrix, LoadError> {
-    let tensor = tensors.tensor(name)?;
+const MAX_HEADER_SIZE: u64 = 100_000_000;
+
+struct TensorArchive<R> {
+    source: R,
+    metadata: Metadata,
+    data_start: u64,
+}
+
+struct OwnedTensor {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    data: Vec<u8>,
+}
+
+impl OwnedTensor {
+    fn view(&self) -> Result<TensorView<'_>, LoadError> {
+        TensorView::new(self.dtype, self.shape.clone(), &self.data).map_err(LoadError::from)
+    }
+}
+
+impl<R: Read + Seek> TensorArchive<R> {
+    fn new(mut source: R) -> Result<Self, LoadError> {
+        let file_len = source.seek(SeekFrom::End(0))?;
+        if file_len < 8 {
+            return Err(SafeTensorError::HeaderTooSmall.into());
+        }
+        source.rewind()?;
+        let mut header_size_bytes = [0; 8];
+        source.read_exact(&mut header_size_bytes)?;
+        let header_size = u64::from_le_bytes(header_size_bytes);
+        if header_size > MAX_HEADER_SIZE {
+            return Err(SafeTensorError::HeaderTooLarge.into());
+        }
+        let data_start = header_size
+            .checked_add(8)
+            .ok_or(SafeTensorError::InvalidHeaderLength)?;
+        if data_start > file_len {
+            return Err(SafeTensorError::InvalidHeaderLength.into());
+        }
+        let mut header = vec![0; header_size as usize];
+        source.read_exact(&mut header)?;
+        if header.first() != Some(&b'{') {
+            return Err(SafeTensorError::InvalidHeaderLength.into());
+        }
+        let metadata: Metadata = serde_json::from_slice(&header)
+            .map_err(SafeTensorError::InvalidHeaderDeserialization)?;
+        let expected_len = data_start
+            .checked_add(metadata.data_len() as u64)
+            .ok_or(SafeTensorError::ValidationOverflow)?;
+        if expected_len != file_len {
+            return Err(SafeTensorError::MetadataIncompleteBuffer.into());
+        }
+        Ok(Self {
+            source,
+            metadata,
+            data_start,
+        })
+    }
+
+    fn tensor(&mut self, name: &str) -> Result<OwnedTensor, LoadError> {
+        let info = self
+            .metadata
+            .info(name)
+            .ok_or_else(|| SafeTensorError::TensorNotFound(name.to_owned()))?;
+        let (start, end) = info.data_offsets;
+        let offset = self
+            .data_start
+            .checked_add(start as u64)
+            .ok_or(SafeTensorError::ValidationOverflow)?;
+        self.source.seek(SeekFrom::Start(offset))?;
+        let mut data = vec![0; end - start];
+        self.source.read_exact(&mut data)?;
+        Ok(OwnedTensor {
+            dtype: info.dtype,
+            shape: info.shape.clone(),
+            data,
+        })
+    }
+}
+
+fn read_matrix<R: Read + Seek>(
+    tensors: &mut TensorArchive<R>,
+    name: &str,
+) -> Result<Matrix, LoadError> {
+    let owned = tensors.tensor(name)?;
+    let tensor = owned.view()?;
     let shape = tensor.shape();
     if shape.len() != 2 {
         return Err(LoadError::InvalidTensor(format!(
@@ -200,8 +289,12 @@ fn read_half_bits(
         .collect())
 }
 
-fn read_vector(tensors: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>, LoadError> {
-    let tensor = tensors.tensor(name)?;
+fn read_vector<R: Read + Seek>(
+    tensors: &mut TensorArchive<R>,
+    name: &str,
+) -> Result<Vec<f32>, LoadError> {
+    let owned = tensors.tensor(name)?;
+    let tensor = owned.view()?;
     if tensor.shape().len() != 1 {
         return Err(LoadError::InvalidTensor(format!(
             "{name} must have one dimension, got {:?}",
@@ -260,4 +353,65 @@ fn read_values(
         }
     };
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::{LoadError, TensorArchive};
+    use safetensors::SafeTensorError;
+
+    fn file(header: &str, data: &[u8]) -> Vec<u8> {
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    #[test]
+    fn reads_a_tensor_from_a_valid_archive() {
+        let bytes = file(
+            r#"{"weight":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#,
+            &[0, 0, 0, 0],
+        );
+        let mut archive = TensorArchive::new(Cursor::new(bytes)).unwrap();
+        let tensor = archive.tensor("weight").unwrap();
+        assert_eq!(tensor.shape, [2]);
+        assert_eq!(tensor.data, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rejects_overlapping_or_incomplete_tensor_data() {
+        let overlap = file(
+            r#"{"a":{"dtype":"F16","shape":[2],"data_offsets":[0,4]},"b":{"dtype":"F16","shape":[2],"data_offsets":[2,6]}}"#,
+            &[0; 6],
+        );
+        assert!(matches!(
+            TensorArchive::new(Cursor::new(overlap)),
+            Err(LoadError::Safetensors(
+                SafeTensorError::InvalidHeaderDeserialization(_)
+            ))
+        ));
+
+        let incomplete = file(
+            r#"{"weight":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#,
+            &[0; 3],
+        );
+        assert!(matches!(
+            TensorArchive::new(Cursor::new(incomplete)),
+            Err(LoadError::Safetensors(
+                SafeTensorError::MetadataIncompleteBuffer
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_header_before_allocating_it() {
+        let bytes = (100_000_001_u64).to_le_bytes();
+        assert!(matches!(
+            TensorArchive::new(Cursor::new(bytes)),
+            Err(LoadError::Safetensors(SafeTensorError::HeaderTooLarge))
+        ));
+    }
 }

@@ -10,9 +10,11 @@
 - [Real checkpoint parity](learnings/2026-09-26-reference-parity.md)
 - [Tokenizer parity](learnings/2026-09-26-tokenizer-parity.md)
 - [Compact weights](learnings/2026-09-26-compact-weights.md)
+- [Per-tensor loading](learnings/2026-09-26-per-tensor-loading.md)
 
 ## Reviews
 
 - [Engine foundation review](reviews/2026-09-26-engine-foundation.md)
 - [Tokenizer review](reviews/2026-09-26-tokenizer.md)
 - [Compact weights review](reviews/2026-09-26-compact-weights.md)
+- [Per-tensor loading review](reviews/2026-09-26-per-tensor-loading.md)
