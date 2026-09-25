@@ -1,0 +1,40 @@
+# Inference Engine
+
+A Rust inference engine for language models on user-owned devices. The engine loads weights, runs model calculations, and generates tokens on one device. A server and a device pool will use the engine as their foundation.
+
+## Architecture
+
+- **Engine library:** Tensor storage, CPU operations, a direct Llama-style model executor, a per-request KV cache, and token selection.
+- **Model input:** Safetensors and its separate configuration first. GGUF and quantized weights follow as additional input and execution layers. An existing tokenizer helps validate the first real model. We will then implement a compatible tokenizer.
+- **Device backends:** A 32-bit CPU path checks numerical correctness. Metal and 16-bit execution add Mac GPU support. Quantized execution supports compact models.
+- **Serving:** A per-device server exposes an authenticated, streaming chat API. It limits queues and memory use and reports overload clearly.
+- **Device pool:** An owner pairs devices explicitly. A coordinator routes whole requests to capable devices and handles device loss. Reusable conversation state and model splitting are additional layers.
+
+The first real checkpoint target is SmolLM2-135M. We will carry one model family through the engine and serving layers before adding another family. llama.cpp is a reference and benchmark, not the implementation blueprint. We will measure performance and reliability before making comparative claims.
+
+## Current milestone
+
+The Rust library runs a Llama-style decoder on the CPU. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, and greedy token selection. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. The loader converts weights to f32 in memory. The command-line probes accept token IDs or text through an existing tokenizer.
+
+The small fixed-weight fixture and the real SmolLM2-135M checkpoint each have an independent NumPy reference. The real-model test compares next-token scores within `1e-3` and checks the selected token. The checkpoint test is opt-in because it needs the model files.
+
+Run the checks after installing Rust:
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+Download `config.json`, `model.safetensors`, and `tokenizer.json` from the [SmolLM2-135M checkpoint](https://huggingface.co/HuggingFaceTB/SmolLM2-135M/tree/main) into one directory. Then run the model comparison and a text prompt:
+
+```sh
+SMOLLM2_DIR=/path/to/SmolLM2-135M cargo test --release --test real_model -- --ignored
+cargo run --release --bin text-probe -- \
+  /path/to/SmolLM2-135M/config.json \
+  /path/to/SmolLM2-135M/model.safetensors \
+  /path/to/SmolLM2-135M/tokenizer.json \
+  "The capital of France is" 8
+```
+
+The current decoder is a correctness baseline, not a production serving runtime. It uses f32 CPU calculations, greedy token selection, and one supported model layout. The next engine layers add a project-owned tokenizer, more execution modes, GGUF, and Metal. Serving and device pooling build on this library.
