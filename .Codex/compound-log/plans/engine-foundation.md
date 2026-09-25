@@ -10,7 +10,7 @@ Build the model execution core before device pooling. The core must produce corr
 - Direct Llama-style executor with reusable tensor operations.
 - CPU path first, then Metal. Validate 32-bit results before 16-bit and quantized execution.
 - Safetensors plus model configuration first, then GGUF.
-- Existing tokenizer for initial model validation, then a compatible tokenizer owned by this project.
+- A project-owned tokenizer, checked against an existing implementation for the first model.
 - SmolLM2-135M as the first real checkpoint.
 - A per-request generation session owns its KV cache and emits tokens incrementally.
 
@@ -25,7 +25,7 @@ Build the model execution core before device pooling. The core must produce corr
 
 - [x] Read SmolLM2-135M weights and configuration from Safetensors and JSON.
 - [x] Validate tensor names, shapes, and numeric types.
-- [x] Run a text prompt through an existing tokenizer.
+- [x] Run a text prompt through an existing tokenizer, then a project-owned tokenizer.
 - [x] Compare real-model next-token scores and token choice with an independent NumPy reference.
 
 ## Risks

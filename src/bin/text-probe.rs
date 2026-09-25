@@ -2,8 +2,7 @@ use std::env;
 use std::error::Error;
 use std::process;
 
-use inference_engine::{load_safetensors, GenerationSession};
-use tokenizers::Tokenizer;
+use inference_engine::{load_safetensors, ByteBpeTokenizer, GenerationSession};
 
 fn main() {
     if let Err(error) = run() {
@@ -21,9 +20,12 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .into());
     }
-    let tokenizer = Tokenizer::from_file(&args[3])?;
-    let encoding = tokenizer.encode(args[4].as_str(), true)?;
-    let prompt_tokens: Vec<usize> = encoding.get_ids().iter().map(|&id| id as usize).collect();
+    let tokenizer = ByteBpeTokenizer::from_file(&args[3])?;
+    let prompt_tokens: Vec<usize> = tokenizer
+        .encode(&args[4])?
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
     let model = load_safetensors(&args[1], &args[2])?;
     let count: usize = args[5].parse()?;
     let mut session = GenerationSession::new(&model);
