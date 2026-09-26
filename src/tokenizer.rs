@@ -114,6 +114,63 @@ pub struct ByteBpeTokenizer {
     pattern: Regex,
 }
 
+/// Decode tokens as UTF-8 text without emitting incomplete characters.
+pub struct ByteBpeDecoder {
+    pending: Vec<u8>,
+}
+
+impl Default for ByteBpeDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ByteBpeDecoder {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    pub fn push(
+        &mut self,
+        tokenizer: &ByteBpeTokenizer,
+        id: u32,
+    ) -> Result<String, TokenizerError> {
+        self.pending.extend(tokenizer.decode_bytes(&[id], true)?);
+        let mut output = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    output.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    output.push_str(
+                        std::str::from_utf8(&self.pending[..valid])
+                            .expect("UTF-8 parser identified a valid prefix"),
+                    );
+                    self.pending.drain(..valid);
+                    match error.error_len() {
+                        Some(length) => {
+                            output.push('\u{fffd}');
+                            self.pending.drain(..length);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn finish(self) -> String {
+        String::from_utf8_lossy(&self.pending).into_owned()
+    }
+}
+
 impl ByteBpeTokenizer {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, TokenizerError> {
         let spec: TokenizerSpec = serde_json::from_slice(&fs::read(path)?)?;
@@ -268,7 +325,25 @@ impl ByteBpeTokenizer {
         Ok(result)
     }
 
+    /// Encode user text without interpreting special-token spellings as control tokens.
+    pub fn encode_plain_text(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
+        let mut result = Vec::new();
+        self.encode_plain(text, &mut result)?;
+        Ok(result)
+    }
+
+    pub fn special_token_id(&self, content: &str) -> Option<u32> {
+        self.special
+            .iter()
+            .find(|(token, _)| token == content)
+            .map(|(_, id)| *id)
+    }
+
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> Result<String, TokenizerError> {
+        Ok(String::from_utf8_lossy(&self.decode_bytes(ids, skip_special)?).into_owned())
+    }
+
+    pub fn decode_bytes(&self, ids: &[u32], skip_special: bool) -> Result<Vec<u8>, TokenizerError> {
         let mut bytes = Vec::new();
         for &id in ids {
             let piece = self
@@ -291,7 +366,7 @@ impl ByteBpeTokenizer {
                 bytes.push(byte);
             }
         }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(bytes)
     }
 
     fn encode_plain(&self, text: &str, result: &mut Vec<u32>) -> Result<(), TokenizerError> {

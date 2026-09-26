@@ -79,11 +79,15 @@ impl<'a> GenerationSession<'a> {
     }
 
     pub fn next_token(&mut self) -> Result<usize, EngineError> {
+        let token = self.selected_token()?;
+        self.advance(token)?;
+        Ok(token)
+    }
+
+    /// Select a token from the current scores without running the next model step.
+    pub fn selected_token(&self) -> Result<usize, EngineError> {
         let logits = self.next_logits.as_ref().ok_or(EngineError::EmptyPrompt)?;
-        if self.cache.position() >= self.model.config().max_positions {
-            return Err(EngineError::ContextFull);
-        }
-        let token = logits
+        logits
             .iter()
             .enumerate()
             .reduce(|best, candidate| {
@@ -94,9 +98,16 @@ impl<'a> GenerationSession<'a> {
                 }
             })
             .map(|(index, _)| index)
-            .ok_or(EngineError::InvalidConfig("model has an empty vocabulary"))?;
+            .ok_or(EngineError::InvalidConfig("model has an empty vocabulary"))
+    }
+
+    /// Add a selected token to the context so that another token can be selected.
+    pub fn advance(&mut self, token: usize) -> Result<(), EngineError> {
+        if self.cache.position() >= self.model.config().max_positions {
+            return Err(EngineError::ContextFull);
+        }
         self.next_logits = Some(self.forward_token(token)?);
-        Ok(token)
+        Ok(())
     }
 
     pub fn next_token_scores(&self) -> Option<&[f32]> {

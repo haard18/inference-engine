@@ -204,6 +204,7 @@ fn full_context_returns_clear_error() {
     let model = model(3);
     let mut session = GenerationSession::new(&model);
     session.prefill(&[1, 2, 3]).unwrap();
+    assert!(session.selected_token().is_ok());
     assert_eq!(session.next_token(), Err(EngineError::ContextFull));
 }
 

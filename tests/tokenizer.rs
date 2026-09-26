@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use inference_engine::{load_gguf_tokenizer, ByteBpeTokenizer};
+use inference_engine::{load_gguf_tokenizer, ByteBpeDecoder, ByteBpeTokenizer};
 use tokenizers::Tokenizer;
 
 #[test]
@@ -88,6 +88,31 @@ fn smollm2_gguf_tokenizer_matches_json_and_reference() {
             .collect::<String>();
         assert_eq!(gguf.encode(&prompt).unwrap(), json.encode(&prompt).unwrap());
         compare(&gguf, &reference, &prompt);
+    }
+}
+
+#[test]
+#[ignore = "requires SmolLM2-135M tokenizer.json in SMOLLM2_DIR"]
+fn streaming_decode_waits_for_complete_utf8_and_keeps_user_text_plain() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let tokenizer = ByteBpeTokenizer::from_file(directory.join("tokenizer.json")).unwrap();
+    let marker = "<|im_start|>";
+    let special = tokenizer.special_token_id(marker).unwrap();
+    assert_eq!(tokenizer.encode(marker).unwrap(), [special]);
+    assert!(!tokenizer
+        .encode_plain_text(marker)
+        .unwrap()
+        .contains(&special));
+    for text in ["é café 東京 😀", "hello\nworld", "a<|im_start|>b"] {
+        let ids = tokenizer.encode_plain_text(text).unwrap();
+        let mut decoder = ByteBpeDecoder::new();
+        let mut output = String::new();
+        for id in ids {
+            output.push_str(&decoder.push(&tokenizer, id).unwrap());
+            assert!(!output.contains('\u{fffd}'));
+        }
+        output.push_str(&decoder.finish());
+        assert_eq!(output, text);
     }
 }
 

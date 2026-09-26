@@ -3,6 +3,7 @@
 ## Plans
 
 - [Engine foundation](plans/engine-foundation.md)
+- [Per-device serving](plans/per-device-serving.md)
 
 ## Learnings
 
@@ -15,6 +16,7 @@
 - [Tokenization from GGUF](learnings/2026-09-26-gguf-tokenizer.md)
 - [Mixed Q4_K_M checkpoint](learnings/2026-09-26-q4-k-m.md)
 - [Metal matrix execution](learnings/2026-09-26-metal-parity.md)
+- [Local serving](learnings/2026-09-26-local-serving.md)
 
 ## Reviews
 
@@ -26,3 +28,4 @@
 - [GGUF tokenizer review](reviews/2026-09-26-gguf-tokenizer.md)
 - [Q4_K_M review](reviews/2026-09-26-q4-k-m.md)
 - [Metal review](reviews/2026-09-26-metal.md)
+- [Local serving review](reviews/2026-09-26-local-serving.md)

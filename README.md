@@ -14,7 +14,7 @@ The first real checkpoint target is SmolLM2-135M. We will carry one model family
 
 ## Current milestone
 
-The Rust library runs a Llama-style decoder on the CPU, with an optional Metal path for matrix operations on Macs. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, greedy token selection, and a byte-level BPE tokenizer for the supported SmolLM2 layout. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. It also loads the supported Llama-style GGUF layout with Q8_0 or mixed Q4_K_M matrices, interleaved rotary positions, and tokenizer metadata. Matrix weights retain their source precision in CPU memory, while activations and accumulations use f32. The command-line probes accept token IDs or text.
+The Rust library runs a Llama-style decoder on the CPU, with an optional Metal path for matrix operations on Macs. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, greedy token selection, and a byte-level BPE tokenizer for the supported SmolLM2 layout. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. It also loads the supported Llama-style GGUF layout with Q8_0 or mixed Q4_K_M matrices, interleaved rotary positions, and tokenizer metadata. Matrix weights retain their source precision in CPU memory, while activations and accumulations use f32. The command-line probes accept token IDs or text. A local server now offers an authenticated subset of the OpenAI chat completion API with ordinary and streaming responses.
 
 The small fixed-weight fixture, the real SmolLM2-135M Safetensors checkpoint, and its Q8_0 and Q4_K_M GGUF variants each have an independent NumPy reference. The real-model tests compare next-token scores within `1e-3` and check the selected token. The checkpoint tests are opt-in because they need the model files.
 
@@ -49,4 +49,23 @@ cargo run --release --bin gguf-probe -- \
 # On macOS, add --metal before the model path to use the GPU matrix path.
 ```
 
-The current decoder is a correctness baseline, not a production serving runtime. It uses f32 activations, greedy token selection, and one supported model and tokenizer layout. The loader validates the Safetensors header and reads tensor payloads one at a time. On one Apple Silicon Mac, the same one-token text prompt used 120 MB peak resident memory with Q4_K_M GGUF, 162 MB with Q8_0 GGUF, and 358 MB with the bf16 Safetensors checkpoint. The Metal runtime currently keeps CPU weights as well as uploaded GPU weights. One local eight-token Q4_K_M run took 1.20 seconds and 235 MB peak resident memory with Metal, compared with 0.78 seconds and 122 MB on the CPU. These are single local measurements; quantization can change model scores and output quality. GPU-resident attention, lower synchronization cost, serving, and device pooling remain open layers.
+To run the server on the same device, set a secret with at least 32 visible characters and start it with a GGUF model:
+
+```sh
+export INFERENCE_API_KEY="$(openssl rand -hex 32)"
+cargo run --release --bin serve -- /path/to/SmolLM2-135M-Q4_K_M.gguf 8080
+# On macOS, add --metal before the model path to use the GPU matrix path.
+```
+
+The server listens on `127.0.0.1` only. Send a chat request from another terminal:
+
+```sh
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $INFERENCE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"local-smollm2","messages":[{"role":"user","content":"Say hello"}],"max_completion_tokens":32,"stream":true}'
+```
+
+The API supports string chat messages, one choice, and greedy decoding. It rejects other settings explicitly. One worker runs model calculations, up to four requests wait in the queue, and a full queue returns HTTP 429. The server limits request bodies to 64 KiB and completion length to 256 tokens. It requires a Bearer token for model and chat routes. The health route is public. This is a local serving layer; paired-device access, transport encryption, recovery after device loss, and model splitting are still planned layers.
+
+The current decoder is a correctness baseline. It uses f32 activations, greedy token selection, and one supported model and tokenizer layout. The loader validates the Safetensors header and reads tensor payloads one at a time. On one Apple Silicon Mac, the same one-token text prompt used 120 MB peak resident memory with Q4_K_M GGUF, 162 MB with Q8_0 GGUF, and 358 MB with the bf16 Safetensors checkpoint. The Metal runtime currently keeps CPU weights as well as uploaded GPU weights. One local eight-token Q4_K_M run took 1.20 seconds and 235 MB peak resident memory with Metal, compared with 0.78 seconds and 122 MB on the CPU. These are single local measurements; quantization can change model scores and output quality. GPU-resident attention and lower synchronization cost remain open layers.

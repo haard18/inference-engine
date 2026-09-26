@@ -6,6 +6,7 @@ mod metal_backend;
 #[cfg(target_os = "macos")]
 pub use metal_backend::MetalRuntime;
 mod model;
+pub mod serving;
 mod session;
 mod tensor;
 mod tokenizer;
@@ -16,4 +17,4 @@ pub use loader::{load_safetensors, LoadError};
 pub use model::{LayerWeights, Model, ModelConfig, ModelWeights};
 pub use session::GenerationSession;
 pub use tensor::Matrix;
-pub use tokenizer::{ByteBpeTokenizer, TokenizerError};
+pub use tokenizer::{ByteBpeDecoder, ByteBpeTokenizer, TokenizerError};
