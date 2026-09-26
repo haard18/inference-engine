@@ -59,6 +59,7 @@
 - [Metal worker memory under load](learnings/2026-09-26-metal-worker-memory.md)
 - [Varied conversation parity](learnings/2026-09-26-varied-conversations.md)
 - [Peer return after loss](learnings/2026-09-26-peer-return.md)
+- [Exact model identity in a pool](learnings/2026-09-26-model-identity.md)
 
 ## Reviews
 

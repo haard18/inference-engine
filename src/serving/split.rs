@@ -83,6 +83,7 @@ pub async fn start_split_prefix(
         device_id,
         session_reuse: true,
         model_id: config.model_id,
+        model_digest: ready.model_digest.clone(),
         api_key: config.api_key.into_bytes(),
         tokenizer: Arc::clone(&tokenizer),
         max_positions: ready.max_positions,

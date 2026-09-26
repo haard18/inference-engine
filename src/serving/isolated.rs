@@ -35,6 +35,7 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 enum WireEvent {
     Ready {
         max_positions: usize,
+        model_digest: String,
     },
     Delta {
         text: String,
@@ -127,15 +128,17 @@ async fn start_isolated_state(
         .map_err(|error| ServingError::Worker(format!("model path: {error}")))?;
     let executable = fs::canonicalize(executable)
         .map_err(|error| ServingError::Worker(format!("worker executable: {error}")))?;
-    let (child, max_positions) = spawn_child(&executable, &model_path, config.backend)
-        .await
-        .map_err(ServingError::Worker)?;
+    let (child, max_positions, model_digest) =
+        spawn_child(&executable, &model_path, config.backend)
+            .await
+            .map_err(ServingError::Worker)?;
     let (sender, receiver) = mpsc::channel(config.queue_capacity);
     let worker_status = Arc::new(WorkerStatus::default());
     let state = Arc::new(AppState {
         device_id: device_id.unwrap_or_else(Uuid::new_v4),
         session_reuse: true,
         model_id: config.model_id,
+        model_digest: model_digest.clone(),
         api_key: config.api_key.into_bytes(),
         tokenizer: Arc::new(tokenizer),
         max_positions,
@@ -153,6 +156,7 @@ async fn start_isolated_state(
         executable,
         model_path,
         config.backend,
+        model_digest,
     ));
     Ok((state, task))
 }
@@ -161,7 +165,7 @@ async fn spawn_child(
     executable: &Path,
     model_path: &Path,
     backend: ServingBackend,
-) -> Result<(ChildWorker, usize), String> {
+) -> Result<(ChildWorker, usize, String), String> {
     let mut command = Command::new(executable);
     command
         .arg("--internal-worker")
@@ -179,9 +183,17 @@ async fn spawn_child(
     let stdout = child.stdout.take().ok_or("worker stdout is unavailable")?;
     let mut lines = BufReader::new(stdout).lines();
     let ready = tokio::time::timeout(STARTUP_TIMEOUT, lines.next_line()).await;
-    let max_positions = match ready {
+    let (max_positions, model_digest) = match ready {
         Ok(Ok(Some(line))) => match serde_json::from_str::<WireEvent>(&line) {
-            Ok(WireEvent::Ready { max_positions }) if max_positions > 0 => max_positions,
+            Ok(WireEvent::Ready {
+                max_positions,
+                model_digest,
+            }) if max_positions > 0
+                && model_digest.len() == 64
+                && hex::decode(&model_digest).is_ok() =>
+            {
+                (max_positions, model_digest)
+            }
             _ => {
                 let _ = child.kill().await;
                 return Err("worker sent an invalid startup response".into());
@@ -207,6 +219,7 @@ async fn spawn_child(
             lines,
         },
         max_positions,
+        model_digest,
     ))
 }
 
@@ -217,6 +230,7 @@ async fn supervise(
     executable: PathBuf,
     model_path: PathBuf,
     backend: ServingBackend,
+    model_digest: String,
 ) {
     let mut worker = Some(first_child);
     loop {
@@ -225,9 +239,14 @@ async fn supervise(
                 break;
             }
             match spawn_child(&executable, &model_path, backend).await {
-                Ok((child, _)) => {
+                Ok((child, _, digest)) if digest == model_digest => {
                     worker = Some(child);
                     status.set_unavailable(false);
+                }
+                Ok((_, _, _)) => {
+                    status.set_unavailable(true);
+                    tokio::time::sleep(RESTART_DELAY).await;
+                    continue;
                 }
                 Err(_) => {
                     status.set_unavailable(true);
@@ -408,6 +427,7 @@ pub fn run_worker_stdio(
         &mut output,
         &WireEvent::Ready {
             max_positions: model.config().max_positions,
+            model_digest: hex::encode(crate::gguf::digest_file(&model_path)?),
         },
     )?;
     let mut sessions = SessionCache::new();
@@ -583,7 +603,7 @@ mod tests {
             &script,
             r#"#!/bin/sh
 model_dir="$2"
-printf '%s\n' '{"kind":"ready","max_positions":2048}'
+printf '%s\n' '{"kind":"ready","max_positions":2048,"model_digest":"0707070707070707070707070707070707070707070707070707070707070707"}'
 while IFS= read -r request; do
   if [ ! -f "$model_dir/seen" ]; then
     : > "$model_dir/seen"
@@ -654,6 +674,68 @@ done
             recovered_after_exit,
             "server did not recover after worker exit"
         );
+        drop(app);
+        tokio::time::timeout(Duration::from_secs(3), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_with_different_model_digest_stays_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("fake-worker");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+model_dir="$2"
+if [ -f "$model_dir/switched" ]; then
+  : > "$model_dir/replacement"
+  printf '%s\n' '{"kind":"ready","max_positions":2048,"model_digest":"0808080808080808080808080808080808080808080808080808080808080808"}'
+  exec sleep 60
+fi
+printf '%s\n' '{"kind":"ready","max_positions":2048,"model_digest":"0707070707070707070707070707070707070707070707070707070707070707"}'
+: > "$model_dir/switched"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let (app, supervisor) = start_isolated(
+            directory.path(),
+            test_tokenizer(),
+            ServingConfig {
+                model_id: "local-smollm2".into(),
+                api_key: "test-only-key-with-at-least-32-characters".into(),
+                queue_capacity: 1,
+                max_completion_tokens: 4,
+                request_timeout: Duration::from_secs(1),
+                backend: ServingBackend::Cpu,
+            },
+            &script,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while !directory.path().join("replacement").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("replacement worker was not started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = app.clone().oneshot(chat_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         drop(app);
         tokio::time::timeout(Duration::from_secs(3), supervisor)
             .await

@@ -14,6 +14,7 @@ use inference_engine::serving::{
     start_isolated_paired, ServingBackend, ServingConfig, CONVERSATION_HEADER,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -136,6 +137,10 @@ async fn paired_peer_serves_real_model_and_rejects_unapproved_device() {
     let client = PeerClient::new(&approved, trusted_server).unwrap();
     let snapshot = client.snapshot().await.unwrap();
     assert_eq!(snapshot.model_id, "local-smollm2");
+    assert_eq!(
+        snapshot.model_digest,
+        hex::encode(Sha256::digest(std::fs::read(&model).unwrap()))
+    );
     assert!(snapshot.ready);
     assert_eq!(snapshot.queue_capacity, 2);
     let models = peer_request(
@@ -236,6 +241,114 @@ async fn paired_peer_serves_real_model_and_rejects_unapproved_device() {
         .unwrap();
     drop(local);
     tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Q4_K_M and Q8_0 SmolLM2 GGUF files in SMOLLM2_DIR"]
+async fn coordinator_rejects_a_peer_with_the_same_name_but_different_weights() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let local_model = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let peer_model = directory.join("SmolLM2-135M-Q8_0.gguf");
+    let local_dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let local_id = DeviceIdentity::load_or_create(local_dir.path()).unwrap();
+    let peer_id = DeviceIdentity::load_or_create(peer_dir.path()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut local_peers = PeerStore::load(local_dir.path()).unwrap();
+    local_peers
+        .trust(
+            &local_id.device_id,
+            &peer_id.offer(),
+            address,
+            &peer_id.fingerprint,
+        )
+        .unwrap();
+    let mut peer_peers = PeerStore::load(peer_dir.path()).unwrap();
+    peer_peers
+        .trust(
+            &peer_id.device_id,
+            &local_id.offer(),
+            address,
+            &local_id.fingerprint,
+        )
+        .unwrap();
+    let config = || ServingConfig {
+        model_id: "local-smollm2".into(),
+        api_key: KEY.into(),
+        queue_capacity: 2,
+        max_completion_tokens: 4,
+        request_timeout: Duration::from_secs(30),
+        backend: ServingBackend::Cpu,
+    };
+    let (local, local_peer, local_worker) = start_isolated_paired(
+        &local_model,
+        load_gguf_tokenizer(&local_model).unwrap(),
+        config(),
+        env!("CARGO_BIN_EXE_serve"),
+        &local_id,
+        &local_peers,
+    )
+    .await
+    .unwrap();
+    let (peer_local, peer, peer_worker) = start_isolated_paired(
+        &peer_model,
+        load_gguf_tokenizer(&peer_model).unwrap(),
+        config(),
+        env!("CARGO_BIN_EXE_serve"),
+        &peer_id,
+        &peer_peers,
+    )
+    .await
+    .unwrap();
+    let handle = axum_server::Handle::new();
+    let running = tokio::spawn(peer.serve(listener, handle.clone()));
+    drop(local_peer);
+    drop(peer_local);
+    let client = PeerClient::new(&local_id, local_peers.peers()[0].clone()).unwrap();
+    let snapshot = client.snapshot().await.unwrap();
+    assert!(snapshot.ready);
+    assert_eq!(snapshot.model_id, "local-smollm2");
+    assert_ne!(
+        snapshot.model_digest,
+        hex::encode(Sha256::digest(std::fs::read(&local_model).unwrap()))
+    );
+
+    local_worker.abort();
+    assert!(local_worker.await.unwrap_err().is_cancelled());
+    let response = local
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {KEY}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "local-smollm2",
+                        "messages": [{"role": "user", "content": "Say hi"}],
+                        "max_completion_tokens": 2
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    handle.graceful_shutdown(Some(Duration::from_secs(2)));
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(local);
+    tokio::time::timeout(Duration::from_secs(5), peer_worker)
         .await
         .unwrap()
         .unwrap();
@@ -504,9 +617,11 @@ async fn coordinator_sends_next_request_to_idle_peer_while_local_worker_is_busy(
 
     let fake_dir = tempfile::tempdir().unwrap();
     let script = fake_dir.path().join("worker");
+    let model_digest = hex::encode(Sha256::digest(fs::read(&model).unwrap()));
     fs::write(
         &script,
-        "#!/bin/sh\nprintf '%s\\n' '{\"kind\":\"ready\",\"max_positions\":2048}'\nif [ ! -f \"$2/active\" ]; then\n  IFS= read -r request\n  : > \"$2/active\"\n  exec sleep 60\nfi\nwhile IFS= read -r request; do\n  printf '%s\\n' '{\"kind\":\"delta\",\"text\":\"local\"}'\n  printf '%s\\n' '{\"kind\":\"finished\",\"reason\":\"length\",\"completion_tokens\":1}'\ndone\n",
+        "#!/bin/sh\nprintf '%s\\n' '{\"kind\":\"ready\",\"max_positions\":2048,\"model_digest\":\"MODEL_DIGEST\"}'\nif [ ! -f \"$2/active\" ]; then\n  IFS= read -r request\n  : > \"$2/active\"\n  exec sleep 60\nfi\nwhile IFS= read -r request; do\n  printf '%s\\n' '{\"kind\":\"delta\",\"text\":\"local\"}'\n  printf '%s\\n' '{\"kind\":\"finished\",\"reason\":\"length\",\"completion_tokens\":1}'\ndone\n"
+            .replace("MODEL_DIGEST", &model_digest),
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();

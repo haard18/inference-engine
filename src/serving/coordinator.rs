@@ -26,6 +26,7 @@ impl Coordinator {
         &self,
         local: &CapacitySnapshot,
         model_id: &str,
+        model_digest: &str,
         required_positions: usize,
         max_completion_tokens: usize,
     ) -> Option<PeerClient> {
@@ -57,6 +58,7 @@ impl Coordinator {
             if peer_can_take(
                 &snapshot,
                 model_id,
+                model_digest,
                 required_positions,
                 max_completion_tokens,
             ) && snapshot.backlog() < best_score
@@ -72,6 +74,7 @@ impl Coordinator {
         &self,
         device_id: &str,
         model_id: &str,
+        model_digest: &str,
         required_positions: usize,
         max_completion_tokens: usize,
     ) -> Option<PeerClient> {
@@ -86,6 +89,7 @@ impl Coordinator {
         peer_can_take(
             &snapshot,
             model_id,
+            model_digest,
             required_positions,
             max_completion_tokens,
         )
@@ -96,12 +100,14 @@ impl Coordinator {
 fn peer_can_take(
     snapshot: &CapacitySnapshot,
     model_id: &str,
+    model_digest: &str,
     required_positions: usize,
     max_completion_tokens: usize,
 ) -> bool {
     snapshot.ready
         && snapshot.queue_available > 0
         && snapshot.model_id == model_id
+        && snapshot.model_digest == model_digest
         && required_positions <= snapshot.max_positions
         && max_completion_tokens <= snapshot.max_completion_tokens
 }
@@ -114,6 +120,7 @@ mod tests {
     fn only_compatible_workers_with_queue_space_are_candidates() {
         let mut peer = CapacitySnapshot {
             model_id: "model-a".into(),
+            model_digest: "07".repeat(32),
             ready: true,
             active: false,
             queue_available: 2,
@@ -121,16 +128,17 @@ mod tests {
             max_positions: 512,
             max_completion_tokens: 64,
         };
-        assert!(peer_can_take(&peer, "model-a", 512, 64));
+        assert!(peer_can_take(&peer, "model-a", &"07".repeat(32), 512, 64));
         assert_eq!(peer.backlog(), 0);
-        assert!(!peer_can_take(&peer, "model-b", 512, 64));
-        assert!(!peer_can_take(&peer, "model-a", 513, 64));
-        assert!(!peer_can_take(&peer, "model-a", 512, 65));
+        assert!(!peer_can_take(&peer, "model-b", &"07".repeat(32), 512, 64));
+        assert!(!peer_can_take(&peer, "model-a", &"08".repeat(32), 512, 64));
+        assert!(!peer_can_take(&peer, "model-a", &"07".repeat(32), 513, 64));
+        assert!(!peer_can_take(&peer, "model-a", &"07".repeat(32), 512, 65));
         peer.queue_available = 0;
-        assert!(!peer_can_take(&peer, "model-a", 512, 64));
+        assert!(!peer_can_take(&peer, "model-a", &"07".repeat(32), 512, 64));
         peer.queue_available = 1;
         peer.ready = false;
-        assert!(!peer_can_take(&peer, "model-a", 512, 64));
+        assert!(!peer_can_take(&peer, "model-a", &"07".repeat(32), 512, 64));
         peer.ready = true;
         peer.active = true;
         assert_eq!(peer.backlog(), 2);

@@ -70,6 +70,7 @@ pub struct ServingConfig {
 #[serde(deny_unknown_fields)]
 pub struct CapacitySnapshot {
     pub model_id: String,
+    pub model_digest: String,
     pub ready: bool,
     pub active: bool,
     pub queue_available: usize,
@@ -107,6 +108,7 @@ struct AppState {
     device_id: Uuid,
     session_reuse: bool,
     model_id: String,
+    model_digest: String,
     api_key: Vec<u8>,
     tokenizer: Arc<ByteBpeTokenizer>,
     max_positions: usize,
@@ -123,6 +125,7 @@ impl AppState {
         let ready = !self.requests.is_closed() && !self.worker_status.unavailable();
         CapacitySnapshot {
             model_id: self.model_id.clone(),
+            model_digest: self.model_digest.clone(),
             ready,
             active: self.worker_status.active(),
             queue_available: if ready { self.requests.capacity() } else { 0 },
@@ -368,6 +371,7 @@ fn start_state(
         device_id: Uuid::new_v4(),
         session_reuse: false,
         model_id: config.model_id,
+        model_digest: String::new(),
         api_key: config.api_key.into_bytes(),
         tokenizer,
         max_positions: model.config().max_positions,
@@ -662,6 +666,7 @@ async fn chat_completions_impl(
                         .owner_if_available(
                             &id.owner().to_string(),
                             &request.model,
+                            &state.model_digest,
                             required_positions,
                             max_tokens,
                         )
@@ -680,7 +685,13 @@ async fn chat_completions_impl(
                 None
             } else {
                 coordinator
-                    .choose(&local, &request.model, required_positions, max_tokens)
+                    .choose(
+                        &local,
+                        &request.model,
+                        &state.model_digest,
+                        required_positions,
+                        max_tokens,
+                    )
                     .await
             };
             if let Some(peer) = peer {
@@ -1131,6 +1142,7 @@ mod tests {
             device_id: Uuid::new_v4(),
             session_reuse: false,
             model_id: "local-smollm2".into(),
+            model_digest: "07".repeat(32),
             api_key: KEY.as_bytes().to_vec(),
             tokenizer: Arc::new(tokenizer),
             max_positions: 2048,
@@ -1151,6 +1163,7 @@ mod tests {
             device_id: Uuid::new_v4(),
             session_reuse: false,
             model_id: "local-smollm2".into(),
+            model_digest: "07".repeat(32),
             api_key: KEY.as_bytes().to_vec(),
             tokenizer: Arc::new(test_tokenizer()),
             max_positions: 2048,
@@ -1467,6 +1480,7 @@ mod tests {
             device_id: Uuid::new_v4(),
             session_reuse: false,
             model_id: "local-smollm2".into(),
+            model_digest: "07".repeat(32),
             api_key: KEY.as_bytes().to_vec(),
             tokenizer: Arc::new(tokenizer),
             max_positions: 2048,

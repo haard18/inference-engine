@@ -85,6 +85,8 @@ impl PeerClient {
                 .map_err(|error| PoolError::Transport(error.to_string()))?;
             let snapshot: CapacitySnapshot = serde_json::from_slice(&body)?;
             if snapshot.model_id.is_empty()
+                || snapshot.model_digest.len() != 64
+                || hex::decode(&snapshot.model_digest).is_err()
                 || snapshot.queue_capacity == 0
                 || snapshot.queue_capacity > 1024
                 || snapshot.queue_available > snapshot.queue_capacity

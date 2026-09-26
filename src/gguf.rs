@@ -170,6 +170,10 @@ fn file_digest(file: &mut File) -> Result<[u8; 32], GgufError> {
     Ok(digest.finalize().into())
 }
 
+pub(crate) fn digest_file(path: impl AsRef<Path>) -> Result<[u8; 32], GgufError> {
+    file_digest(&mut File::open(path)?)
+}
+
 fn read_model_config(source: &GgufReader) -> Result<ModelConfig, GgufError> {
     if source.string("general.architecture")? != "llama" {
         return Err(GgufError::Unsupported("model architecture".into()));
