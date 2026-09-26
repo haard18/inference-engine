@@ -13,18 +13,28 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 4 {
-        return Err(format!("usage: {} MODEL_GGUF PROMPT GENERATION_COUNT", args[0]).into());
+    let metal = args.get(1).is_some_and(|option| option == "--metal");
+    let offset = usize::from(metal);
+    if args.len() != 4 + offset {
+        return Err(format!(
+            "usage: {} [--metal] MODEL_GGUF PROMPT GENERATION_COUNT",
+            args[0]
+        )
+        .into());
     }
-    let tokenizer = load_gguf_tokenizer(&args[1])?;
+    let tokenizer = load_gguf_tokenizer(&args[1 + offset])?;
     let prompt: Vec<usize> = tokenizer
-        .encode(&args[2])?
+        .encode(&args[2 + offset])?
         .into_iter()
         .map(|id| id as usize)
         .collect();
-    let model = load_gguf(&args[1])?;
-    let count: usize = args[3].parse()?;
-    let mut session = GenerationSession::new(&model);
+    let model = load_gguf(&args[1 + offset])?;
+    let count: usize = args[3 + offset].parse()?;
+    let mut session = if metal {
+        GenerationSession::on_metal(&model)?
+    } else {
+        GenerationSession::new(&model)
+    };
     session.prefill(&prompt)?;
     let mut generated = Vec::with_capacity(count);
     for _ in 0..count {

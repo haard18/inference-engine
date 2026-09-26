@@ -1,4 +1,6 @@
 use half::{bf16, f16};
+#[cfg(target_os = "macos")]
+use inference_engine::MetalRuntime;
 use inference_engine::{
     EngineError, GenerationSession, LayerWeights, Matrix, Model, ModelConfig, ModelWeights,
 };
@@ -72,6 +74,120 @@ fn tiny_model_matches_independent_numpy_reference() {
     assert_eq!(session.position(), 3);
     assert_eq!(session.next_token().unwrap(), 2);
     assert_eq!(session.position(), 4);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tiny_model_metal_matches_cpu() {
+    let model = model(8);
+    let mut cpu = GenerationSession::new(&model);
+    let runtime = MetalRuntime::new(&model).expect("prepare Metal model");
+    let mut metal = runtime.session();
+    let mut second_metal = runtime.session();
+    cpu.prefill(&[1, 2, 3]).unwrap();
+    metal.prefill(&[1, 2, 3]).unwrap();
+    second_metal.prefill(&[1, 2, 3]).unwrap();
+    for (index, (&actual, &expected)) in metal
+        .next_token_scores()
+        .unwrap()
+        .iter()
+        .zip(cpu.next_token_scores().unwrap())
+        .enumerate()
+    {
+        assert!(
+            (actual - expected).abs() < 1e-4,
+            "score {index}: Metal {actual}, CPU {expected}"
+        );
+    }
+    assert_eq!(metal.next_token_scores(), second_metal.next_token_scores());
+    assert_eq!(metal.next_token().unwrap(), cpu.next_token().unwrap());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn f16_model_metal_matches_cpu() {
+    let square = Matrix::from_f16_bits(
+        2,
+        2,
+        [0.5, -0.25, 0.125, 0.75]
+            .map(|value| f16::from_f32(value).to_bits())
+            .to_vec(),
+    )
+    .unwrap();
+    let embeddings = Matrix::from_f16_bits(
+        4,
+        2,
+        [0.5, 0.25, -0.25, 0.75, 0.125, -0.5, 0.25, 0.5]
+            .map(|value| f16::from_f32(value).to_bits())
+            .to_vec(),
+    )
+    .unwrap();
+    let config = ModelConfig {
+        vocab_size: 4,
+        hidden_size: 2,
+        intermediate_size: 2,
+        num_layers: 1,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        max_positions: 4,
+        rms_norm_epsilon: 1e-5,
+        rope_theta: 10000.0,
+        rope_interleaved: false,
+    };
+    let weights = ModelWeights {
+        token_embeddings: embeddings,
+        layers: vec![LayerWeights {
+            attention_norm: vec![1.0; 2],
+            query: square.clone(),
+            key: square.clone(),
+            value: square.clone(),
+            attention_output: square.clone(),
+            feed_forward_norm: vec![1.0; 2],
+            gate: square.clone(),
+            up: square.clone(),
+            down: square,
+        }],
+        final_norm: vec![1.0; 2],
+        output: None,
+    };
+    let model = Model::new(config, weights).unwrap();
+    let runtime = MetalRuntime::new(&model).unwrap();
+    let mut cpu = GenerationSession::new(&model);
+    let mut metal = runtime.session();
+    cpu.prefill(&[1, 2]).unwrap();
+    metal.prefill(&[1, 2]).unwrap();
+    for (actual, expected) in metal
+        .next_token_scores()
+        .unwrap()
+        .iter()
+        .zip(cpu.next_token_scores().unwrap())
+    {
+        assert!((actual - expected).abs() < 1e-4);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_runtime_reuses_weights_across_threads() {
+    let model = model(8);
+    let runtime = std::sync::Arc::new(MetalRuntime::new(&model).unwrap());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let runtime = std::sync::Arc::clone(&runtime);
+                scope.spawn(move || {
+                    let mut session = runtime.session();
+                    session.prefill(&[1, 2, 3]).unwrap();
+                    session.next_token_scores().unwrap().to_vec()
+                })
+            })
+            .collect();
+        let scores: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(scores[0], scores[1]);
+    });
 }
 
 #[test]

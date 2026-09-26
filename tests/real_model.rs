@@ -42,3 +42,31 @@ fn smollm2_matches_independent_numpy_reference() {
     }
     assert_eq!(session.next_token().unwrap(), 30);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires the SmolLM2-135M checkpoint in SMOLLM2_DIR"]
+fn smollm2_bf16_metal_matches_cpu() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let model = load_safetensors(
+        directory.join("config.json"),
+        directory.join("model.safetensors"),
+    )
+    .unwrap();
+    let mut cpu = GenerationSession::new(&model);
+    let mut metal = GenerationSession::on_metal(&model).expect("create Metal session");
+    cpu.prefill(&[1, 2, 3]).unwrap();
+    metal.prefill(&[1, 2, 3]).unwrap();
+    let largest_difference = cpu
+        .next_token_scores()
+        .unwrap()
+        .iter()
+        .zip(metal.next_token_scores().unwrap())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        largest_difference < 1e-3,
+        "score difference {largest_difference}"
+    );
+    assert_eq!(cpu.next_token().unwrap(), metal.next_token().unwrap());
+}

@@ -12,6 +12,7 @@ pub enum EngineError {
     InvalidToken(usize),
     EmptyPrompt,
     ContextFull,
+    Backend(String),
 }
 
 impl fmt::Display for EngineError {
@@ -32,6 +33,7 @@ impl fmt::Display for EngineError {
             Self::InvalidToken(token) => write!(f, "token ID {token} is outside the vocabulary"),
             Self::EmptyPrompt => write!(f, "the prompt must contain at least one token"),
             Self::ContextFull => write!(f, "the model context is full"),
+            Self::Backend(message) => write!(f, "compute backend failed: {message}"),
         }
     }
 }

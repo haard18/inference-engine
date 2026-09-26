@@ -1,5 +1,7 @@
 use crate::EngineError;
 use half::{bf16, f16};
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::mem::size_of;
 
 #[derive(Clone, Debug)]
@@ -132,6 +134,18 @@ impl Matrix {
 
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_storage(&self) -> (*const c_void, usize, u32) {
+        match &self.data {
+            MatrixData::F32(values) => (values.as_ptr().cast(), self.storage_bytes(), 0),
+            MatrixData::F16(values) => (values.as_ptr().cast(), self.storage_bytes(), 1),
+            MatrixData::Bf16(values) => (values.as_ptr().cast(), self.storage_bytes(), 2),
+            MatrixData::Q8_0(values) => (values.as_ptr().cast(), values.len(), 3),
+            MatrixData::Q5_0(values) => (values.as_ptr().cast(), values.len(), 4),
+            MatrixData::Q4K(values) => (values.as_ptr().cast(), values.len(), 5),
+        }
     }
 
     /// Bytes used by the matrix values, excluding Vec capacity and metadata.

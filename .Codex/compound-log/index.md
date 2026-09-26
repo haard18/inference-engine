@@ -14,6 +14,7 @@
 - [GGUF Q8_0 parity](learnings/2026-09-26-gguf-q8-parity.md)
 - [Tokenization from GGUF](learnings/2026-09-26-gguf-tokenizer.md)
 - [Mixed Q4_K_M checkpoint](learnings/2026-09-26-q4-k-m.md)
+- [Metal matrix execution](learnings/2026-09-26-metal-parity.md)
 
 ## Reviews
 
@@ -24,3 +25,4 @@
 - [GGUF Q8_0 review](reviews/2026-09-26-gguf-q8.md)
 - [GGUF tokenizer review](reviews/2026-09-26-gguf-tokenizer.md)
 - [Q4_K_M review](reviews/2026-09-26-q4-k-m.md)
+- [Metal review](reviews/2026-09-26-metal.md)

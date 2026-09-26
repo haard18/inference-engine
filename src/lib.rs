@@ -1,6 +1,10 @@
 mod error;
 mod gguf;
 mod loader;
+#[cfg(target_os = "macos")]
+mod metal_backend;
+#[cfg(target_os = "macos")]
+pub use metal_backend::MetalRuntime;
 mod model;
 mod session;
 mod tensor;

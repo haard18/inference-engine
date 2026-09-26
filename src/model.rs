@@ -80,6 +80,29 @@ impl Model {
         &self.config
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn matrices(&self) -> Vec<&Matrix> {
+        let mut matrices = Vec::with_capacity(1 + self.weights.layers.len() * 7);
+        matrices.push(
+            self.weights
+                .output
+                .as_ref()
+                .unwrap_or(&self.weights.token_embeddings),
+        );
+        for layer in &self.weights.layers {
+            matrices.extend([
+                &layer.query,
+                &layer.key,
+                &layer.value,
+                &layer.attention_output,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ]);
+        }
+        matrices
+    }
+
     /// Bytes held by weight values, excluding allocation and model metadata.
     pub fn stored_weight_bytes(&self) -> usize {
         let mut total = self.weights.token_embeddings.storage_bytes()
@@ -105,6 +128,7 @@ impl Model {
         &self,
         token_id: usize,
         cache: &mut KvCache,
+        mut multiply: impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
     ) -> Result<Vec<f32>, EngineError> {
         if token_id >= self.config.vocab_size {
             return Err(EngineError::InvalidToken(token_id));
@@ -126,9 +150,10 @@ impl Model {
         for (layer_index, layer) in self.weights.layers.iter().enumerate() {
             let normalized =
                 rms_norm(&hidden, &layer.attention_norm, self.config.rms_norm_epsilon)?;
-            let mut query = layer.query.mul_vec(&normalized)?;
-            let mut key = layer.key.mul_vec(&normalized)?;
-            let value = layer.value.mul_vec(&normalized)?;
+            let [mut query, mut key, value]: [Vec<f32>; 3] =
+                multiply(&[&layer.query, &layer.key, &layer.value], &normalized)?
+                    .try_into()
+                    .map_err(|_| EngineError::Backend("attention projection count".into()))?;
             debug_assert_eq!(query.len(), hidden_size);
             debug_assert_eq!(key.len(), kv_size);
 
@@ -174,21 +199,28 @@ impl Model {
                     }
                 }
             }
-            add_in_place(&mut hidden, &layer.attention_output.mul_vec(&attended)?);
+            add_in_place(
+                &mut hidden,
+                &multiply_one(&mut multiply, &layer.attention_output, &attended)?,
+            );
 
             let normalized = rms_norm(
                 &hidden,
                 &layer.feed_forward_norm,
                 self.config.rms_norm_epsilon,
             )?;
-            let gate = layer.gate.mul_vec(&normalized)?;
-            let up = layer.up.mul_vec(&normalized)?;
+            let [gate, up]: [Vec<f32>; 2] = multiply(&[&layer.gate, &layer.up], &normalized)?
+                .try_into()
+                .map_err(|_| EngineError::Backend("feed-forward projection count".into()))?;
             let activated: Vec<f32> = gate
                 .into_iter()
                 .zip(up)
                 .map(|(gate_value, up_value)| silu(gate_value) * up_value)
                 .collect();
-            add_in_place(&mut hidden, &layer.down.mul_vec(&activated)?);
+            add_in_place(
+                &mut hidden,
+                &multiply_one(&mut multiply, &layer.down, &activated)?,
+            );
             new_keys.push(key);
             new_values.push(value);
         }
@@ -203,7 +235,7 @@ impl Model {
             .output
             .as_ref()
             .unwrap_or(&self.weights.token_embeddings);
-        let logits = output.mul_vec(&normalized)?;
+        let logits = multiply_one(&mut multiply, output, &normalized)?;
         if !logits.iter().all(|value| value.is_finite()) {
             return Err(EngineError::InvalidValue("next-token scores"));
         }
@@ -219,6 +251,17 @@ impl Model {
         cache.position += 1;
         Ok(logits)
     }
+}
+
+fn multiply_one(
+    multiply: &mut impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
+    matrix: &Matrix,
+    input: &[f32],
+) -> Result<Vec<f32>, EngineError> {
+    multiply(&[matrix], input)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| EngineError::Backend("missing matrix result".into()))
 }
 
 fn validate_config(config: &ModelConfig) -> Result<(), EngineError> {

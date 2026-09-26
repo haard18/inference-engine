@@ -98,3 +98,29 @@ fn q8_0_and_bf16_generate_same_tokens_for_smoke_prompt() {
         );
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires Q8_0 and Q4_K_M SmolLM2 GGUF checkpoints in SMOLLM2_DIR"]
+fn real_gguf_metal_matches_cpu() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    for filename in ["SmolLM2-135M-Q8_0.gguf", "SmolLM2-135M-Q4_K_M.gguf"] {
+        let model = load_gguf(directory.join(filename)).unwrap();
+        let mut cpu = GenerationSession::new(&model);
+        let mut metal = GenerationSession::on_metal(&model).expect("create Metal session");
+        cpu.prefill(&[1, 2, 3]).unwrap();
+        metal.prefill(&[1, 2, 3]).unwrap();
+        let cpu_scores = cpu.next_token_scores().unwrap();
+        let metal_scores = metal.next_token_scores().unwrap();
+        let largest_difference = cpu_scores
+            .iter()
+            .zip(metal_scores)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            largest_difference < 1e-3,
+            "{filename}: score difference {largest_difference}"
+        );
+        assert_eq!(cpu.next_token().unwrap(), metal.next_token().unwrap());
+    }
+}
