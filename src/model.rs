@@ -319,6 +319,21 @@ impl ModelStage {
         self.config.max_positions
     }
 
+    pub(crate) fn cache_bytes_per_position(&self) -> Option<usize> {
+        let head_size = self
+            .config
+            .hidden_size
+            .checked_div(self.config.num_attention_heads)?;
+        let kv_size = self.config.num_key_value_heads.checked_mul(head_size)?;
+        (self.range.end - self.range.start)
+            .checked_mul(2)?
+            .checked_mul(
+                kv_size
+                    .checked_mul(size_of::<f32>())?
+                    .checked_add(size_of::<Vec<f32>>())?,
+            )
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.config.vocab_size
     }

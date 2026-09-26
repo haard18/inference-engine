@@ -47,6 +47,7 @@ pub struct StageCapacitySnapshot {
     pub hidden_size: usize,
     pub vocab_size: usize,
     pub max_positions: usize,
+    pub model_max_positions: usize,
     pub stored_weight_bytes: usize,
     pub queue_capacity: usize,
     pub queue_available: usize,
@@ -61,6 +62,7 @@ pub(super) struct StageReady {
     pub(super) hidden_size: usize,
     pub(super) vocab_size: usize,
     pub(super) max_positions: usize,
+    pub(super) model_max_positions: usize,
     stored_weight_bytes: usize,
 }
 
@@ -278,6 +280,7 @@ async fn capacity(State(state): State<Arc<StageState>>) -> Json<StageCapacitySna
         hidden_size: state.expected.hidden_size,
         vocab_size: state.expected.vocab_size,
         max_positions: state.expected.max_positions,
+        model_max_positions: state.expected.model_max_positions,
         stored_weight_bytes: state.expected.stored_weight_bytes,
         queue_capacity: state.queue_capacity,
         queue_available: state.queue.available_permits(),
@@ -608,6 +611,7 @@ impl StageChild {
             || ready.hidden_size == 0
             || ready.vocab_size == 0
             || ready.max_positions == 0
+            || ready.max_positions > ready.model_max_positions
             || ready.stored_weight_bytes == 0
             || ready.model_digest.len() != 64
             || hex::decode(&ready.model_digest).is_err()
@@ -900,7 +904,7 @@ if sys.argv[-1] != '--metal':
     sys.exit(4)
 marker = sys.argv[2] + '.started'
 first = not os.path.exists(marker)
-print(json.dumps({'kind':'ready','model_digest':'07'*32,'layer_start':1,'layer_end':2,'hidden_size':2,'vocab_size':2,'max_positions':4,'stored_weight_bytes':1}), flush=True)
+print(json.dumps({'kind':'ready','model_digest':'07'*32,'layer_start':1,'layer_end':2,'hidden_size':2,'vocab_size':2,'max_positions':4,'model_max_positions':4,'stored_weight_bytes':1}), flush=True)
 command = json.loads(sys.stdin.buffer.readline())
 sys.stdin.buffer.read(command['payload_bytes'])
 if first:

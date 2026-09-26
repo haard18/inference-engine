@@ -85,7 +85,7 @@ pub async fn start_split_prefix(
         model_digest: ready.model_digest.clone(),
         api_key: config.api_key.into_bytes(),
         tokenizer: Arc::clone(&tokenizer),
-        max_positions: ready.max_positions,
+        max_positions: ready.max_positions.min(remote.max_positions),
         max_completion_tokens: config.max_completion_tokens,
         queue_capacity: config.queue_capacity,
         request_timeout: config.request_timeout,
@@ -106,12 +106,18 @@ pub async fn start_split_prefix(
         Arc::downgrade(&runtime.status),
         client,
         ready,
+        state.max_positions,
     ));
     let task = tokio::spawn(supervise(receiver, child, runtime));
     Ok((router(state), task))
 }
 
-async fn monitor_suffix(status: Weak<WorkerStatus>, client: PeerClient, ready: StageReady) {
+async fn monitor_suffix(
+    status: Weak<WorkerStatus>,
+    client: PeerClient,
+    ready: StageReady,
+    served_positions: usize,
+) {
     let mut interval = tokio::time::interval(SUFFIX_PROBE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut failed_probes = 0_u8;
@@ -120,10 +126,11 @@ async fn monitor_suffix(status: Weak<WorkerStatus>, client: PeerClient, ready: S
         let Some(status) = status.upgrade() else {
             break;
         };
-        let healthy = client
-            .stage_snapshot()
-            .await
-            .is_ok_and(|snapshot| snapshot.ready && validate_pair(&ready, &snapshot).is_ok());
+        let healthy = client.stage_snapshot().await.is_ok_and(|snapshot| {
+            snapshot.ready
+                && snapshot.max_positions >= served_positions
+                && validate_pair(&ready, &snapshot).is_ok()
+        });
         if healthy {
             failed_probes = 0;
             status.set_remote_unavailable(false);
@@ -142,7 +149,9 @@ fn validate_pair(prefix: &StageReady, suffix: &StageCapacitySnapshot) -> Result<
         || prefix.model_digest != suffix.model_digest
         || prefix.hidden_size != suffix.hidden_size
         || prefix.vocab_size != suffix.vocab_size
-        || prefix.max_positions != suffix.max_positions
+        || prefix.model_max_positions != suffix.model_max_positions
+        || suffix.max_positions == 0
+        || suffix.max_positions > suffix.model_max_positions
         || suffix.layer_end <= suffix.layer_start
     {
         return Err("suffix stage does not match the local prefix model and range".into());

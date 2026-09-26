@@ -54,7 +54,7 @@ def health(port: int) -> int | None:
             return response.status
     except HTTPError as error:
         return error.code
-    except (URLError, TimeoutError):
+    except (URLError, TimeoutError, socket.timeout):
         return None
 
 

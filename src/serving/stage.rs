@@ -1,6 +1,7 @@
 //! Private, bounded process protocol for one decoder stage.
 
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -16,7 +17,8 @@ use crate::MetalStageRuntime;
 use crate::{load_gguf_stage, ActivationFrame, StageSession};
 
 const MAX_SESSIONS: usize = 8;
-const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_CACHE_MIB: usize = 128;
+const MAX_CACHE_MIB: usize = 8192;
 const MAX_ACTIVATION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SCORE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COMMAND_LINE_BYTES: usize = 4096;
@@ -60,6 +62,7 @@ enum StageEvent<'a> {
         layer_end: usize,
         hidden_size: usize,
         max_positions: usize,
+        model_max_positions: usize,
         vocab_size: usize,
         stored_weight_bytes: usize,
     },
@@ -95,6 +98,41 @@ fn lease_duration(lease_ms: Option<u64>) -> Result<Duration, &'static str> {
     }
 }
 
+fn cache_budget_bytes() -> Result<usize, String> {
+    let mib = match env::var("INFERENCE_STAGE_CACHE_MIB") {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|_| "INFERENCE_STAGE_CACHE_MIB must be an integer".to_owned())?,
+        Err(env::VarError::NotPresent) => DEFAULT_CACHE_MIB,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("INFERENCE_STAGE_CACHE_MIB must be text".into());
+        }
+    };
+    if !(16..=MAX_CACHE_MIB).contains(&mib) {
+        return Err(format!(
+            "INFERENCE_STAGE_CACHE_MIB must be between 16 and {MAX_CACHE_MIB}"
+        ));
+    }
+    mib.checked_mul(1024 * 1024)
+        .ok_or_else(|| "stage cache budget overflows this platform".into())
+}
+
+fn cache_max_positions(
+    model_max_positions: usize,
+    bytes_per_position: usize,
+    cache_budget: usize,
+) -> Result<usize, String> {
+    if bytes_per_position == 0 {
+        return Err("stage cache size is invalid".into());
+    }
+    let possible = cache_budget / bytes_per_position;
+    if possible == 0 || (possible < 16 && model_max_positions > possible) {
+        return Err("stage cache budget is too small for this model".into());
+    }
+    let power_of_two = 1_usize << (usize::BITS - 1 - possible.leading_zeros());
+    Ok(model_max_positions.min(power_of_two))
+}
+
 struct SessionEntry<'a> {
     session: StageSession<'a>,
     touched: Instant,
@@ -118,6 +156,14 @@ pub fn run_stage_worker_stdio_with_backend(
     backend: ServingBackend,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let stage = load_gguf_stage(model_path, start..end)?;
+    let cache_budget = cache_budget_bytes()?;
+    let cache_max_positions = cache_max_positions(
+        stage.max_positions(),
+        stage
+            .cache_bytes_per_position()
+            .ok_or("stage cache size overflow")?,
+        cache_budget,
+    )?;
     #[cfg(target_os = "macos")]
     let metal = (backend == ServingBackend::Metal)
         .then(|| MetalStageRuntime::new(&stage))
@@ -144,7 +190,8 @@ pub fn run_stage_worker_stdio_with_backend(
             layer_start: start,
             layer_end: end,
             hidden_size: stage.hidden_size(),
-            max_positions: stage.max_positions(),
+            max_positions: cache_max_positions,
+            model_max_positions: stage.max_positions(),
             vocab_size: stage.vocab_size(),
             stored_weight_bytes: stage.stored_weight_bytes(),
         },
@@ -210,6 +257,11 @@ pub fn run_stage_worker_stdio_with_backend(
                 entry.checkpointed = false;
                 entry.lease_until = Instant::now() + lease;
                 let position = entry.session.position();
+                if position >= cache_max_positions {
+                    sessions.remove(&request_id);
+                    fail(&mut output, "stage cache context limit reached")?;
+                    continue;
+                }
                 let result = entry
                     .session
                     .forward_token(token_id)
@@ -219,7 +271,14 @@ pub fn run_stage_worker_stdio_with_backend(
                             .map(|frame| frame.encode())
                             .map_err(|error| error.to_string())
                     });
-                finish_step(&mut sessions, request_id, result, &mut output, true)?;
+                finish_step(
+                    &mut sessions,
+                    request_id,
+                    result,
+                    &mut output,
+                    true,
+                    cache_budget,
+                )?;
             }
             StageCommand::Activation {
                 request_id,
@@ -271,6 +330,16 @@ pub fn run_stage_worker_stdio_with_backend(
                 });
                 entry.checkpointed = false;
                 entry.lease_until = Instant::now() + lease;
+                if entry
+                    .session
+                    .position()
+                    .checked_add(frame_count)
+                    .is_none_or(|end| end > cache_max_positions)
+                {
+                    sessions.remove(&request_id);
+                    fail(&mut output, "stage cache context limit reached")?;
+                    continue;
+                }
                 let result = (|| -> Result<Vec<u8>, String> {
                     let mut scores = Vec::new();
                     for frame in payload.chunks_exact(frame_bytes) {
@@ -292,7 +361,14 @@ pub fn run_stage_worker_stdio_with_backend(
                     }
                     Ok(bytes)
                 })();
-                finish_step(&mut sessions, request_id, result, &mut output, false)?;
+                finish_step(
+                    &mut sessions,
+                    request_id,
+                    result,
+                    &mut output,
+                    false,
+                    cache_budget,
+                )?;
             }
             StageCommand::Close { request_id } => {
                 let id = match Uuid::parse_str(&request_id) {
@@ -366,6 +442,7 @@ fn finish_step(
     result: Result<Vec<u8>, String>,
     output: &mut impl Write,
     activation: bool,
+    cache_budget: usize,
 ) -> io::Result<()> {
     match result {
         Ok(bytes) => {
@@ -373,11 +450,24 @@ fn finish_step(
                 sessions.remove(&request_id);
                 return fail(output, "stage scores exceed response limit");
             }
-            let allocated: usize = sessions
+            let mut allocated: usize = sessions
                 .values()
                 .map(|entry| entry.session.allocated_cache_bytes())
                 .sum();
-            if allocated > MAX_CACHE_BYTES {
+            while allocated > cache_budget {
+                let Some(oldest) = sessions
+                    .iter()
+                    .filter(|(id, entry)| **id != request_id && entry.checkpointed)
+                    .min_by_key(|(_, entry)| entry.touched)
+                    .map(|(id, _)| *id)
+                else {
+                    break;
+                };
+                if let Some(removed) = sessions.remove(&oldest) {
+                    allocated = allocated.saturating_sub(removed.session.allocated_cache_bytes());
+                }
+            }
+            if allocated > cache_budget {
                 sessions.remove(&request_id);
                 return fail(output, "stage cache memory limit reached");
             }
@@ -418,4 +508,23 @@ fn write_event(output: &mut impl Write, event: &StageEvent<'_>, payload: &[u8]) 
     output.write_all(b"\n")?;
     output.write_all(payload)?;
     output.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_max_positions;
+
+    #[test]
+    fn advertised_stage_context_fits_the_cache_budget() {
+        let per_position = 12 * 2 * (2048 * 4 + std::mem::size_of::<Vec<f32>>());
+        assert_eq!(
+            cache_max_positions(8192, per_position, 128 * 1024 * 1024).unwrap(),
+            512
+        );
+        assert_eq!(
+            cache_max_positions(8192, per_position, 2048 * 1024 * 1024).unwrap(),
+            8192
+        );
+        assert!(cache_max_positions(8192, per_position, 1024).is_err());
+    }
 }

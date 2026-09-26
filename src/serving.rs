@@ -980,7 +980,7 @@ fn validate_request(
             .map(|token| token as usize),
     );
     if prompt.len() >= state.max_positions || max_tokens > state.max_positions - prompt.len() {
-        return Err("prompt and requested completion exceed the model context".into());
+        return Err("prompt and requested completion exceed available context".into());
     }
     Ok((prompt, max_tokens))
 }

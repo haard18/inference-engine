@@ -548,3 +548,92 @@ async fn mixed_backend_split_chat_matches_whole_metal_worker() {
     split_backend_case(ServingBackend::Cpu, ServingBackend::Metal).await;
     split_backend_case(ServingBackend::Metal, ServingBackend::Cpu).await;
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires SMOLLM2_1_7B_GGUF and the default 128 MiB stage cache budget"]
+async fn large_split_rejects_context_that_exceeds_stage_cache_before_generation() {
+    let model = PathBuf::from(env::var("SMOLLM2_1_7B_GGUF").expect("set SMOLLM2_1_7B_GGUF"));
+    let executable = env!("CARGO_BIN_EXE_serve");
+    let suffix_dir = tempfile::tempdir().unwrap();
+    let prefix_dir = tempfile::tempdir().unwrap();
+    let suffix_identity = DeviceIdentity::load_or_create(suffix_dir.path()).unwrap();
+    let prefix_identity = DeviceIdentity::load_or_create(prefix_dir.path()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut suffix_peers = PeerStore::load(suffix_dir.path()).unwrap();
+    suffix_peers
+        .trust(
+            &suffix_identity.device_id,
+            &prefix_identity.offer(),
+            address,
+            &prefix_identity.fingerprint,
+        )
+        .unwrap();
+    let mut prefix_peers = PeerStore::load(prefix_dir.path()).unwrap();
+    prefix_peers
+        .trust(
+            &prefix_identity.device_id,
+            &suffix_identity.offer(),
+            address,
+            &suffix_identity.fingerprint,
+        )
+        .unwrap();
+    let suffix = start_stage_peer_with_backend(
+        &model,
+        executable,
+        12,
+        24,
+        StagePeerOptions {
+            queue_capacity: 4,
+            backend: ServingBackend::Metal,
+        },
+        &suffix_identity,
+        &suffix_peers,
+    )
+    .await
+    .unwrap();
+    let suffix_handle = axum_server::Handle::new();
+    let handle = suffix_handle.clone();
+    let suffix_task = tokio::spawn(async move { suffix.serve(listener, handle).await });
+    let client = PeerClient::new(&prefix_identity, prefix_peers.peers()[0].clone()).unwrap();
+    let (split, split_worker) = start_split_prefix(
+        &model,
+        load_gguf_tokenizer(&model).unwrap(),
+        ServingConfig {
+            backend: ServingBackend::Metal,
+            ..config()
+        },
+        executable,
+        12,
+        &prefix_identity,
+        client,
+    )
+    .await
+    .unwrap();
+    let long_text = " hello".repeat(700);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {KEY}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "local-smollm2",
+                "messages": [{"role": "user", "content": long_text}],
+                "max_tokens": 1,
+                "temperature": 0
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = split.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("available context"));
+    let (status, body, _) = chat(split, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    suffix_handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    suffix_task.await.unwrap().unwrap();
+    split_worker.abort();
+}
