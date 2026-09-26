@@ -309,7 +309,8 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     )
     .await
     .unwrap();
-    let handle = axum_server::Handle::new();
+    let suffix_handle = axum_server::Handle::new();
+    let handle = suffix_handle.clone();
     let suffix_task = tokio::spawn(async move { suffix.serve(listener, handle).await });
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -361,8 +362,8 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
             .unwrap();
         observed.push_str(&String::from_utf8_lossy(&frame.into_data().unwrap()));
     }
-    suffix_task.abort();
-    let _ = suffix_task.await;
+    suffix_handle.shutdown();
+    suffix_task.await.unwrap().unwrap();
     while let Some(frame) = tokio::time::timeout(Duration::from_secs(20), body.frame())
         .await
         .unwrap()

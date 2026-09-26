@@ -13,7 +13,7 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_rustls::TlsConnector;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -40,6 +40,7 @@ pub struct PeerClient {
     tls: Arc<ClientConfig>,
     server_name: ServerName<'static>,
     failure_until: Arc<Mutex<Option<Instant>>>,
+    stage_sender: Arc<AsyncMutex<Option<http1::SendRequest<Full<Bytes>>>>>,
 }
 
 impl PeerClient {
@@ -51,6 +52,7 @@ impl PeerClient {
             tls,
             server_name,
             failure_until: Arc::new(Mutex::new(None)),
+            stage_sender: Arc::new(AsyncMutex::new(None)),
         })
     }
 
@@ -293,33 +295,11 @@ impl PeerClient {
             .header("x-inference-frame-count", frame_count.to_string())
             .body(Full::new(Bytes::from(frames)))
             .map_err(|error| PoolError::Transport(error.to_string()))?;
-        let response = match self.send(request, deadline).await {
+        let (status, body) = match self.send_stage_activation(request, deadline).await {
             Ok(response) => response,
             Err(error) => {
                 self.mark_failure();
                 return Err(error);
-            }
-        };
-        let status = response.status();
-        let limit = if status == StatusCode::OK {
-            MAX_STAGE_BYTES
-        } else {
-            4096
-        };
-        let body = match tokio::time::timeout_at(
-            deadline,
-            to_bytes(Body::new(response.into_body()), limit),
-        )
-        .await
-        {
-            Ok(Ok(body)) => body,
-            Ok(Err(error)) => {
-                self.mark_failure();
-                return Err(PoolError::Transport(error.to_string()));
-            }
-            Err(_) => {
-                self.mark_failure();
-                return Err(PoolError::Transport("stage response timed out".into()));
             }
         };
         if status != StatusCode::OK {
@@ -588,6 +568,74 @@ impl PeerClient {
         request: Request<Full<Bytes>>,
         deadline: tokio::time::Instant,
     ) -> Result<Response<Incoming>, PoolError> {
+        let mut sender = self.connect(deadline).await?;
+        tokio::time::timeout_at(deadline, sender.send_request(request))
+            .await
+            .map_err(|_| PoolError::Transport("peer response timed out".into()))?
+            .map_err(|error| PoolError::Transport(error.to_string()))
+    }
+
+    async fn send_stage_activation(
+        &self,
+        request: Request<Full<Bytes>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(StatusCode, Bytes), PoolError> {
+        let mut slot = tokio::time::timeout_at(deadline, self.stage_sender.lock())
+            .await
+            .map_err(|_| PoolError::Transport("stage connection wait timed out".into()))?;
+        if slot.as_ref().is_some_and(http1::SendRequest::is_closed) {
+            *slot = None;
+        }
+        if slot.is_none() {
+            *slot = Some(self.connect(deadline).await?);
+        }
+        let response = match tokio::time::timeout_at(
+            deadline,
+            slot.as_mut()
+                .expect("stage sender connected")
+                .send_request(request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                *slot = None;
+                return Err(PoolError::Transport(error.to_string()));
+            }
+            Err(_) => {
+                *slot = None;
+                return Err(PoolError::Transport("stage response timed out".into()));
+            }
+        };
+        let status = response.status();
+        let limit = if status == StatusCode::OK {
+            MAX_STAGE_BYTES
+        } else {
+            4096
+        };
+        let body = match tokio::time::timeout_at(
+            deadline,
+            to_bytes(Body::new(response.into_body()), limit),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) => {
+                *slot = None;
+                return Err(PoolError::Transport(error.to_string()));
+            }
+            Err(_) => {
+                *slot = None;
+                return Err(PoolError::Transport("stage response timed out".into()));
+            }
+        };
+        Ok((status, body))
+    }
+
+    async fn connect(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<http1::SendRequest<Full<Bytes>>, PoolError> {
         let stage_deadline = deadline.min(tokio::time::Instant::now() + CONNECT_TIMEOUT);
         let socket = tokio::time::timeout_at(stage_deadline, TcpStream::connect(self.peer.address))
             .await
@@ -603,7 +651,7 @@ impl PeerClient {
         .map_err(|_| PoolError::Transport("peer handshake timed out".into()))?
         .map_err(|error| PoolError::Transport(error.to_string()))?;
         let stage_deadline = deadline.min(tokio::time::Instant::now() + CONNECT_TIMEOUT);
-        let (mut sender, connection) =
+        let (sender, connection) =
             tokio::time::timeout_at(stage_deadline, http1::handshake(TokioIo::new(stream)))
                 .await
                 .map_err(|_| PoolError::Transport("peer HTTP handshake timed out".into()))?
@@ -611,10 +659,7 @@ impl PeerClient {
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        tokio::time::timeout_at(deadline, sender.send_request(request))
-            .await
-            .map_err(|_| PoolError::Transport("peer response timed out".into()))?
-            .map_err(|error| PoolError::Transport(error.to_string()))
+        Ok(sender)
     }
 
     fn mark_failure(&self) {

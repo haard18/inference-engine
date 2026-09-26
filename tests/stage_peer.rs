@@ -2,6 +2,8 @@ use std::env;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use inference_engine::pool::client::PeerClient;
@@ -10,6 +12,7 @@ use inference_engine::{
     load_gguf, load_gguf_stage, ActivationFrame, GenerationSession, StageSession,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -26,6 +29,20 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
     let unapproved = DeviceIdentity::load_or_create(unapproved_dir.path()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address: SocketAddr = listener.local_addr().unwrap();
+    let proxy = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&connections);
+    let proxy_task = tokio::spawn(async move {
+        while let Ok((mut incoming, _)) = proxy.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Ok(mut upstream) = TcpStream::connect(address).await {
+                    let _ = tokio::io::copy_bidirectional(&mut incoming, &mut upstream).await;
+                }
+            });
+        }
+    });
     let mut server_peers = PeerStore::load(server_dir.path()).unwrap();
     server_peers
         .trust(
@@ -40,7 +57,7 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         .trust(
             &approved.device_id,
             &server.offer(),
-            address,
+            proxy_address,
             &server.fingerprint,
         )
         .unwrap();
@@ -98,6 +115,7 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
             .unwrap(),
         0
     );
+    let prior_connections = connections.load(Ordering::SeqCst);
     for token in [1, 2, 3, 30] {
         whole.prefill(&[token]).unwrap();
         let position = first.position();
@@ -123,6 +141,7 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
             .unwrap();
         assert_eq!(scores, whole.next_token_scores().unwrap());
     }
+    assert_eq!(connections.load(Ordering::SeqCst), prior_connections + 1);
     client
         .close_stage(id, tokio::time::Instant::now() + Duration::from_secs(5))
         .await
@@ -304,6 +323,62 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         )
         .await
         .is_err());
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--stage-suffix")
+        .arg(server_dir.path())
+        .arg(address.to_string())
+        .arg(&path)
+        .arg("15")
+        .arg("30")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut restarted_output = BufReader::new(restarted.stdout.take().unwrap());
+    ready.clear();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        restarted_output.read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(ready.contains("Serving approved suffix stage"), "{ready}");
+    let resumed = Uuid::new_v4();
+    client
+        .reserve_stage(
+            resumed,
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let mut resumed_prefix = StageSession::new(&prefix);
+    let frame = ActivationFrame::new(
+        &prefix,
+        resumed,
+        0,
+        resumed_prefix.forward_token(1).unwrap(),
+    )
+    .unwrap()
+    .encode();
+    let scores = client
+        .forward_stage(
+            frame,
+            resumed,
+            model.config().vocab_size,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let mut resumed_whole = GenerationSession::new(&model);
+    resumed_whole.prefill(&[1]).unwrap();
+    assert_eq!(scores, resumed_whole.next_token_scores().unwrap());
+    restarted.kill().await.unwrap();
+    restarted.wait().await.unwrap();
+    proxy_task.abort();
 }
 
 #[cfg(target_os = "macos")]

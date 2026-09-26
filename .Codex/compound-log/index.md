@@ -18,6 +18,7 @@
 - [Repeated local serving check](plans/local-serving-soak.md)
 - [Varied conversation parity](plans/varied-conversation-parity.md)
 - [Complete-worker cache admission](plans/whole-worker-cache.md)
+- [Split activation connection reuse](plans/stage-connection-reuse.md)
 
 ## Learnings
 
@@ -71,6 +72,7 @@
 - [Longer Metal split serving check](learnings/2026-09-26-metal-split-lease-soak.md)
 - [Split-stage cache reservations](learnings/2026-09-26-stage-cache-reservations.md)
 - [Complete-worker cache admission](learnings/2026-09-26-whole-worker-cache.md)
+- [Split activation connection reuse](learnings/2026-09-26-stage-connection-reuse.md)
 
 ## Reviews
 
@@ -112,3 +114,4 @@
 - [Varied conversation review](reviews/2026-09-26-varied-conversations.md)
 - [Split-stage cache reservation review](reviews/2026-09-26-stage-reservations.md)
 - [Complete-worker cache admission review](reviews/2026-09-26-whole-worker-cache.md)
+- [Split activation connection review](reviews/2026-09-26-stage-connection-reuse.md)
