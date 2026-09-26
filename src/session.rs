@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use crate::metal_backend::{MetalBackend, MetalKvCache};
+use crate::metal_backend::{MetalBackend, MetalKvCache, MAX_METAL_BATCH};
 use crate::model::KvCache;
 use crate::{EngineError, Model};
 use std::mem::size_of;
@@ -110,6 +110,30 @@ impl<'a> GenerationSession<'a> {
             if token >= self.model.config().vocab_size {
                 return Err(EngineError::InvalidToken(token));
             }
+        }
+        #[cfg(target_os = "macos")]
+        if let Backend::Metal { backend, cache } = &mut self.backend {
+            let mut backend = backend
+                .lock()
+                .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?;
+            self.next_logits = None;
+            let mut chunks = tokens.chunks(MAX_METAL_BATCH).peekable();
+            while let Some(chunk) = chunks.next() {
+                let is_last = chunks.peek().is_none();
+                let result = objc::rc::autoreleasepool(|| {
+                    self.model.prefill_tokens_metal(
+                        chunk,
+                        &mut self.cache,
+                        cache,
+                        &mut backend,
+                        is_last,
+                    )
+                })?;
+                if is_last {
+                    self.next_logits = Some(result);
+                }
+            }
+            return Ok(());
         }
         self.next_logits = None;
         for (index, &token) in tokens.iter().enumerate() {

@@ -77,6 +77,7 @@
 - [Matching prompts in warm serving checks](learnings/2026-09-26-warm-serving-prompt-parity.md)
 - [Skipping unused prompt-token scores](learnings/2026-09-26-unused-prefill-scores.md)
 - [Why command-only prompt batching was removed](learnings/2026-09-26-prefill-command-batching.md)
+- [Batched Metal prompt execution](learnings/2026-09-26-metal-batched-prefill.md)
 
 ## Reviews
 
@@ -119,3 +120,4 @@
 - [Split-stage cache reservation review](reviews/2026-09-26-stage-reservations.md)
 - [Complete-worker cache admission review](reviews/2026-09-26-whole-worker-cache.md)
 - [Split activation connection review](reviews/2026-09-26-stage-connection-reuse.md)
+- [Batched Metal prompt review](reviews/2026-09-26-metal-batched-prefill.md)

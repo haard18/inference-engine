@@ -25,6 +25,9 @@ The corrected warm-server check serves the 1.7B Q4_K_M model at about one reques
 - [x] Measure prompt evaluation separately from generation for the 42-token 1.7B Q4_K_M prompt.
 - [x] Avoid unused prompt-token score projections and verify real-model output and conversation reuse.
 - [x] Test a four-token Metal command batch without shared matrix work. It kept real-model scores but made the 42-token prompt slower in five local runs, so the implementation was removed.
-- [ ] Add and verify bounded batched prompt evaluation.
+- [x] Add bounded eight-token batched prompt evaluation to complete Metal sessions. Check tiny, 135M Q4_K_M, and 1.7B Q4_K_M score parity against one-token execution, including cache growth.
 - [x] Repeat the warm-server comparison after the projection change; ordinary throughput rose from 0.987 to 1.068 requests/s in separate short runs.
-- [ ] Repeat the warm-server comparison after batched prompt evaluation.
+- [x] Repeat the warm-server comparison after batched prompt evaluation; median ordinary and streaming rates rose to 2.238 and 2.245 requests/s with the same digest.
+- [x] Run four local Metal serving waves; all 80 requests completed with one stable worker.
+- [ ] Extend the batch path to split Metal stages and verify parity and failure behavior.
+- [ ] Measure sustained two-Mac serving and loss recovery when the second Mac is available.

@@ -1,11 +1,85 @@
 use std::env;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+use inference_engine::MetalRuntime;
 use inference_engine::{
     load_gguf, load_gguf_stage, load_safetensors, ActivationFrame, ByteBpeTokenizer,
     GenerationSession, ModelStage, StageSession,
 };
 use uuid::Uuid;
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+fn real_q4_metal_prompt_batch_matches_incremental_scores() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let model = load_gguf(directory.join("SmolLM2-135M-Q4_K_M.gguf")).unwrap();
+    let prompt: Vec<usize> = (0..20).map(|index| [1, 2, 3, 30][index % 4]).collect();
+    let mut batched = GenerationSession::on_metal(&model).unwrap();
+    let mut incremental = GenerationSession::on_metal(&model).unwrap();
+    batched.prefill(&prompt).unwrap();
+    for &token in &prompt {
+        incremental.prefill(&[token]).unwrap();
+    }
+    assert_eq!(batched.position(), prompt.len());
+    for (index, (actual, expected)) in batched
+        .next_token_scores()
+        .unwrap()
+        .iter()
+        .zip(incremental.next_token_scores().unwrap())
+        .enumerate()
+    {
+        assert!(
+            (actual - expected).abs() < 1e-3,
+            "score {index}: batched {actual}, incremental {expected}"
+        );
+    }
+    assert_eq!(batched.selected_token(), incremental.selected_token());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires SMOLLM2_1_7B_GGUF with the official Q4_K_M checkpoint"]
+fn larger_q4_metal_prompt_batch_matches_incremental_scores() {
+    let path = PathBuf::from(env::var("SMOLLM2_1_7B_GGUF").expect("set SMOLLM2_1_7B_GGUF"));
+    let tokenizer = inference_engine::load_gguf_tokenizer(&path).unwrap();
+    let model = load_gguf(&path).unwrap();
+    let runtime = MetalRuntime::new(&model).unwrap();
+    let prompt = "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nGive a short factual answer: what is two plus two?<|im_end|>\n<|im_start|>assistant\n";
+    let tokens: Vec<usize> = tokenizer
+        .encode(prompt)
+        .unwrap()
+        .into_iter()
+        .map(|token| token as usize)
+        .collect();
+    assert_eq!(tokens.len(), 42);
+    let mut batched = runtime.session();
+    let mut incremental = runtime.session();
+    batched.prefill(&tokens).unwrap();
+    for &token in &tokens {
+        incremental.prefill(&[token]).unwrap();
+    }
+    assert_eq!(batched.position(), 42);
+    for (index, (actual, expected)) in batched
+        .next_token_scores()
+        .unwrap()
+        .iter()
+        .zip(incremental.next_token_scores().unwrap())
+        .enumerate()
+    {
+        assert!(
+            (actual - expected).abs() < 1e-3,
+            "score {index}: batched {actual}, incremental {expected}"
+        );
+    }
+    for _ in 0..7 {
+        assert_eq!(
+            batched.next_token().unwrap(),
+            incremental.next_token().unwrap()
+        );
+    }
+}
 
 #[test]
 #[ignore = "requires Q4_K_M and Q8_0 SmolLM2 GGUF files in SMOLLM2_DIR"]

@@ -154,6 +154,33 @@ fn metal_attention_cache_grows_without_changing_scores() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn batched_metal_prefill_matches_incremental_execution_across_cache_growth() {
+    let model = model(32);
+    let runtime = MetalRuntime::new(&model).unwrap();
+    let prompt: Vec<usize> = (0..32).map(|position| 1 + position % 6).collect();
+    let mut batched = runtime.session();
+    let mut incremental = runtime.session();
+    batched.prefill(&prompt).unwrap();
+    for &token in &prompt {
+        incremental.prefill(&[token]).unwrap();
+    }
+    assert_eq!(batched.position(), prompt.len());
+    assert_eq!(incremental.position(), prompt.len());
+    for (actual, expected) in batched
+        .next_token_scores()
+        .unwrap()
+        .iter()
+        .zip(incremental.next_token_scores().unwrap())
+    {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+    assert_eq!(batched.selected_token(), incremental.selected_token());
+    assert_eq!(batched.next_token(), Err(EngineError::ContextFull));
+    assert_eq!(incremental.next_token(), Err(EngineError::ContextFull));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn f16_model_metal_matches_cpu() {
     let square = Matrix::from_f16_bits(
         2,

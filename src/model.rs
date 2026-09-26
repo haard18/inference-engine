@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use crate::metal_backend::{DecoderStep, MetalBackend, MetalKvCache};
+use crate::metal_backend::{BatchDecoderStep, DecoderStep, MetalBackend, MetalKvCache};
 use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
@@ -670,6 +670,80 @@ impl Model {
         }
         cache.commit(Vec::new(), Vec::new());
         Ok(logits)
+    }
+
+    /// Evaluate known prompt tokens together while keeping attention causal.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn prefill_tokens_metal(
+        &self,
+        tokens: &[usize],
+        cache: &mut KvCache,
+        metal_cache: &mut MetalKvCache,
+        backend: &mut MetalBackend,
+        project_scores: bool,
+    ) -> Result<Vec<f32>, EngineError> {
+        if tokens.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        if cache.position > self.config.max_positions
+            || tokens.len() > self.config.max_positions - cache.position
+        {
+            return Err(EngineError::ContextFull);
+        }
+        if !cache.layers.is_empty() {
+            return Err(EngineError::InvalidConfig("Metal cache has CPU layers"));
+        }
+        let head_count = self.config.num_attention_heads;
+        let head_size = self.config.hidden_size / head_count;
+        let mut hidden = Vec::with_capacity(tokens.len() * self.config.hidden_size);
+        let mut rotations = Vec::with_capacity(tokens.len() * head_size);
+        for (index, &token) in tokens.iter().enumerate() {
+            if token >= self.config.vocab_size {
+                return Err(EngineError::InvalidToken(token));
+            }
+            hidden.extend(self.embed_token(token)?);
+            let position = cache.position + index;
+            for pair in 0..head_size / 2 {
+                let frequency = self
+                    .config
+                    .rope_theta
+                    .powf(-((2 * pair) as f32) / head_size as f32);
+                let (sine, cosine) = (position as f32 * frequency).sin_cos();
+                rotations.extend([sine, cosine]);
+            }
+        }
+        let output = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.token_embeddings);
+        let result = backend.run_prompt_batch(
+            metal_cache,
+            BatchDecoderStep {
+                first_position: cache.position,
+                batch_count: tokens.len(),
+                head_count,
+                kv_head_count: self.config.num_key_value_heads,
+                layers: &self.weights.layers,
+                hidden: &hidden,
+                final_norm: project_scores.then_some(self.weights.final_norm.as_slice()),
+                output: project_scores.then_some(output),
+                epsilon: self.config.rms_norm_epsilon,
+                rotations: &rotations,
+                interleaved: self.config.rope_interleaved,
+            },
+        )?;
+        if !result.iter().all(|value| value.is_finite()) {
+            return Err(EngineError::InvalidValue(if project_scores {
+                "next-token scores"
+            } else {
+                "decoder hidden state"
+            }));
+        }
+        for _ in tokens {
+            cache.commit(Vec::new(), Vec::new());
+        }
+        Ok(result)
     }
 
     fn forward_token_ranges(
