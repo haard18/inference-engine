@@ -19,19 +19,20 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 - [x] Keep the model in a child process and replace it after a hung or failed calculation.
 - [x] Advertise a cache-safe context for the complete worker, reject oversized requests before model work, and require a replacement child to preserve that context contract.
 
-## Next layers
+## Integrated layers
 
-- [ ] Measure throughput, latency, memory, and behavior under concurrent and disconnected clients.
+- [x] Measure throughput, latency, and sampled memory under concurrent local load; verify that disconnected streams do not block later requests. A fresh two-wave 135M Q4_K_M Metal run completed 40/40 requests at concurrency two with one stable worker. The real-model disconnect test passed.
 - [x] Measure restart latency and sampled process-tree memory under repeated worker failures on one host, for both CPU and Metal workers. Physical-device load trials remain open.
 - [x] Add stable device identities, explicit owner-approved pairing, and verified mutual TLS configurations.
 - [x] Connect the mutual TLS transport to a peer listener before listening beyond loopback.
-- [ ] Route whole requests across paired devices with health and loss handling.
-- [ ] Reuse conversation state safely across requests and devices.
-- [ ] Explore model splitting across devices after whole-request routing works.
-- [ ] Improve the Metal path by keeping attention and KV state on the GPU and reducing synchronization.
+- [x] Route whole requests across paired devices with health and loss handling; a real-model test passed for local and peer loss followed by recovery on one host.
+- [x] Reuse exact prompt prefixes with device-owned conversation IDs and bounded eviction; CPU and Metal real-model conversation tests passed.
+- [x] Run model splitting through approved peer services; CPU, Metal, and mixed-backend local tests match complete serving.
+- [x] Keep attention and key/value state on the GPU and run known prompt tokens in bounded Metal batches.
+- [ ] Measure sustained whole-request routing, split serving, and failure recovery on two physical Macs.
 
-The Metal path now executes attention on the GPU and keeps per-session key/value state in growing Metal buffers. Normalization, rotary positions, and activation functions still run on the CPU, with a wait after each Metal operation. The remaining item is the synchronization and full-decoder work.
+The Metal decoder keeps its intermediate hidden state and key/value history on the GPU through each token. Known prompt tokens can run in bounded batches. The CPU supplies token embeddings and rotary values and receives final scores for token choice. Physical two-Mac validation remains the open deployment check.
 
 ## Limits
 
-This API is an intentional subset of chat completions. It supports one model, one choice, greedy decoding, and text messages. It does not claim full OpenAI API compatibility. The local listener is loopback-only; an optional second listener accepts mutually approved peers over TLS. Pool routing is not implemented yet.
+This API is an intentional subset of chat completions. It supports one model, one choice, greedy decoding, and text messages. It does not claim full OpenAI API compatibility. The local listener is loopback-only; an optional second listener accepts mutually approved peers over TLS. Pool routing and split serving pass one-host checks; deployment over a physical LAN is unmeasured.
