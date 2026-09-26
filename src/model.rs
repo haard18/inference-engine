@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use crate::metal_backend::{AttentionStep, MetalBackend, MetalKvCache};
+use crate::metal_backend::{LayerStep, MetalBackend, MetalKvCache};
 use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
@@ -404,6 +404,20 @@ impl Model {
         matrices
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn layer_norms(&self) -> Vec<(&[f32], &[f32])> {
+        self.weights
+            .layers
+            .iter()
+            .map(|layer| {
+                (
+                    layer.attention_norm.as_slice(),
+                    layer.feed_forward_norm.as_slice(),
+                )
+            })
+            .collect()
+    }
+
     /// Bytes held by weight values, excluding allocation and model metadata.
     pub fn stored_weight_bytes(&self) -> usize {
         let mut total = self.weights.token_embeddings.storage_bytes()
@@ -427,8 +441,8 @@ impl Model {
         self.forward_token_ranges(token_id, cache, std::slice::from_ref(&all_layers), multiply)
     }
 
-    /// Metal matrix operations and attention share one command queue, while each
-    /// generation session owns the key/value buffers used by attention.
+    /// Each decoder layer runs in one Metal command. The generation session owns
+    /// its key/value buffers and commits a position only after logits succeed.
     #[cfg(target_os = "macos")]
     pub(crate) fn forward_token_metal(
         &self,
@@ -461,36 +475,20 @@ impl Model {
             rotations.extend([sine, cosine]);
         }
         for (layer_index, layer) in self.weights.layers.iter().enumerate() {
-            let normalized =
-                rms_norm(&hidden, &layer.attention_norm, self.config.rms_norm_epsilon)?;
-            let attended = backend.project_and_attend(
+            hidden = backend.run_layer(
                 metal_cache,
                 layer_index,
-                AttentionStep {
+                LayerStep {
                     position,
                     head_count,
                     kv_head_count,
-                    matrices: (&layer.query, &layer.key, &layer.value),
-                    normalized: &normalized,
+                    layer,
+                    hidden: &hidden,
+                    epsilon: self.config.rms_norm_epsilon,
                     rotations: &rotations,
                     interleaved: self.config.rope_interleaved,
                 },
             )?;
-            let attention_output = backend.mul_vec_many(&[&layer.attention_output], &attended)?;
-            add_in_place(
-                &mut hidden,
-                attention_output
-                    .first()
-                    .ok_or_else(|| EngineError::Backend("missing attention output".into()))?,
-            );
-            let normalized = rms_norm(
-                &hidden,
-                &layer.feed_forward_norm,
-                self.config.rms_norm_epsilon,
-            )?;
-            let feed_forward_output =
-                backend.feed_forward(&layer.gate, &layer.up, &layer.down, &normalized)?;
-            add_in_place(&mut hidden, &feed_forward_output);
         }
         let logits = self.project_logits(&hidden, &mut |matrices, input| {
             backend.mul_vec_many(matrices, input)

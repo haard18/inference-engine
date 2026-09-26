@@ -25,6 +25,11 @@ struct RopeParams {
     uint interleaved;
 };
 
+struct NormParams {
+    uint count;
+    float epsilon;
+};
+
 static float half_at(device const uchar *bytes, uint offset) {
     ushort bits = ushort(bytes[offset]) | (ushort(bytes[offset + 1]) << 8);
     return float(as_type<half>(bits));
@@ -122,6 +127,38 @@ kernel void silu_multiply(
     if (index >= count) return;
     float value = gate[index];
     output[index] = (value / (1.0f + exp(-value))) * up[index];
+}
+
+kernel void rms_scale(
+    device const float *input [[buffer(0)]],
+    device float *scale [[buffer(1)]],
+    constant NormParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index != 0) return;
+    float sum = 0.0f;
+    for (uint i = 0; i < params.count; ++i) sum += input[i] * input[i];
+    scale[0] = 1.0f / sqrt(sum / float(params.count) + params.epsilon);
+}
+
+kernel void rms_apply(
+    device const float *input [[buffer(0)]],
+    device const float *weights [[buffer(1)]],
+    device const float *scale [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &count [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= count) return;
+    output[index] = input[index] * scale[0] * weights[index];
+}
+
+kernel void add_vectors(
+    device const float *left [[buffer(0)]],
+    device const float *right [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= count) return;
+    output[index] = left[index] + right[index];
 }
 
 kernel void rotate_and_store(
