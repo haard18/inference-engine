@@ -9,6 +9,7 @@
 - [Repeated worker recovery](plans/worker-recovery.md)
 - [Metal attention and key/value state](plans/metal-attention.md)
 - [Metal projection-to-attention boundary](plans/metal-projection-attention.md)
+- [Capacity probes during split inference](plans/split-capacity-readiness.md)
 
 ## Learnings
 
@@ -41,6 +42,7 @@
 - [Repeated worker recovery](learnings/2026-09-26-worker-recovery.md)
 - [Metal attention and key/value state](learnings/2026-09-26-metal-attention.md)
 - [Metal projection-to-attention boundary](learnings/2026-09-26-metal-projection-attention.md)
+- [Capacity probes during split inference](learnings/2026-09-26-split-capacity-readiness.md)
 
 ## Reviews
 
@@ -72,3 +74,4 @@
 - [Worker recovery review](reviews/2026-09-26-worker-recovery.md)
 - [Metal attention review](reviews/2026-09-26-metal-attention.md)
 - [Metal projection-to-attention review](reviews/2026-09-26-metal-projection-attention.md)
+- [Split capacity readiness review](reviews/2026-09-26-split-capacity-readiness.md)

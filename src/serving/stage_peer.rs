@@ -5,6 +5,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -68,11 +69,45 @@ pub(super) struct StageChild {
 
 struct StageState {
     worker: Mutex<Option<StageChild>>,
+    worker_ready: AtomicBool,
     expected: StageReady,
     executable: PathBuf,
     model_path: PathBuf,
     queue: Arc<Semaphore>,
     queue_capacity: usize,
+}
+
+/// Keep readiness true while a child is serving a request. Dropping an unfinished
+/// lease also drops the child, so the next capacity check must report it missing.
+struct StageChildLease<'a> {
+    child: Option<StageChild>,
+    worker_ready: &'a AtomicBool,
+}
+
+impl<'a> StageChildLease<'a> {
+    fn new(child: StageChild, worker_ready: &'a AtomicBool) -> Self {
+        Self {
+            child: Some(child),
+            worker_ready,
+        }
+    }
+
+    fn child(&mut self) -> &mut StageChild {
+        self.child.as_mut().expect("stage child lease is active")
+    }
+
+    fn restore(mut self, worker: &mut Option<StageChild>) {
+        *worker = self.child.take();
+        self.worker_ready.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for StageChildLease<'_> {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            self.worker_ready.store(false, Ordering::Release);
+        }
+    }
 }
 
 pub struct StagePeerServer {
@@ -116,6 +151,7 @@ pub async fn start_stage_peer(
     let state = Arc::new(StageState {
         expected: child.ready.clone(),
         worker: Mutex::new(Some(child)),
+        worker_ready: AtomicBool::new(true),
         executable,
         model_path,
         queue: Arc::new(Semaphore::new(queue_capacity)),
@@ -145,6 +181,7 @@ async fn supervise_stage(weak: Weak<StageState>) {
             worker.take();
         }
         if worker.is_none() {
+            state.worker_ready.store(false, Ordering::Release);
             if let Ok(Ok(child)) = tokio::time::timeout(
                 STARTUP_TIMEOUT,
                 StageChild::spawn(
@@ -158,6 +195,7 @@ async fn supervise_stage(weak: Weak<StageState>) {
             {
                 if child.ready == state.expected {
                     *worker = Some(child);
+                    state.worker_ready.store(true, Ordering::Release);
                 }
             }
         }
@@ -180,15 +218,19 @@ impl StagePeerServer {
 }
 
 async fn capacity(State(state): State<Arc<StageState>>) -> Json<StageCapacitySnapshot> {
-    let mut worker = state.worker.lock().await;
-    if worker
-        .as_mut()
-        .is_some_and(|child| !matches!(child.child.try_wait(), Ok(None)))
-    {
-        worker.take();
-    }
+    let ready = match state.worker.try_lock() {
+        Ok(mut worker) => {
+            if worker.as_mut().is_some_and(|child| !child.running()) {
+                worker.take();
+            }
+            let ready = worker.is_some();
+            state.worker_ready.store(ready, Ordering::Release);
+            ready
+        }
+        Err(_) => state.worker_ready.load(Ordering::Acquire),
+    };
     Json(StageCapacitySnapshot {
-        ready: worker.is_some(),
+        ready,
         model_digest: state.expected.model_digest.clone(),
         layer_start: state.expected.layer_start,
         layer_end: state.expected.layer_end,
@@ -229,15 +271,16 @@ async fn activation(
         })?;
     ensure_worker(&state, &mut worker, deadline).await?;
     // Cancellation drops this child and discards any incomplete pipe response.
-    let mut child = worker.take().expect("worker started");
-    let result = tokio::time::timeout_at(deadline, child.step(request_id, &body)).await;
+    let mut child =
+        StageChildLease::new(worker.take().expect("worker started"), &state.worker_ready);
+    let result = tokio::time::timeout_at(deadline, child.child().step(request_id, &body)).await;
     match result {
         Ok(Ok(scores)) => {
-            *worker = Some(child);
+            child.restore(&mut worker);
             Ok(([("content-type", "application/octet-stream")], scores))
         }
         Ok(Err(StageStepError::Rejected(message))) => {
-            *worker = Some(child);
+            child.restore(&mut worker);
             let status = if message.contains("capacity") || message.contains("memory limit") {
                 StatusCode::TOO_MANY_REQUESTS
             } else {
@@ -269,13 +312,18 @@ async fn close(
                 "stage queue wait timed out".into(),
             )
         })?;
+    if worker.as_mut().is_some_and(|child| !child.running()) {
+        worker.take();
+    }
     if worker.is_none() {
+        state.worker_ready.store(false, Ordering::Release);
         return Ok(StatusCode::NO_CONTENT);
     }
-    let mut child = worker.take().expect("worker present");
-    match tokio::time::timeout_at(deadline, child.close(request_id)).await {
+    let mut child =
+        StageChildLease::new(worker.take().expect("worker present"), &state.worker_ready);
+    match tokio::time::timeout_at(deadline, child.child().close(request_id)).await {
         Ok(Ok(())) => {
-            *worker = Some(child);
+            child.restore(&mut worker);
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err((StatusCode::SERVICE_UNAVAILABLE, "stage close failed".into())),
@@ -304,16 +352,18 @@ async fn probe(
     if worker.as_mut().is_some_and(|child| !child.running()) {
         worker.take();
     }
-    let Some(mut child) = worker.take() else {
+    let Some(child) = worker.take() else {
+        state.worker_ready.store(false, Ordering::Release);
         return Ok(Json(json!({"position": null})));
     };
-    match tokio::time::timeout_at(deadline, child.probe(request_id)).await {
+    let mut child = StageChildLease::new(child, &state.worker_ready);
+    match tokio::time::timeout_at(deadline, child.child().probe(request_id)).await {
         Ok(Ok(position)) => {
-            *worker = Some(child);
+            child.restore(&mut worker);
             Ok(Json(json!({"position": position})))
         }
         Ok(Err(StageStepError::Rejected(message))) => {
-            *worker = Some(child);
+            child.restore(&mut worker);
             Err((StatusCode::UNPROCESSABLE_ENTITY, message))
         }
         Ok(Err(StageStepError::Broken(message))) => Err((StatusCode::SERVICE_UNAVAILABLE, message)),
@@ -349,16 +399,18 @@ async fn rewind(
     if worker.as_mut().is_some_and(|child| !child.running()) {
         worker.take();
     }
-    let Some(mut child) = worker.take() else {
+    let Some(child) = worker.take() else {
+        state.worker_ready.store(false, Ordering::Release);
         return Err((StatusCode::CONFLICT, "stage session is missing".into()));
     };
-    match tokio::time::timeout_at(deadline, child.rewind(request_id, position)).await {
+    let mut child = StageChildLease::new(child, &state.worker_ready);
+    match tokio::time::timeout_at(deadline, child.child().rewind(request_id, position)).await {
         Ok(Ok(())) => {
-            *worker = Some(child);
+            child.restore(&mut worker);
             Ok(StatusCode::NO_CONTENT)
         }
         Ok(Err(StageStepError::Rejected(message))) => {
-            *worker = Some(child);
+            child.restore(&mut worker);
             Err((StatusCode::CONFLICT, message))
         }
         Ok(Err(StageStepError::Broken(message))) => Err((StatusCode::SERVICE_UNAVAILABLE, message)),
@@ -378,6 +430,7 @@ async fn ensure_worker(
         worker.take();
     }
     if worker.is_none() {
+        state.worker_ready.store(false, Ordering::Release);
         let remaining = tokio::time::timeout_at(
             deadline,
             StageChild::spawn(
@@ -403,6 +456,7 @@ async fn ensure_worker(
         }
         *worker = Some(remaining);
     }
+    state.worker_ready.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -781,6 +835,22 @@ else:
         })
         .await
         .unwrap();
+        let capacity_request = Request::builder()
+            .uri("/internal/stage/capacity")
+            .body(Body::empty())
+            .unwrap();
+        let capacity = tokio::time::timeout(
+            Duration::from_millis(500),
+            app.clone().oneshot(capacity_request),
+        )
+        .await
+        .expect("capacity must answer while a stage step is running")
+        .unwrap();
+        assert_eq!(capacity.status(), StatusCode::OK);
+        let snapshot: StageCapacitySnapshot =
+            serde_json::from_slice(&to_bytes(capacity.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(snapshot.ready);
+        assert_eq!(snapshot.queue_available, 0);
         first.abort();
         let _ = first.await;
         let response = tokio::time::timeout(Duration::from_secs(5), app.oneshot(request()))

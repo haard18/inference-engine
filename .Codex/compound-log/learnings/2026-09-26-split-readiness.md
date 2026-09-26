@@ -6,4 +6,4 @@ The prefix now probes the approved suffix once a second. It checks the suffix wo
 
 The real-model integration test stops and restarts the suffix. It confirms HTTP 503 for health and new requests during loss, HTTP 200 after recovery, and a cache miss after the suffix restarts. It also confirms that a stream which already emitted text ends with an inference error when the suffix is lost.
 
-Readiness is sampled, not instantaneous. A loss can still admit a request before the second failed probe, and a busy suffix can make a probe time out. The request path retains its own suffix check and reports the execution failure. The probe uses a weak status reference so it ends when the split service is dropped.
+Readiness is sampled, not instantaneous. A loss can still admit a request before the second failed probe. The request path retains its own suffix check and reports the execution failure. The probe uses a weak status reference so it ends when the split service is dropped. A later [capacity probe change](2026-09-26-split-capacity-readiness.md) removed the worker-lock delay during a busy suffix step; network and runtime delays can still make a probe time out.
