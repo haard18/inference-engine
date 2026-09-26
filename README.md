@@ -47,6 +47,14 @@ python3 scripts/local-soak.py /path/to/SmolLM2-135M-Q4_K_M.gguf \
 
 The tool creates a fresh local API key, checks every response and text digest, watches health and the worker process, samples memory for the server and worker, and stops both processes when done. It prints one JSON report. On one Mac, four CPU waves completed all 120 requests with one stable worker and a sampled process-tree maximum of 160,192 KiB. An eight-wave Metal run completed all 240 requests after an autorelease pool was added around each model step. The Metal worker's post-wave resident memory was 248,576 KiB after wave one and 248,384 KiB after wave eight. Before that fix, an eight-wave run's combined server and worker memory rose by 15,472 KiB from wave one to wave eight. The generated text digest stayed the same. Memory values are sampled process resident memory; short spikes between samples can be missed. These runs use one model, one prompt, and one physical Mac.
 
+## Varied conversation state
+
+An opt-in real-model test runs six different conversations through each CPU and Metal worker. It extends the full message history several times, compares every cached answer with a fresh full-history answer, checks exact cached prompt-token counts, and carries state through a streamed response. Both backends also check that a changed prompt recomputes the correct answer. The CPU test checks eviction as well. This exercises the isolated serving worker and chat API in one process; it does not measure a physical network or long-running memory use.
+
+```sh
+SMOLLM2_DIR=/path/to/SmolLM2-135M cargo test --release --test conversation -- --ignored
+```
+
 ## Current milestone
 
 The Rust library runs a Llama-style decoder on the CPU, with an optional Metal path for matrix operations and attention on Macs. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, greedy token selection, and a byte-level BPE tokenizer for the supported SmolLM2 layout. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. It also loads the supported Llama-style GGUF layout with Q8_0 or mixed Q4_K_M matrices, interleaved rotary positions, and tokenizer metadata. Matrix weights retain their source precision in CPU memory, while activations and accumulations use f32. The command-line probes accept token IDs or text. A local server now offers an authenticated subset of the OpenAI chat completion API with ordinary and streaming responses.

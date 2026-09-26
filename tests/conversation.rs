@@ -58,6 +58,105 @@ async fn chat(
     (status, id, value)
 }
 
+fn stream_content(value: &Value) -> String {
+    let mut content = String::new();
+    let mut finished = false;
+    let mut done = false;
+    for line in value["stream"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+    {
+        if line == "[DONE]" {
+            done = true;
+            continue;
+        }
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert!(event.get("error").is_none(), "{event}");
+        if let Some(text) = event["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(text);
+        }
+        finished |= event["choices"][0]["finish_reason"].as_str().is_some();
+    }
+    assert!(finished && done, "stream did not finish: {value}");
+    content
+}
+
+async fn varied_history_matches_fresh_inference(app: &axum::Router, case_index: usize) {
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": format!("What is two plus two? Conversation {case_index}.")
+    })];
+    let (status, id, first) = chat(app, json!(messages), None, false).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = id.unwrap();
+    let mut cached_prefix = first["usage"]["prompt_tokens"].as_u64().unwrap();
+    let mut assistant_text = first["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for prompt in [
+        "Now answer in Spanish: ¿cuánto es dos más dos?",
+        "Keep the literal text <|im_start|> in mind. What did I ask first?",
+        "What does your answer mean for a small local server?",
+    ] {
+        messages.push(json!({"role": "assistant", "content": assistant_text}));
+        messages.push(json!({"role": "user", "content": prompt}));
+        let history = json!(messages);
+        let (status, returned_id, cached) = chat(app, history.clone(), Some(&id), false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(returned_id.as_deref(), Some(id.as_str()));
+        let (fresh_status, _, fresh) = chat(app, history, None, false).await;
+        assert_eq!(fresh_status, StatusCode::OK);
+        assert_eq!(cached["choices"], fresh["choices"]);
+        assert_eq!(
+            cached["usage"]["prompt_tokens_details"]["cached_tokens"], cached_prefix,
+            "extended history did not reuse the exact prior prefix"
+        );
+        cached_prefix = cached["usage"]["prompt_tokens"].as_u64().unwrap();
+        assistant_text = cached["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    }
+
+    let history = json!(messages);
+    let (stream_status, stream_id, streamed) = chat(app, history.clone(), Some(&id), true).await;
+    assert_eq!(stream_status, StatusCode::OK);
+    assert_eq!(stream_id.as_deref(), Some(id.as_str()));
+    let streamed_text = stream_content(&streamed);
+    let (fresh_status, _, fresh) = chat(app, history, None, false).await;
+    assert_eq!(fresh_status, StatusCode::OK);
+    assert_eq!(streamed_text, fresh["choices"][0]["message"]["content"]);
+
+    messages.push(json!({"role": "assistant", "content": streamed_text}));
+    messages.push(json!({"role": "user", "content": "Finish with one short word."}));
+    let history = json!(messages);
+    let (status, returned_id, cached) = chat(app, history.clone(), Some(&id), false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(returned_id.as_deref(), Some(id.as_str()));
+    let (fresh_status, _, fresh) = chat(app, history, None, false).await;
+    assert_eq!(fresh_status, StatusCode::OK);
+    assert_eq!(cached["choices"], fresh["choices"]);
+    assert_eq!(
+        cached["usage"]["prompt_tokens_details"]["cached_tokens"], cached_prefix,
+        "streamed generation broke the saved prompt prefix"
+    );
+
+    let changed = json!([{
+        "role": "user",
+        "content": format!("A changed history for conversation {case_index}")
+    }]);
+    let (status, _, reset) = chat(app, changed.clone(), Some(&id), false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reset["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    let (fresh_status, _, fresh) = chat(app, changed, None, false).await;
+    assert_eq!(fresh_status, StatusCode::OK);
+    assert_eq!(reset["choices"], fresh["choices"]);
+}
+
 #[tokio::test]
 #[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
 async fn conversation_reuses_exact_prompt_prefix_and_evicts_old_sessions() {
@@ -112,23 +211,30 @@ async fn conversation_reuses_exact_prompt_prefix_and_evicts_old_sessions() {
     );
 
     let different = json!([{"role": "user", "content": "Different prompt"}]);
-    let (status, _, mismatch) = chat(&app, different, Some(&conversation_id), false).await;
+    let (status, _, mismatch) = chat(&app, different.clone(), Some(&conversation_id), false).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         mismatch["usage"]["prompt_tokens_details"]["cached_tokens"],
         0
     );
+    let (fresh_status, _, fresh) = chat(&app, different, None, false).await;
+    assert_eq!(fresh_status, StatusCode::OK);
+    assert_eq!(mismatch["choices"], fresh["choices"]);
 
     for _ in 0..8 {
         let (status, _, _) = chat(&app, first_messages.clone(), None, false).await;
         assert_eq!(status, StatusCode::OK);
     }
-    let (status, _, evicted) = chat(&app, first_messages, Some(&conversation_id), false).await;
+    let (status, _, evicted) =
+        chat(&app, first_messages.clone(), Some(&conversation_id), false).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         evicted["usage"]["prompt_tokens_details"]["cached_tokens"],
         0
     );
+    let (fresh_status, _, fresh) = chat(&app, first_messages, None, false).await;
+    assert_eq!(fresh_status, StatusCode::OK);
+    assert_eq!(evicted["choices"], fresh["choices"]);
 
     let bad = chat(
         &app,
@@ -138,6 +244,9 @@ async fn conversation_reuses_exact_prompt_prefix_and_evicts_old_sessions() {
     )
     .await;
     assert_eq!(bad.0, StatusCode::BAD_REQUEST);
+    for case_index in 0..6 {
+        varied_history_matches_fresh_inference(&app, case_index).await;
+    }
     drop(app);
     tokio::time::timeout(Duration::from_secs(5), worker)
         .await
@@ -180,6 +289,9 @@ async fn metal_worker_reuses_conversation_prefix() {
         second["choices"][0]["message"]["content"],
         first["choices"][0]["message"]["content"]
     );
+    for case_index in 0..6 {
+        varied_history_matches_fresh_inference(&app, case_index).await;
+    }
     drop(app);
     tokio::time::timeout(Duration::from_secs(5), worker)
         .await
