@@ -14,6 +14,7 @@
 - [One Metal command per decoder layer](plans/metal-decoder-layer.md)
 - [One Metal command per token](plans/metal-token-command.md)
 - [Reviewable two-Mac comparison](plans/lan-comparison.md)
+- [CPU matrix-row execution](plans/cpu-matrix-rows.md)
 
 ## Learnings
 
@@ -51,6 +52,8 @@
 - [One Metal command per decoder layer](learnings/2026-09-26-metal-decoder-layer.md)
 - [One Metal command per token](learnings/2026-09-26-metal-token-command.md)
 - [Reviewable LAN comparison](learnings/2026-09-26-lan-comparison.md)
+- [Measured llama.cpp reference](learnings/2026-09-26-llama-reference.md)
+- [Parallel CPU output rows](learnings/2026-09-26-cpu-matrix-rows.md)
 
 ## Reviews
 
@@ -87,3 +90,4 @@
 - [Metal decoder-layer review](reviews/2026-09-26-metal-decoder-layer.md)
 - [Metal token-command review](reviews/2026-09-26-metal-token-command.md)
 - [LAN comparison review](reviews/2026-09-26-lan-comparison.md)
+- [CPU output-row review](reviews/2026-09-26-cpu-matrix-rows.md)

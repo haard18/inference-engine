@@ -1,5 +1,6 @@
 use crate::EngineError;
 use half::{bf16, f16};
+use rayon::prelude::*;
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -222,37 +223,42 @@ impl Matrix {
         if self.cols == 0 {
             return Ok(result);
         }
+        let elements = self.rows * self.cols;
         match &self.data {
             MatrixData::F32(values) => {
-                for (output, row) in result.iter_mut().zip(values.chunks_exact(self.cols)) {
+                for_each_output_row(&mut result, elements, |index, output| {
+                    let row = &values[index * self.cols..(index + 1) * self.cols];
                     *output = row
                         .iter()
                         .zip(input)
                         .map(|(weight, value)| weight * value)
                         .sum();
-                }
+                });
             }
             MatrixData::F16(values) => {
-                for (output, row) in result.iter_mut().zip(values.chunks_exact(self.cols)) {
+                for_each_output_row(&mut result, elements, |index, output| {
+                    let row = &values[index * self.cols..(index + 1) * self.cols];
                     *output = row
                         .iter()
                         .zip(input)
                         .map(|(&bits, value)| f16::from_bits(bits).to_f32() * value)
                         .sum();
-                }
+                });
             }
             MatrixData::Bf16(values) => {
-                for (output, row) in result.iter_mut().zip(values.chunks_exact(self.cols)) {
+                for_each_output_row(&mut result, elements, |index, output| {
+                    let row = &values[index * self.cols..(index + 1) * self.cols];
                     *output = row
                         .iter()
                         .zip(input)
                         .map(|(&bits, value)| bf16::from_bits(bits).to_f32() * value)
                         .sum();
-                }
+                });
             }
             MatrixData::Q8_0(values) => {
                 let row_bytes = self.cols / 32 * 34;
-                for (output, row) in result.iter_mut().zip(values.chunks_exact(row_bytes)) {
+                for_each_output_row(&mut result, elements, |index, output| {
+                    let row = &values[index * row_bytes..(index + 1) * row_bytes];
                     for (block, input_block) in row
                         .as_chunks::<34>()
                         .0
@@ -268,11 +274,12 @@ impl Matrix {
                             .sum();
                         *output += scale * dot;
                     }
-                }
+                });
             }
             MatrixData::Q5_0(values) => {
                 let row_bytes = self.cols / 32 * 22;
-                for (output, row) in result.iter_mut().zip(values.chunks_exact(row_bytes)) {
+                for_each_output_row(&mut result, elements, |index, output| {
+                    let row = &values[index * row_bytes..(index + 1) * row_bytes];
                     for (block, input_block) in row
                         .as_chunks::<22>()
                         .0
@@ -285,11 +292,12 @@ impl Matrix {
                             .map(|(weight, value)| weight * value)
                             .sum::<f32>();
                     }
-                }
+                });
             }
             MatrixData::Q4K(values) => {
                 let row_bytes = self.cols / 256 * 144;
-                for (output, row) in result.iter_mut().zip(values.chunks_exact(row_bytes)) {
+                for_each_output_row(&mut result, elements, |index, output| {
+                    let row = &values[index * row_bytes..(index + 1) * row_bytes];
                     for (block, input_block) in row
                         .as_chunks::<144>()
                         .0
@@ -302,10 +310,26 @@ impl Matrix {
                             .map(|(weight, value)| weight * value)
                             .sum::<f32>();
                     }
-                }
+                });
             }
         }
         Ok(result)
+    }
+}
+
+fn for_each_output_row<F>(output: &mut [f32], elements: usize, compute: F)
+where
+    F: Fn(usize, &mut f32) + Sync + Send,
+{
+    if elements >= 256 * 1024 && output.len() >= 64 {
+        output
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| compute(index, value));
+    } else {
+        for (index, value) in output.iter_mut().enumerate() {
+            compute(index, value);
+        }
     }
 }
 

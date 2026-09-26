@@ -12,6 +12,29 @@ fn matrix(seed: usize, rows: usize, cols: usize) -> Matrix {
     Matrix::new(rows, cols, values).unwrap()
 }
 
+#[test]
+fn large_matrix_rows_match_serial_dot() {
+    let rows = 128;
+    let cols = 2048;
+    let values: Vec<f32> = (0..rows * cols)
+        .map(|index| ((index * 37) % 31) as f32 / 64.0 - 0.25)
+        .collect();
+    let input: Vec<f32> = (0..cols)
+        .map(|index| ((index * 11) % 19) as f32 / 32.0 - 0.25)
+        .collect();
+    let expected: Vec<f32> = values
+        .chunks_exact(cols)
+        .map(|row| {
+            row.iter()
+                .zip(&input)
+                .map(|(weight, value)| weight * value)
+                .sum()
+        })
+        .collect();
+    let matrix = Matrix::new(rows, cols, values).unwrap();
+    assert_eq!(matrix.mul_vec(&input).unwrap(), expected);
+}
+
 fn model(max_positions: usize) -> Model {
     let config = ModelConfig {
         vocab_size: 8,

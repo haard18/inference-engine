@@ -14,6 +14,7 @@ http-body-util = "0.1.5"
 hyper = { version = "1.11.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 rcgen = "0.14.10"
+rayon = "1.12.0"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 safetensors = "0.8.0"
 serde = { version = "1.0.229", features = ["derive"] }
