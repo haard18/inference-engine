@@ -12,6 +12,7 @@
 - [Compact weights](learnings/2026-09-26-compact-weights.md)
 - [Per-tensor loading](learnings/2026-09-26-per-tensor-loading.md)
 - [GGUF Q8_0 parity](learnings/2026-09-26-gguf-q8-parity.md)
+- [Tokenization from GGUF](learnings/2026-09-26-gguf-tokenizer.md)
 
 ## Reviews
 
@@ -20,3 +21,4 @@
 - [Compact weights review](reviews/2026-09-26-compact-weights.md)
 - [Per-tensor loading review](reviews/2026-09-26-per-tensor-loading.md)
 - [GGUF Q8_0 review](reviews/2026-09-26-gguf-q8.md)
+- [GGUF tokenizer review](reviews/2026-09-26-gguf-tokenizer.md)

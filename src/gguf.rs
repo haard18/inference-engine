@@ -6,7 +6,10 @@ use std::path::Path;
 
 use half::{bf16, f16};
 
-use crate::{EngineError, LayerWeights, Matrix, Model, ModelConfig, ModelWeights};
+use crate::{
+    ByteBpeTokenizer, EngineError, LayerWeights, Matrix, Model, ModelConfig, ModelWeights,
+    TokenizerError,
+};
 
 const MAX_STRING_BYTES: u64 = 16_000_000;
 const MAX_ENTRIES: u64 = 1_000_000;
@@ -15,6 +18,7 @@ const MAX_ENTRIES: u64 = 1_000_000;
 pub enum GgufError {
     Io(std::io::Error),
     Engine(EngineError),
+    Tokenizer(TokenizerError),
     Invalid(String),
     Unsupported(String),
 }
@@ -24,6 +28,7 @@ impl fmt::Display for GgufError {
         match self {
             Self::Io(error) => write!(f, "could not read GGUF file: {error}"),
             Self::Engine(error) => write!(f, "invalid GGUF model: {error}"),
+            Self::Tokenizer(error) => write!(f, "invalid GGUF tokenizer: {error}"),
             Self::Invalid(message) => write!(f, "invalid GGUF file: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported GGUF option: {message}"),
         }
@@ -44,10 +49,19 @@ impl From<EngineError> for GgufError {
     }
 }
 
+impl From<TokenizerError> for GgufError {
+    fn from(error: TokenizerError) -> Self {
+        Self::Tokenizer(error)
+    }
+}
+
 enum Value {
     U32(u32),
     F32(f32),
+    Bool(bool),
     String(String),
+    Strings(Vec<String>),
+    I32s(Vec<i32>),
 }
 
 struct TensorInfo {
@@ -67,7 +81,7 @@ struct GgufReader {
 
 /// Load the supported Llama-style GGUF layout, retaining Q8_0 matrices in block form.
 pub fn load_gguf(path: impl AsRef<Path>) -> Result<Model, GgufError> {
-    let mut source = GgufReader::open(path)?;
+    let mut source = GgufReader::open(path, false)?;
     if source.string("general.architecture")? != "llama" {
         return Err(GgufError::Unsupported("model architecture".into()));
     }
@@ -139,8 +153,54 @@ pub fn load_gguf(path: impl AsRef<Path>) -> Result<Model, GgufError> {
     Model::new(config, weights).map_err(GgufError::from)
 }
 
+/// Load the supported SmolLM byte-level BPE tokenizer from GGUF metadata.
+pub fn load_gguf_tokenizer(path: impl AsRef<Path>) -> Result<ByteBpeTokenizer, GgufError> {
+    let mut source = GgufReader::open(path, true)?;
+    if source.metadata_keys.iter().any(|key| {
+        key.starts_with("tokenizer.ggml.")
+            && !matches!(
+                key.as_str(),
+                "tokenizer.ggml.model"
+                    | "tokenizer.ggml.pre"
+                    | "tokenizer.ggml.tokens"
+                    | "tokenizer.ggml.token_type"
+                    | "tokenizer.ggml.merges"
+                    | "tokenizer.ggml.add_space_prefix"
+                    | "tokenizer.ggml.bos_token_id"
+                    | "tokenizer.ggml.eos_token_id"
+                    | "tokenizer.ggml.unknown_token_id"
+                    | "tokenizer.ggml.add_bos_token"
+            )
+    }) {
+        return Err(GgufError::Unsupported("tokenizer metadata".into()));
+    }
+    if source.string("tokenizer.ggml.model")? != "gpt2"
+        || source.string("tokenizer.ggml.pre")? != "smollm"
+        || source.boolean("tokenizer.ggml.add_space_prefix")?
+        || source.boolean("tokenizer.ggml.add_bos_token")?
+    {
+        return Err(GgufError::Unsupported("tokenizer layout".into()));
+    }
+    let tokens = source.take_strings("tokenizer.ggml.tokens")?;
+    let types = source.take_i32s("tokenizer.ggml.token_type")?;
+    for key in [
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.unknown_token_id",
+    ] {
+        let index = source.integer(key)? as usize;
+        if types.get(index) != Some(&3) {
+            return Err(GgufError::Invalid(format!(
+                "invalid special token ID {key}"
+            )));
+        }
+    }
+    ByteBpeTokenizer::from_gguf_parts(tokens, source.take_strings("tokenizer.ggml.merges")?, types)
+        .map_err(GgufError::from)
+}
+
 impl GgufReader {
-    fn open(path: impl AsRef<Path>) -> Result<Self, GgufError> {
+    fn open(path: impl AsRef<Path>, load_tokenizer: bool) -> Result<Self, GgufError> {
         let mut file = File::open(path)?;
         let file_len = file.seek(SeekFrom::End(0))?;
         file.rewind()?;
@@ -167,7 +227,8 @@ impl GgufReader {
             let kind = read_u32(&mut file)?;
             let keep = key == "general.architecture"
                 || key == "general.alignment"
-                || key.starts_with("llama.");
+                || key.starts_with("llama.")
+                || (load_tokenizer && key.starts_with("tokenizer.ggml."));
             let value = read_value(&mut file, file_len, kind, keep)?;
             if key == "general.alignment" {
                 alignment = match value {
@@ -280,6 +341,27 @@ impl GgufReader {
         }
     }
 
+    fn boolean(&self, key: &str) -> Result<bool, GgufError> {
+        match self.values.get(key) {
+            Some(Value::Bool(value)) => Ok(*value),
+            _ => Err(GgufError::Invalid(format!("missing boolean {key}"))),
+        }
+    }
+
+    fn take_strings(&mut self, key: &str) -> Result<Vec<String>, GgufError> {
+        match self.values.remove(key) {
+            Some(Value::Strings(values)) => Ok(values),
+            _ => Err(GgufError::Invalid(format!("missing string array {key}"))),
+        }
+    }
+
+    fn take_i32s(&mut self, key: &str) -> Result<Vec<i32>, GgufError> {
+        match self.values.remove(key) {
+            Some(Value::I32s(values)) => Ok(values),
+            _ => Err(GgufError::Invalid(format!("missing integer array {key}"))),
+        }
+    }
+
     fn tensor(&mut self, name: &str) -> Result<(u32, Vec<usize>, Vec<u8>), GgufError> {
         let info = self
             .tensors
@@ -367,6 +449,11 @@ fn read_value(
     let value = match kind {
         4 if keep => Some(Value::U32(read_u32(file)?)),
         6 if keep => Some(Value::F32(f32::from_le_bytes(read_bytes::<4>(file)?))),
+        7 if keep => Some(Value::Bool(match read_bytes::<1>(file)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(GgufError::Invalid("invalid boolean metadata".into())),
+        })),
         8 if keep => Some(Value::String(read_string(file)?)),
         8 => {
             skip_string(file, file_len)?;
@@ -375,13 +462,26 @@ fn read_value(
         9 => {
             let element_type = read_u32(file)?;
             let count = read_u64(file)?;
-            if count > 10_000_000 {
+            if count > MAX_ENTRIES {
                 return Err(GgufError::Invalid("metadata array too large".into()));
             }
-            if element_type == 8 {
+            if keep && element_type == 8 {
+                Some(Value::Strings(
+                    (0..count)
+                        .map(|_| read_string(file))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            } else if keep && element_type == 5 {
+                Some(Value::I32s(
+                    (0..count)
+                        .map(|_| Ok(i32::from_le_bytes(read_bytes::<4>(file)?)))
+                        .collect::<Result<Vec<_>, GgufError>>()?,
+                ))
+            } else if element_type == 8 {
                 for _ in 0..count {
                     skip_string(file, file_len)?;
                 }
+                None
             } else {
                 let width = primitive_width(element_type)?;
                 skip_bytes(
@@ -391,8 +491,8 @@ fn read_value(
                         .checked_mul(width)
                         .ok_or_else(|| GgufError::Invalid("array length overflow".into()))?,
                 )?;
+                None
             }
-            None
         }
         _ => {
             skip_bytes(file, file_len, primitive_width(kind)?)?;
@@ -539,7 +639,7 @@ mod tests {
     #[test]
     fn reads_a_q8_0_tensor() {
         let fixture = Fixture::new(&archive(&[0]));
-        let mut reader = GgufReader::open(&fixture.0).unwrap();
+        let mut reader = GgufReader::open(&fixture.0, false).unwrap();
         let (kind, shape, data) = reader.tensor("tensor.0").unwrap();
         assert_eq!(kind, 8);
         assert_eq!(shape, [32, 1]);
@@ -550,14 +650,14 @@ mod tests {
     fn rejects_overlapping_or_truncated_tensors() {
         let overlap = Fixture::new(&archive(&[0, 0]));
         assert!(matches!(
-            GgufReader::open(&overlap.0),
+            GgufReader::open(&overlap.0, false),
             Err(GgufError::Invalid(_))
         ));
         let mut truncated = archive(&[0]);
         truncated.truncate(truncated.len() - 1);
         let truncated = Fixture::new(&truncated);
         assert!(matches!(
-            GgufReader::open(&truncated.0),
+            GgufReader::open(&truncated.0, false),
             Err(GgufError::Invalid(_))
         ));
     }

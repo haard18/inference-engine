@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::process;
 
-use inference_engine::{load_gguf, ByteBpeTokenizer, GenerationSession};
+use inference_engine::{load_gguf, load_gguf_tokenizer, GenerationSession};
 
 fn main() {
     if let Err(error) = run() {
@@ -13,21 +13,17 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 5 {
-        return Err(format!(
-            "usage: {} MODEL_GGUF TOKENIZER_JSON PROMPT GENERATION_COUNT",
-            args[0]
-        )
-        .into());
+    if args.len() != 4 {
+        return Err(format!("usage: {} MODEL_GGUF PROMPT GENERATION_COUNT", args[0]).into());
     }
-    let tokenizer = ByteBpeTokenizer::from_file(&args[2])?;
+    let tokenizer = load_gguf_tokenizer(&args[1])?;
     let prompt: Vec<usize> = tokenizer
-        .encode(&args[3])?
+        .encode(&args[2])?
         .into_iter()
         .map(|id| id as usize)
         .collect();
     let model = load_gguf(&args[1])?;
-    let count: usize = args[4].parse()?;
+    let count: usize = args[3].parse()?;
     let mut session = GenerationSession::new(&model);
     session.prefill(&prompt)?;
     let mut generated = Vec::with_capacity(count);

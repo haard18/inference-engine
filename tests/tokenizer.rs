@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use inference_engine::ByteBpeTokenizer;
+use inference_engine::{load_gguf_tokenizer, ByteBpeTokenizer};
 use tokenizers::Tokenizer;
 
 #[test]
@@ -40,6 +40,54 @@ fn smollm2_tokenizer_matches_reference() {
             .map(|index| fragments[(case * 7 + index * 11 + index * case) % fragments.len()])
             .collect::<String>();
         compare(&ours, &reference, &prompt);
+    }
+}
+
+#[test]
+#[ignore = "requires SmolLM2-135M-Q8_0.gguf and tokenizer.json in SMOLLM2_DIR"]
+fn smollm2_gguf_tokenizer_matches_json_and_reference() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let json_path = directory.join("tokenizer.json");
+    let gguf =
+        load_gguf_tokenizer(directory.join("SmolLM2-135M-Q8_0.gguf")).expect("load GGUF tokenizer");
+    let json = ByteBpeTokenizer::from_file(&json_path).expect("load JSON tokenizer");
+    let reference = Tokenizer::from_file(&json_path).expect("load reference tokenizer");
+    let prompts = [
+        "The capital of France is",
+        "Hello, world!",
+        "  whitespace\n\tand  two spaces ",
+        "abc123def 2026-09-26",
+        "é café 東京 😀",
+        "<|im_start|>user\nHello<|im_end|>",
+        "a<|endoftext|>b",
+        "don't we'll I've",
+    ];
+    for prompt in prompts {
+        let expected = json.encode(prompt).expect("encode with JSON");
+        assert_eq!(gguf.encode(prompt).expect("encode with GGUF"), expected);
+        compare(&gguf, &reference, prompt);
+        assert_eq!(
+            gguf.decode(&expected, false).unwrap(),
+            json.decode(&expected, false).unwrap()
+        );
+    }
+    let fragments = [
+        "hello",
+        " ",
+        "  ",
+        "\n",
+        "42",
+        "élan",
+        "東京",
+        "!",
+        "<|im_end|>",
+    ];
+    for case in 0..100 {
+        let prompt = (0..12)
+            .map(|index| fragments[(case * 7 + index * 11 + index * case) % fragments.len()])
+            .collect::<String>();
+        assert_eq!(gguf.encode(&prompt).unwrap(), json.encode(&prompt).unwrap());
+        compare(&gguf, &reference, &prompt);
     }
 }
 

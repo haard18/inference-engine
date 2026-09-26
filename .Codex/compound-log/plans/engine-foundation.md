@@ -34,7 +34,8 @@ Build the model execution core before device pooling. The core must produce corr
 - [x] Preserve real-model numerical parity and measure the memory change.
 - [x] Reduce load-time file buffering while preserving Safetensors validation.
 - [x] Add Q8_0 block execution and load the supported GGUF model layout.
-- [ ] Add further quantized formats, GGUF-native tokenization, and Metal.
+- [x] Read the supported SmolLM byte-level BPE tokenizer from GGUF metadata without a separate JSON file.
+- [ ] Add further quantized formats and Metal.
 
 ## Risks
 

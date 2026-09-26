@@ -161,13 +161,6 @@ impl ByteBpeTokenizer {
                 return Err(TokenizerError::InvalidVocabulary(piece.clone()));
             }
         }
-        let mut merge_rank = HashMap::with_capacity(model.merges.len());
-        for (rank, merge) in model.merges.into_iter().enumerate() {
-            let (left, right) = merge
-                .split_once(' ')
-                .ok_or_else(|| TokenizerError::InvalidVocabulary(merge.clone()))?;
-            merge_rank.insert((left.to_owned(), right.to_owned()), rank);
-        }
         let mut special = Vec::with_capacity(spec.added_tokens.len());
         for token in spec.added_tokens {
             if !token.special
@@ -185,6 +178,52 @@ impl ByteBpeTokenizer {
             }
             special.push((token.content, token.id));
         }
+        Self::build(model.vocab, tokens, model.merges, special)
+    }
+
+    pub(crate) fn from_gguf_parts(
+        pieces: Vec<String>,
+        merges: Vec<String>,
+        token_types: Vec<i32>,
+    ) -> Result<Self, TokenizerError> {
+        if pieces.len() != token_types.len() || pieces.len() > u32::MAX as usize {
+            return Err(TokenizerError::Unsupported("GGUF token types"));
+        }
+        let mut vocab = HashMap::with_capacity(pieces.len());
+        let mut tokens = Vec::with_capacity(pieces.len());
+        let mut special = Vec::new();
+        for (index, (piece, kind)) in pieces.into_iter().zip(token_types).enumerate() {
+            match kind {
+                1 => {}
+                3 => special.push((piece.clone(), index as u32)),
+                _ => return Err(TokenizerError::Unsupported("GGUF token type")),
+            }
+            if vocab.insert(piece.clone(), index as u32).is_some() {
+                return Err(TokenizerError::InvalidVocabulary(piece));
+            }
+            tokens.push(Some(piece));
+        }
+        Self::build(vocab, tokens, merges, special)
+    }
+
+    fn build(
+        vocab: HashMap<String, u32>,
+        tokens: Vec<Option<String>>,
+        merges: Vec<String>,
+        mut special: Vec<(String, u32)>,
+    ) -> Result<Self, TokenizerError> {
+        let mut merge_rank = HashMap::with_capacity(merges.len());
+        for (rank, merge) in merges.into_iter().enumerate() {
+            let (left, right) = merge
+                .split_once(' ')
+                .ok_or_else(|| TokenizerError::InvalidVocabulary(merge.clone()))?;
+            if merge_rank
+                .insert((left.to_owned(), right.to_owned()), rank)
+                .is_some()
+            {
+                return Err(TokenizerError::InvalidVocabulary(merge));
+            }
+        }
         special.sort_by_key(|token| std::cmp::Reverse(token.0.len()));
         let byte_to_char = byte_alphabet();
         let char_to_byte = byte_to_char
@@ -193,7 +232,7 @@ impl ByteBpeTokenizer {
             .map(|(index, &letter)| (letter, index as u8))
             .collect();
         Ok(Self {
-            vocab: model.vocab,
+            vocab,
             tokens,
             merge_rank,
             special,
@@ -320,4 +359,21 @@ fn byte_alphabet() -> [char; 256] {
         }
     }
     alphabet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ByteBpeTokenizer;
+
+    #[test]
+    fn rejects_invalid_gguf_vocabulary() {
+        assert!(ByteBpeTokenizer::from_gguf_parts(
+            vec!["a".into(), "a".into()],
+            vec![],
+            vec![1, 1]
+        )
+        .is_err());
+        assert!(ByteBpeTokenizer::from_gguf_parts(vec!["a".into()], vec![], vec![]).is_err());
+        assert!(ByteBpeTokenizer::from_gguf_parts(vec!["a".into()], vec![], vec![2]).is_err());
+    }
 }
