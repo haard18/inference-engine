@@ -1,0 +1,23 @@
+# Model splitting plan
+
+## Goal
+
+Run one model across two approved owner-owned devices when it does not fit on one device, without requiring both devices to load the full model. Keep whole-request routing for models that fit independently on each worker.
+
+## Existing boundary
+
+`Model::forward_token` currently embeds one token, executes every decoder layer, projects next-token scores, and commits all key/value cache entries. `GenerationSession` owns one cache for all layers. The GGUF loader reads every layer into one `ModelWeights`. These three boundaries must change together so a stage owns only its assigned weights and cache.
+
+## Layers and acceptance checks
+
+1. Extract a layer-range executor and split the token step into embedding, layers, and output projection. Prove that a local two-stage run gives the same scores, selected tokens, and cache positions as the whole-model path for a fixed fixture and the real Q4_K_M model.
+2. Add a GGUF stage loader that reads only the needed layer range and its endpoint weights. The prefix stage needs token embeddings; the suffix stage needs final norm and output projection. For tied embeddings, the suffix also needs the embedding matrix for output projection. Check actual stored-weight bytes for each stage and reject incompatible stage ranges or model identities.
+3. Add separate, bounded key/value state per stage and a versioned activation message containing model identity, request identity, token position, and `hidden_size` f32 values. Validate lengths and finite values before executing a stage. SmolLM2-135M has 576 hidden values, so a raw f32 activation is 2,304 bytes per token at one boundary, before protocol overhead.
+4. Run each stage on its assigned device through the existing approved peer channel. Keep per-request stage placement fixed; stop generation clearly if either stage or the link fails after output begins. Admit only when both stages have capacity. Keep the full request deadline and bounded memory rules.
+5. Check real-model parity, stage memory, output rate, first-token latency, and injected peer loss. Compare the split with one-device execution and whole-request pooling on two physical Macs. Model splitting succeeds when both workers hold less than the full model's weights where the format permits and the combined run produces the same greedy tokens within the established score tolerance.
+
+## Risks to measure
+
+- Tied embeddings limit memory savings because the prefix and suffix both need that matrix.
+- A network round trip per token may make splitting slower than a single capable worker. Prefill batching can reduce message overhead later, but correctness comes first.
+- A failed stage cannot be silently retried after tokens have streamed to a caller.

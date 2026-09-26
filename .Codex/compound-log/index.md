@@ -5,6 +5,7 @@
 - [Engine foundation](plans/engine-foundation.md)
 - [Per-device serving](plans/per-device-serving.md)
 - [Device pooling](plans/device-pooling.md)
+- [Model splitting](plans/model-splitting.md)
 
 ## Learnings
 
@@ -24,6 +25,7 @@
 - [Encrypted peer listener](learnings/2026-09-26-peer-listener.md)
 - [Capacity-aware request routing](learnings/2026-09-26-capacity-routing.md)
 - [Reusable conversation checkpoints](learnings/2026-09-26-conversation-state.md)
+- [Co-located pool measurement](learnings/2026-09-26-pool-measurement.md)
 
 ## Reviews
 
@@ -42,3 +44,4 @@
 - [Peer listener review](reviews/2026-09-26-peer-listener.md)
 - [Capacity routing review](reviews/2026-09-26-capacity-routing.md)
 - [Conversation state review](reviews/2026-09-26-conversation-state.md)
+- [Pool measurement review](reviews/2026-09-26-pool-measurement.md)

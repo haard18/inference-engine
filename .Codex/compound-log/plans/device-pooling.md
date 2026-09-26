@@ -13,10 +13,11 @@ Let an owner join two or more of their devices into one reliable inference servi
 - [x] Define an authenticated peer capacity snapshot with model inventory, readiness, queue space, and whole-request forwarding.
 - [x] Route complete requests to local or peer workers with bounded admission and clear overload responses.
 - [x] Handle peer loss before and during responses, retry only before output escapes, and treat capacity snapshots as hints with destination-side admission.
-- [ ] Measure two-device behavior with live models and failure injection.
+- [x] Measure a co-located two-worker pool with a live model; exercise peer loss in end-to-end tests.
+- [ ] Measure two physical Macs over the LAN with repeated throughput, latency, memory, and loss trials.
 - [x] Reuse exact prompt prefixes across requests with device-owned conversation IDs and bounded checkpoint eviction.
-- [ ] Explore model splitting after whole-request routing is correct and measured.
+- [ ] Split model layers across devices, transfer hidden activations, and verify output parity and per-device memory reduction.
 
 ## Current boundary
 
-The peer listener uses mutually approved certificates and exposes the same bounded local model worker over an encrypted API. The local listener remains on loopback. A coordinator compares local backlog with fresh peer snapshots and forwards a whole request when a compatible peer has less work. Conversation IDs preserve device ownership for cached prompt prefixes. If an owner is lost, the full prompt can be rebuilt on another device and receives a new ID. The destination worker enforces queue admission after a potentially stale snapshot. Multi-device performance measurements and model splitting remain open. Peer trust changes take effect after a restart.
+The peer listener uses mutually approved certificates and exposes the same bounded local model worker over an encrypted API. The local listener remains on loopback. A coordinator compares local backlog with fresh peer snapshots and forwards a whole request when a compatible peer has less work. Conversation IDs preserve device ownership for cached prompt prefixes. If an owner is lost, the full prompt can be rebuilt on another device and receives a new ID. The destination worker enforces queue admission after a potentially stale snapshot. A co-located live-model pilot shows that two workers can share concurrent requests. Physical LAN measurements and model splitting remain open. Peer trust changes take effect after a restart.
