@@ -385,7 +385,9 @@ impl GgufReader {
         match kind {
             0 => Matrix::new(rows, cols, decode_f32(&data)?).map_err(GgufError::from),
             1 => Matrix::from_f16_bits(rows, cols, decode_u16(&data)?).map_err(GgufError::from),
+            6 => Matrix::from_q5_0(rows, cols, data).map_err(GgufError::from),
             8 => Matrix::from_q8_0(rows, cols, data).map_err(GgufError::from),
+            12 => Matrix::from_q4_k(rows, cols, data).map_err(GgufError::from),
             30 => Matrix::from_bf16_bits(rows, cols, decode_u16(&data)?).map_err(GgufError::from),
             _ => Err(GgufError::Unsupported(format!("tensor type {kind}"))),
         }
@@ -421,10 +423,12 @@ fn tensor_size(kind: u32, dims: &[usize]) -> Result<u64, GgufError> {
     let bytes = match kind {
         0 => elements.checked_mul(4),
         1 | 30 => elements.checked_mul(2),
+        6 if dims[0].is_multiple_of(32) => (elements / 32).checked_mul(22),
         8 if dims[0].is_multiple_of(32) => (elements / 32).checked_mul(34),
-        8 => {
+        12 if dims[0].is_multiple_of(256) => (elements / 256).checked_mul(144),
+        6 | 8 | 12 => {
             return Err(GgufError::Invalid(
-                "Q8_0 tensor width must divide by 32".into(),
+                "quantized tensor width must divide by block width".into(),
             ))
         }
         _ => return Err(GgufError::Unsupported(format!("tensor type {kind}"))),

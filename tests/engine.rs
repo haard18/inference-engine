@@ -165,3 +165,35 @@ fn q8_0_blocks_compute_without_expanding_weights() {
         EngineError::InvalidValue("Q8_0 matrix scale")
     );
 }
+
+#[test]
+fn q5_0_blocks_decode_high_bits_and_compute() {
+    let mut block = vec![0_u8; 22];
+    block[..2].copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+    block[2..6].copy_from_slice(&(1_u32 | (1_u32 << 16)).to_le_bytes());
+    block[6] = 0xf0;
+    let matrix = Matrix::from_q5_0(1, 32, block).unwrap();
+    assert_eq!(matrix.storage_bytes(), 22);
+    let row = matrix.row(0).unwrap();
+    assert_eq!(row[0], 0.0);
+    assert_eq!(row[16], 15.0);
+    assert_eq!(row[1], -16.0);
+    assert_eq!(matrix.mul_vec(&[1.0; 32]).unwrap(), [-465.0]);
+    assert!(Matrix::from_q5_0(1, 31, vec![]).is_err());
+}
+
+#[test]
+fn q4_k_blocks_decode_subscales_and_compute() {
+    let mut block = vec![0_u8; 144];
+    block[..2].copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+    block[4..8].fill(1);
+    block[12..16].fill(1);
+    block[16..].fill(0xf0);
+    let matrix = Matrix::from_q4_k(1, 256, block).unwrap();
+    assert_eq!(matrix.storage_bytes(), 144);
+    let row = matrix.row(0).unwrap();
+    assert_eq!(&row[..32], &[0.0; 32]);
+    assert_eq!(&row[32..64], &[15.0; 32]);
+    assert_eq!(matrix.mul_vec(&[1.0; 256]).unwrap(), [1920.0]);
+    assert!(Matrix::from_q4_k(1, 255, vec![]).is_err());
+}

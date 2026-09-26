@@ -7,7 +7,9 @@ enum MatrixData {
     F32(Vec<f32>),
     F16(Vec<u16>),
     Bf16(Vec<u16>),
+    Q5_0(Vec<u8>),
     Q8_0(Vec<u8>),
+    Q4K(Vec<u8>),
 }
 
 /// A contiguous row-major tensor with two dimensions.
@@ -90,6 +92,40 @@ impl Matrix {
         })
     }
 
+    /// Q5_0 stores 32 weights in a 22-byte block.
+    pub fn from_q5_0(rows: usize, cols: usize, data: Vec<u8>) -> Result<Self, EngineError> {
+        validate_quantized_length(rows, cols, data.len(), 32, 22, "Q5_0 matrix")?;
+        if !data
+            .as_chunks::<22>()
+            .0
+            .iter()
+            .all(|block| f16::from_bits(u16::from_le_bytes([block[0], block[1]])).is_finite())
+        {
+            return Err(EngineError::InvalidValue("Q5_0 matrix scale"));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            data: MatrixData::Q5_0(data),
+        })
+    }
+
+    /// Q4_K stores 256 weights in a 144-byte block.
+    pub fn from_q4_k(rows: usize, cols: usize, data: Vec<u8>) -> Result<Self, EngineError> {
+        validate_quantized_length(rows, cols, data.len(), 256, 144, "Q4_K matrix")?;
+        if !data.as_chunks::<144>().0.iter().all(|block| {
+            f16::from_bits(u16::from_le_bytes([block[0], block[1]])).is_finite()
+                && f16::from_bits(u16::from_le_bytes([block[2], block[3]])).is_finite()
+        }) {
+            return Err(EngineError::InvalidValue("Q4_K matrix scale"));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            data: MatrixData::Q4K(data),
+        })
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -103,7 +139,9 @@ impl Matrix {
         match &self.data {
             MatrixData::F32(values) => values.len() * size_of::<f32>(),
             MatrixData::F16(values) | MatrixData::Bf16(values) => values.len() * size_of::<u16>(),
-            MatrixData::Q8_0(values) => values.len(),
+            MatrixData::Q5_0(values) | MatrixData::Q8_0(values) | MatrixData::Q4K(values) => {
+                values.len()
+            }
         }
     }
 
@@ -135,6 +173,24 @@ impl Matrix {
                             .iter()
                             .map(move |&quant| scale * (quant as i8 as f32))
                     })
+                    .collect()
+            }
+            MatrixData::Q5_0(values) => {
+                let row_bytes = self.cols / 32 * 22;
+                values[index * row_bytes..(index + 1) * row_bytes]
+                    .as_chunks::<22>()
+                    .0
+                    .iter()
+                    .flat_map(dequantize_q5_0)
+                    .collect()
+            }
+            MatrixData::Q4K(values) => {
+                let row_bytes = self.cols / 256 * 144;
+                values[index * row_bytes..(index + 1) * row_bytes]
+                    .as_chunks::<144>()
+                    .0
+                    .iter()
+                    .flat_map(dequantize_q4_k)
                     .collect()
             }
         })
@@ -200,9 +256,114 @@ impl Matrix {
                     }
                 }
             }
+            MatrixData::Q5_0(values) => {
+                let row_bytes = self.cols / 32 * 22;
+                for (output, row) in result.iter_mut().zip(values.chunks_exact(row_bytes)) {
+                    for (block, input_block) in row
+                        .as_chunks::<22>()
+                        .0
+                        .iter()
+                        .zip(input.as_chunks::<32>().0)
+                    {
+                        *output += dequantize_q5_0(block)
+                            .iter()
+                            .zip(input_block)
+                            .map(|(weight, value)| weight * value)
+                            .sum::<f32>();
+                    }
+                }
+            }
+            MatrixData::Q4K(values) => {
+                let row_bytes = self.cols / 256 * 144;
+                for (output, row) in result.iter_mut().zip(values.chunks_exact(row_bytes)) {
+                    for (block, input_block) in row
+                        .as_chunks::<144>()
+                        .0
+                        .iter()
+                        .zip(input.as_chunks::<256>().0)
+                    {
+                        *output += dequantize_q4_k(block)
+                            .iter()
+                            .zip(input_block)
+                            .map(|(weight, value)| weight * value)
+                            .sum::<f32>();
+                    }
+                }
+            }
         }
         Ok(result)
     }
+}
+
+fn validate_quantized_length(
+    rows: usize,
+    cols: usize,
+    actual: usize,
+    block_width: usize,
+    block_bytes: usize,
+    name: &'static str,
+) -> Result<(), EngineError> {
+    if !cols.is_multiple_of(block_width) {
+        return Err(EngineError::InvalidConfig(
+            "quantized matrix width must divide by block width",
+        ));
+    }
+    let expected = rows
+        .checked_mul(cols / block_width)
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .ok_or(EngineError::InvalidConfig("quantized matrix size overflow"))?;
+    if actual != expected {
+        return Err(EngineError::InvalidShape {
+            name,
+            expected: vec![expected],
+            actual: vec![actual],
+        });
+    }
+    Ok(())
+}
+
+fn dequantize_q5_0(block: &[u8; 22]) -> [f32; 32] {
+    let scale = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+    let high_bits = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let mut output = [0.0; 32];
+    for index in 0..16 {
+        let packed = block[6 + index];
+        let low = (packed & 0x0f) | ((((high_bits >> index) & 1) as u8) << 4);
+        let high = (packed >> 4) | ((((high_bits >> (index + 16)) & 1) as u8) << 4);
+        output[index] = scale * (i32::from(low) - 16) as f32;
+        output[index + 16] = scale * (i32::from(high) - 16) as f32;
+    }
+    output
+}
+
+fn q4_k_scale_min(scales: &[u8], index: usize) -> (f32, f32) {
+    if index < 4 {
+        ((scales[index] & 63) as f32, (scales[index + 4] & 63) as f32)
+    } else {
+        (
+            ((scales[index + 4] & 15) | ((scales[index - 4] >> 6) << 4)) as f32,
+            ((scales[index + 4] >> 4) | ((scales[index] >> 6) << 4)) as f32,
+        )
+    }
+}
+
+fn dequantize_q4_k(block: &[u8; 144]) -> [f32; 256] {
+    let scale = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+    let minimum = f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
+    let scales = &block[4..16];
+    let mut output = [0.0; 256];
+    for group in 0..4 {
+        let (low_scale, low_minimum) = q4_k_scale_min(scales, group * 2);
+        let (high_scale, high_minimum) = q4_k_scale_min(scales, group * 2 + 1);
+        for index in 0..32 {
+            let packed = block[16 + group * 32 + index];
+            output[group * 64 + index] =
+                (scale * low_scale) * f32::from(packed & 15) - minimum * low_minimum;
+            output[group * 64 + 32 + index] =
+                (scale * high_scale) * f32::from(packed >> 4) - minimum * high_minimum;
+        }
+    }
+    output
 }
 
 fn validate_length(rows: usize, cols: usize, actual: usize) -> Result<(), EngineError> {

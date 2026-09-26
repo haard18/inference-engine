@@ -1,4 +1,4 @@
-"""Independent NumPy reference for a local SmolLM2-135M Q8_0 GGUF file.
+"""Independent NumPy reference for a local SmolLM2-135M GGUF file.
 
 Run with: python3 tests/reference_gguf.py MODEL_GGUF
 """
@@ -79,6 +79,39 @@ def tensor(name: str) -> np.ndarray:
     count = int(np.prod(shape))
     if kind == 0:
         return np.frombuffer(model_map, dtype="<f4", count=count, offset=data_start + offset).reshape(shape)
+    if kind == 6 and dimensions[0] % 32 == 0:
+        blocks = np.frombuffer(model_map, dtype=np.uint8, count=count // 32 * 22, offset=data_start + offset).reshape(-1, 22)
+        scales = np.frombuffer(blocks[:, :2].copy().tobytes(), dtype="<f2").astype(np.float32)
+        high = np.frombuffer(blocks[:, 2:6].copy().tobytes(), dtype="<u4")[:, None]
+        packed = blocks[:, 6:].astype(np.int32)
+        positions = np.arange(16, dtype=np.uint32)
+        low = (packed & 15) | (((high >> positions) & 1) << 4)
+        upper = (packed >> 4) | (((high >> (positions + 16)) & 1) << 4)
+        values = np.concatenate([low, upper], axis=1).astype(np.float32) - 16
+        return (values * scales[:, None]).reshape(shape)
+    if kind == 12 and dimensions[0] % 256 == 0:
+        blocks = np.frombuffer(model_map, dtype=np.uint8, count=count // 256 * 144, offset=data_start + offset).reshape(-1, 144)
+        scales = blocks[:, 4:16]
+        q = blocks[:, 16:]
+        d = np.frombuffer(blocks[:, :2].copy().tobytes(), dtype="<f2").astype(np.float32)
+        dmin = np.frombuffer(blocks[:, 2:4].copy().tobytes(), dtype="<f2").astype(np.float32)
+        output = np.empty((len(blocks), 256), dtype=np.float32)
+
+        def scale_min(index: int):
+            if index < 4:
+                return scales[:, index] & 63, scales[:, index + 4] & 63
+            return (scales[:, index + 4] & 15) | ((scales[:, index - 4] >> 6) << 4), \
+                (scales[:, index + 4] >> 4) | ((scales[:, index] >> 6) << 4)
+
+        for group in range(4):
+            lower_scale, lower_min = scale_min(group * 2)
+            upper_scale, upper_min = scale_min(group * 2 + 1)
+            packed = q[:, group * 32:(group + 1) * 32]
+            output[:, group * 64:group * 64 + 32] = \
+                (d * lower_scale)[:, None] * (packed & 15) - (dmin * lower_min)[:, None]
+            output[:, group * 64 + 32:group * 64 + 64] = \
+                (d * upper_scale)[:, None] * (packed >> 4) - (dmin * upper_min)[:, None]
+        return output.reshape(shape)
     if kind != 8 or dimensions[0] % 32:
         raise ValueError(f"Unexpected tensor type: {name}, {kind}")
     blocks = np.frombuffer(model_map, dtype=np.uint8, count=count // 32 * 34, offset=data_start + offset).reshape(-1, 34)
