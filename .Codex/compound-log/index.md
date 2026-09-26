@@ -23,6 +23,7 @@
 - [Device identity and pairing](learnings/2026-09-26-device-pairing.md)
 - [Encrypted peer listener](learnings/2026-09-26-peer-listener.md)
 - [Capacity-aware request routing](learnings/2026-09-26-capacity-routing.md)
+- [Reusable conversation checkpoints](learnings/2026-09-26-conversation-state.md)
 
 ## Reviews
 
@@ -40,3 +41,4 @@
 - [Device pairing review](reviews/2026-09-26-device-pairing.md)
 - [Peer listener review](reviews/2026-09-26-peer-listener.md)
 - [Capacity routing review](reviews/2026-09-26-capacity-routing.md)
+- [Conversation state review](reviews/2026-09-26-conversation-state.md)

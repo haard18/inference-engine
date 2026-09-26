@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, WWW_AUTHENTICATE};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -28,10 +28,13 @@ use uuid::Uuid;
 use crate::MetalRuntime;
 use crate::{ByteBpeDecoder, ByteBpeTokenizer, GenerationSession, Model};
 
+mod conversation;
 mod coordinator;
 mod isolated;
 mod peer;
+use conversation::ConversationId;
 use coordinator::Coordinator;
+pub const CONVERSATION_HEADER: &str = conversation::HEADER;
 pub use isolated::{run_worker_stdio, start_isolated, start_isolated_paired};
 pub use peer::PeerServer;
 
@@ -95,6 +98,8 @@ impl fmt::Display for ServingError {
 impl std::error::Error for ServingError {}
 
 struct AppState {
+    device_id: Uuid,
+    session_reuse: bool,
     model_id: String,
     api_key: Vec<u8>,
     tokenizer: Arc<ByteBpeTokenizer>,
@@ -180,6 +185,7 @@ impl Drop for ActiveJob {
 struct Job {
     prompt: Vec<usize>,
     max_tokens: usize,
+    conversation_id: Option<String>,
     deadline: Instant,
     output: mpsc::Sender<WorkerEvent>,
 }
@@ -190,6 +196,7 @@ enum WorkerEvent {
     Finished {
         reason: &'static str,
         completion_tokens: usize,
+        reused_prompt_tokens: usize,
     },
     Failed(String),
     TimedOut,
@@ -293,6 +300,7 @@ fn start_state(
                             WorkerEvent::Finished {
                                 reason,
                                 completion_tokens,
+                                reused_prompt_tokens: 0,
                             },
                         ) {
                             let _ = send_event(&handle, &job.output, WorkerEvent::End);
@@ -336,6 +344,8 @@ fn start_state(
         .map_err(|_| ServingError::Worker("worker exited during startup".into()))?
         .map_err(ServingError::Worker)?;
     let state = Arc::new(AppState {
+        device_id: Uuid::new_v4(),
+        session_reuse: false,
         model_id: config.model_id,
         api_key: config.api_key.into_bytes(),
         tokenizer,
@@ -535,23 +545,69 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    chat_completions_impl(state, payload, false).await
+    chat_completions_impl(state, headers, payload, false).await
 }
 
 async fn pooled_chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    chat_completions_impl(state, payload, true).await
+    chat_completions_impl(state, headers, payload, true).await
 }
 
 async fn chat_completions_impl(
     state: Arc<AppState>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
     route_to_peers: bool,
 ) -> Response {
+    let supplied = headers
+        .get_all(CONVERSATION_HEADER)
+        .iter()
+        .collect::<Vec<_>>();
+    let requested_conversation = match supplied.as_slice() {
+        [] => None,
+        [value] if state.session_reuse => match value.to_str().ok().and_then(ConversationId::parse)
+        {
+            Some(id) => Some(id),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_conversation_id",
+                    "conversation ID is invalid",
+                )
+            }
+        },
+        [_] => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_conversation_id",
+                "conversation reuse is unavailable",
+            )
+        }
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_conversation_id",
+                "one conversation ID is required",
+            )
+        }
+    };
+    if !route_to_peers
+        && requested_conversation
+            .as_ref()
+            .is_some_and(|id| id.owner() != state.device_id)
+    {
+        return error_response(
+            StatusCode::CONFLICT,
+            "conversation_owned_elsewhere",
+            "conversation belongs to another device",
+        );
+    }
     let Json(value) = match payload {
         Ok(value) => value,
         Err(error) => {
@@ -578,20 +634,45 @@ async fn chat_completions_impl(
     if route_to_peers {
         if let Some(coordinator) = &state.coordinator {
             let required_positions = prompt.len().saturating_add(max_tokens);
-            if let Some(peer) = coordinator
-                .choose(
-                    &state.snapshot(),
-                    &request.model,
-                    required_positions,
-                    max_tokens,
-                )
-                .await
+            let local = state.snapshot();
+            let owner_peer = match requested_conversation.as_ref() {
+                Some(id) if id.owner() != state.device_id => {
+                    coordinator
+                        .owner_if_available(
+                            &id.owner().to_string(),
+                            &request.model,
+                            required_positions,
+                            max_tokens,
+                        )
+                        .await
+                }
+                _ => None,
+            };
+            let peer = if owner_peer.is_some() {
+                owner_peer
+            } else if requested_conversation
+                .as_ref()
+                .is_some_and(|id| id.owner() == state.device_id)
+                && local.ready
+                && local.queue_available > 0
             {
+                None
+            } else {
+                coordinator
+                    .choose(&local, &request.model, required_positions, max_tokens)
+                    .await
+            };
+            if let Some(peer) = peer {
                 if let Ok(body) = serde_json::to_vec(&value) {
+                    let peer_conversation = requested_conversation
+                        .as_ref()
+                        .filter(|id| id.owner().to_string() == peer.device_id())
+                        .map(ConversationId::as_str);
                     if let Ok(response) = peer
                         .forward_chat(
                             body,
                             request.stream,
+                            peer_conversation,
                             deadline.saturating_duration_since(Instant::now()),
                         )
                         .await
@@ -612,6 +693,10 @@ async fn chat_completions_impl(
         return timeout_response();
     }
     let id = format!("chatcmpl-{}", Uuid::new_v4());
+    let conversation_id = state.session_reuse.then(|| match requested_conversation {
+        Some(id) if id.owner() == state.device_id => id,
+        _ => ConversationId::new(state.device_id),
+    });
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
@@ -626,6 +711,7 @@ async fn chat_completions_impl(
     let job = Job {
         prompt,
         max_tokens,
+        conversation_id: conversation_id.as_ref().map(|id| id.as_str().to_owned()),
         deadline,
         output,
     };
@@ -653,7 +739,7 @@ async fn chat_completions_impl(
             )
         }
     }
-    if request.stream {
+    let mut response = if request.stream {
         let model_id = state.model_id.clone();
         let stream = ReceiverStream::new(deadline_stream(receiver, deadline)).map(move |event| {
             Ok::<Event, Infallible>(
@@ -684,7 +770,15 @@ async fn chat_completions_impl(
             Ok(response) => response,
             Err(_) => timeout_response(),
         }
+    };
+    if let Some(conversation_id) = conversation_id {
+        response.headers_mut().insert(
+            CONVERSATION_HEADER,
+            HeaderValue::from_str(conversation_id.as_str())
+                .expect("UUID conversation ID is a valid header"),
+        );
     }
+    response
 }
 
 fn deadline_stream(
@@ -870,6 +964,7 @@ async fn collect_response(
             WorkerEvent::Finished {
                 reason,
                 completion_tokens,
+                reused_prompt_tokens,
             } => {
                 return Json(json!({
                     "id": id,
@@ -884,6 +979,7 @@ async fn collect_response(
                     "usage": {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
+                        "prompt_tokens_details": {"cached_tokens": reused_prompt_tokens},
                         "total_tokens": prompt_tokens + completion_tokens
                     }
                 }))
@@ -1003,6 +1099,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let worker_status = Arc::new(WorkerStatus::default());
         let app = router(Arc::new(AppState {
+            device_id: Uuid::new_v4(),
+            session_reuse: false,
             model_id: "local-smollm2".into(),
             api_key: KEY.as_bytes().to_vec(),
             tokenizer: Arc::new(tokenizer),
@@ -1021,6 +1119,8 @@ mod tests {
     async fn peer_capacity_reports_available_queue_and_worker_readiness() {
         let (sender, receiver) = mpsc::channel(1);
         let state = Arc::new(AppState {
+            device_id: Uuid::new_v4(),
+            session_reuse: false,
             model_id: "local-smollm2".into(),
             api_key: KEY.as_bytes().to_vec(),
             tokenizer: Arc::new(test_tokenizer()),
@@ -1048,6 +1148,7 @@ mod tests {
             .try_send(Job {
                 prompt: vec![1],
                 max_tokens: 1,
+                conversation_id: None,
                 deadline: Instant::now() + Duration::from_secs(30),
                 output,
             })
@@ -1127,6 +1228,7 @@ mod tests {
                 .send(WorkerEvent::Finished {
                     reason: "length",
                     completion_tokens: 1,
+                    reused_prompt_tokens: 0,
                 })
                 .await
                 .unwrap();
@@ -1212,6 +1314,7 @@ mod tests {
             .try_send(Job {
                 prompt: vec![usize::MAX],
                 max_tokens: 1,
+                conversation_id: None,
                 deadline: Instant::now() + Duration::from_secs(30),
                 output,
             })
@@ -1287,11 +1390,14 @@ mod tests {
             .try_send(Job {
                 prompt: vec![1],
                 max_tokens: 1,
+                conversation_id: None,
                 deadline: Instant::now() + Duration::from_secs(30),
                 output,
             })
             .unwrap();
         let saturated = router(Arc::new(AppState {
+            device_id: Uuid::new_v4(),
+            session_reuse: false,
             model_id: "local-smollm2".into(),
             api_key: KEY.as_bytes().to_vec(),
             tokenizer: Arc::new(tokenizer),

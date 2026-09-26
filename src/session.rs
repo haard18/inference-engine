@@ -2,6 +2,7 @@
 use crate::metal_backend::MetalBackend;
 use crate::model::KvCache;
 use crate::{EngineError, Model};
+use std::mem::size_of;
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +18,11 @@ pub struct GenerationSession<'a> {
     cache: KvCache,
     next_logits: Option<Vec<f32>>,
     backend: Backend<'a>,
+}
+
+pub(crate) struct SessionCheckpoint {
+    position: usize,
+    next_logits: Option<Vec<f32>>,
 }
 
 impl<'a> GenerationSession<'a> {
@@ -58,6 +64,26 @@ impl<'a> GenerationSession<'a> {
 
     pub fn position(&self) -> usize {
         self.cache.position()
+    }
+
+    pub(crate) fn checkpoint(&self) -> SessionCheckpoint {
+        SessionCheckpoint {
+            position: self.cache.position(),
+            next_logits: self.next_logits.clone(),
+        }
+    }
+
+    pub(crate) fn rewind(&mut self, checkpoint: SessionCheckpoint) {
+        self.cache.truncate(checkpoint.position);
+        self.next_logits = checkpoint.next_logits;
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.cache.allocated_bytes()
+            + self
+                .next_logits
+                .as_ref()
+                .map_or(0, |logits| logits.capacity() * size_of::<f32>())
     }
 
     pub fn prefill(&mut self, tokens: &[usize]) -> Result<(), EngineError> {

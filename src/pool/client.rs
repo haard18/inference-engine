@@ -20,6 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::tls::{client_config, server_name};
 use super::{DeviceIdentity, PoolError, TrustedPeer};
 use crate::serving::CapacitySnapshot;
+use crate::serving::CONVERSATION_HEADER;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -111,14 +112,19 @@ impl PeerClient {
         &self,
         body: Vec<u8>,
         stream: bool,
+        conversation_id: Option<&str>,
         response_timeout: Duration,
     ) -> Result<Response<Body>, PoolError> {
         let deadline = tokio::time::Instant::now() + response_timeout;
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
             .header("host", "peer")
-            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(id) = conversation_id {
+            request = request.header(CONVERSATION_HEADER, id);
+        }
+        let request = request
             .body(Full::new(Bytes::from(body)))
             .map_err(|error| PoolError::Transport(error.to_string()))?;
         let response = match self.send(request, deadline).await {
@@ -132,8 +138,12 @@ impl PeerClient {
             self.mark_failure();
         }
         let mut forwarded = Response::builder().status(response.status());
-        for header in [CONTENT_TYPE, CACHE_CONTROL] {
-            if let Some(value) = response.headers().get(&header) {
+        for header in [
+            CONTENT_TYPE.as_str(),
+            CACHE_CONTROL.as_str(),
+            CONVERSATION_HEADER,
+        ] {
+            if let Some(value) = response.headers().get(header) {
                 forwarded = forwarded.header(header, value);
             }
         }
@@ -313,7 +323,7 @@ mod tests {
         });
         let client = PeerClient::new(&a, a_peers.peers()[0].clone()).unwrap();
         let streamed = client
-            .forward_chat(b"{}".to_vec(), true, Duration::from_secs(2))
+            .forward_chat(b"{}".to_vec(), true, None, Duration::from_secs(2))
             .await
             .unwrap();
         let bytes =
@@ -327,7 +337,7 @@ mod tests {
         assert!(client.cooling_down());
 
         let ordinary = client
-            .forward_chat(b"{}".to_vec(), false, Duration::from_secs(2))
+            .forward_chat(b"{}".to_vec(), false, None, Duration::from_secs(2))
             .await;
         assert!(ordinary.is_err());
         tokio::time::timeout(Duration::from_secs(3), server)

@@ -10,7 +10,9 @@ use inference_engine::load_gguf_tokenizer;
 use inference_engine::pool::client::PeerClient;
 use inference_engine::pool::tls::{client_config, server_name};
 use inference_engine::pool::{DeviceIdentity, PeerStore, TrustedPeer};
-use inference_engine::serving::{start_isolated_paired, ServingBackend, ServingConfig};
+use inference_engine::serving::{
+    start_isolated_paired, ServingBackend, ServingConfig, CONVERSATION_HEADER,
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -168,7 +170,7 @@ async fn paired_peer_serves_real_model_and_rejects_unapproved_device() {
     assert!(chat.starts_with("HTTP/1.1 200"), "{chat}");
     assert!(chat.contains("Say hi"), "{chat}");
     let forwarded = client
-        .forward_chat(body.into_bytes(), false, Duration::from_secs(30))
+        .forward_chat(body.into_bytes(), false, None, Duration::from_secs(30))
         .await
         .unwrap();
     assert_eq!(forwarded.status(), StatusCode::OK);
@@ -176,6 +178,23 @@ async fn paired_peer_serves_real_model_and_rejects_unapproved_device() {
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&forwarded_body).contains("Say hi"));
+    let foreign_id = format!("{}.{}", approved.device_id, uuid::Uuid::new_v4());
+    let foreign = client
+        .forward_chat(
+            json!({
+                "model": "local-smollm2",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_completion_tokens": 2
+            })
+            .to_string()
+            .into_bytes(),
+            false,
+            Some(&foreign_id),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::CONFLICT);
     let streamed = client
         .forward_chat(
             json!({
@@ -187,6 +206,7 @@ async fn paired_peer_serves_real_model_and_rejects_unapproved_device() {
             .to_string()
             .into_bytes(),
             true,
+            None,
             Duration::from_secs(30),
         )
         .await
@@ -437,7 +457,7 @@ async fn coordinator_sends_next_request_to_idle_peer_while_local_worker_is_busy(
     let script = fake_dir.path().join("worker");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf '%s\\n' '{\"kind\":\"ready\",\"max_positions\":2048}'\nIFS= read -r request\n: > \"$2/active\"\nexec sleep 60\n",
+        "#!/bin/sh\nprintf '%s\\n' '{\"kind\":\"ready\",\"max_positions\":2048}'\nif [ ! -f \"$2/active\" ]; then\n  IFS= read -r request\n  : > \"$2/active\"\n  exec sleep 60\nfi\nwhile IFS= read -r request; do\n  printf '%s\\n' '{\"kind\":\"delta\",\"text\":\"local\"}'\n  printf '%s\\n' '{\"kind\":\"finished\",\"reason\":\"length\",\"completion_tokens\":1}'\ndone\n",
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -504,6 +524,13 @@ async fn coordinator_sends_next_request_to_idle_peer_while_local_worker_is_busy(
         .unwrap()
         .unwrap();
     assert_eq!(second.status(), StatusCode::OK);
+    let conversation_id = second
+        .headers()
+        .get(CONVERSATION_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     let content = axum::body::to_bytes(second.into_body(), 1024 * 1024)
         .await
         .unwrap();
@@ -511,12 +538,94 @@ async fn coordinator_sends_next_request_to_idle_peer_while_local_worker_is_busy(
 
     first.abort();
     let _ = first.await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let ready = local_a
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if ready.status() == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let followup = local_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {KEY}"))
+                .header("content-type", "application/json")
+                .header(CONVERSATION_HEADER, &conversation_id)
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(followup.status(), StatusCode::OK);
+    assert_eq!(
+        followup.headers().get(CONVERSATION_HEADER).unwrap(),
+        conversation_id.as_str()
+    );
+    let followup = axum::body::to_bytes(followup.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let followup: serde_json::Value = serde_json::from_slice(&followup).unwrap();
+    assert!(
+        followup["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(followup["choices"][0]["message"]["content"], "Say hi");
     handle_b.graceful_shutdown(Some(Duration::from_secs(2)));
     tokio::time::timeout(Duration::from_secs(5), running_b)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    let migrated = local_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {KEY}"))
+                .header("content-type", "application/json")
+                .header(CONVERSATION_HEADER, &conversation_id)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(migrated.status(), StatusCode::OK);
+    let migrated_id = migrated
+        .headers()
+        .get(CONVERSATION_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_ne!(migrated_id, conversation_id);
+    assert!(migrated_id.starts_with(&a.device_id));
+    let migrated_body = axum::body::to_bytes(migrated.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let migrated_body: serde_json::Value = serde_json::from_slice(&migrated_body).unwrap();
+    assert_eq!(
+        migrated_body["usage"]["prompt_tokens_details"]["cached_tokens"],
+        0
+    );
+    assert_eq!(migrated_body["choices"][0]["message"]["content"], "local");
     drop(local_a);
     tokio::time::timeout(Duration::from_secs(5), worker_a)
         .await

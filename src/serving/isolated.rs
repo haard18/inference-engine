@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use super::{
     router, validate_config, ActiveJob, AppState, Coordinator, Job, PeerServer, ServingBackend,
@@ -22,6 +23,9 @@ use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 #[cfg(target_os = "macos")]
 use crate::MetalRuntime;
 use crate::{load_gguf, load_gguf_tokenizer, ByteBpeDecoder, ByteBpeTokenizer, GenerationSession};
+
+mod session_cache;
+use session_cache::SessionCache;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -38,6 +42,8 @@ enum WireEvent {
     Finished {
         reason: String,
         completion_tokens: usize,
+        #[serde(default)]
+        reused_prompt_tokens: usize,
     },
     Failed {
         message: String,
@@ -48,6 +54,8 @@ enum WireEvent {
 struct WireRequest {
     prompt: Vec<usize>,
     max_tokens: usize,
+    #[serde(default)]
+    conversation_id: Option<String>,
 }
 
 struct ChildWorker {
@@ -71,7 +79,7 @@ pub async fn start_isolated(
     executable: impl AsRef<Path>,
 ) -> Result<(Router, tokio::task::JoinHandle<()>), ServingError> {
     let (state, task) =
-        start_isolated_state(model_path, tokenizer, config, executable, None).await?;
+        start_isolated_state(model_path, tokenizer, config, executable, None, None).await?;
     Ok((router(state), task))
 }
 
@@ -88,12 +96,15 @@ pub async fn start_isolated_paired(
         server_config(identity, peers).map_err(|error| ServingError::Peer(error.to_string()))?;
     let coordinator =
         Coordinator::new(identity, peers).map_err(|error| ServingError::Peer(error.to_string()))?;
+    let device_id = Uuid::parse_str(&identity.device_id)
+        .map_err(|_| ServingError::Peer("device ID is invalid".into()))?;
     let (state, task) = start_isolated_state(
         model_path,
         tokenizer,
         config,
         executable,
         Some(Arc::new(coordinator)),
+        Some(device_id),
     )
     .await?;
     Ok((
@@ -109,6 +120,7 @@ async fn start_isolated_state(
     config: ServingConfig,
     executable: impl AsRef<Path>,
     coordinator: Option<Arc<Coordinator>>,
+    device_id: Option<Uuid>,
 ) -> Result<(Arc<AppState>, tokio::task::JoinHandle<()>), ServingError> {
     validate_config(&config)?;
     let model_path = fs::canonicalize(model_path)
@@ -121,6 +133,8 @@ async fn start_isolated_state(
     let (sender, receiver) = mpsc::channel(config.queue_capacity);
     let worker_status = Arc::new(WorkerStatus::default());
     let state = Arc::new(AppState {
+        device_id: device_id.unwrap_or_else(Uuid::new_v4),
+        session_reuse: true,
         model_id: config.model_id,
         api_key: config.api_key.into_bytes(),
         tokenizer: Arc::new(tokenizer),
@@ -246,12 +260,13 @@ async fn supervise(
             run_child_job(worker.as_mut().expect("worker is available"), &job).await
         };
         let restart = match outcome {
-            Ok((reason, completion_tokens)) => {
+            Ok((reason, completion_tokens, reused_prompt_tokens)) => {
                 send_result(
                     &job,
                     WorkerEvent::Finished {
                         reason,
                         completion_tokens,
+                        reused_prompt_tokens,
                     },
                 )
                 .await;
@@ -296,10 +311,11 @@ async fn send_result(job: &Job, event: WorkerEvent) {
 async fn run_child_job(
     worker: &mut ChildWorker,
     job: &Job,
-) -> Result<(&'static str, usize), ProcessFailure> {
+) -> Result<(&'static str, usize, usize), ProcessFailure> {
     let request = WireRequest {
         prompt: job.prompt.clone(),
         max_tokens: job.max_tokens,
+        conversation_id: job.conversation_id.clone(),
     };
     let mut bytes =
         serde_json::to_vec(&request).map_err(|error| ProcessFailure::Broken(error.to_string()))?;
@@ -346,6 +362,7 @@ async fn run_child_job(
             Ok(WireEvent::Finished {
                 reason,
                 completion_tokens,
+                reused_prompt_tokens,
             }) => {
                 let reason = match reason.as_str() {
                     "stop" => "stop",
@@ -356,7 +373,7 @@ async fn run_child_job(
                         ))
                     }
                 };
-                return Ok((reason, completion_tokens));
+                return Ok((reason, completion_tokens, reused_prompt_tokens));
             }
             Ok(WireEvent::Failed { message }) => return Err(ProcessFailure::Model(message)),
             _ => {
@@ -393,6 +410,7 @@ pub fn run_worker_stdio(
             max_positions: model.config().max_positions,
         },
     )?;
+    let mut sessions = SessionCache::new();
     for line in io::stdin().lock().lines() {
         let line = line?;
         let request: WireRequest = serde_json::from_str(&line)?;
@@ -405,15 +423,50 @@ pub fn run_worker_stdio(
             )?;
             continue;
         }
-        #[cfg(target_os = "macos")]
-        let mut session = match metal.as_ref() {
-            Some(runtime) => runtime.session(),
-            None => GenerationSession::new(&model),
+        let cached = request
+            .conversation_id
+            .as_deref()
+            .and_then(|id| sessions.take_matching(id, &request.prompt));
+        let (mut session, reused_prompt_tokens) = match cached {
+            Some((session, reused)) => (session, reused),
+            None => {
+                #[cfg(target_os = "macos")]
+                let session = match metal.as_ref() {
+                    Some(runtime) => runtime.session(),
+                    None => GenerationSession::new(&model),
+                };
+                #[cfg(not(target_os = "macos"))]
+                let session = GenerationSession::new(&model);
+                (session, 0)
+            }
         };
-        #[cfg(not(target_os = "macos"))]
-        let mut session = GenerationSession::new(&model);
-        if let Err(message) = generate_in_child(&mut session, &tokenizer, &request, &mut output) {
-            write_event(&mut output, &WireEvent::Failed { message })?;
+        let suffix = &request.prompt[reused_prompt_tokens..];
+        if reused_prompt_tokens == 0 || !suffix.is_empty() {
+            if let Err(error) = session.prefill(suffix) {
+                write_event(
+                    &mut output,
+                    &WireEvent::Failed {
+                        message: error.to_string(),
+                    },
+                )?;
+                continue;
+            }
+        }
+        let checkpoint = session.checkpoint();
+        match generate_in_child(
+            &mut session,
+            &tokenizer,
+            &request,
+            reused_prompt_tokens,
+            &mut output,
+        ) {
+            Ok(()) => {
+                if let Some(id) = request.conversation_id {
+                    session.rewind(checkpoint);
+                    sessions.insert(id, request.prompt, session);
+                }
+            }
+            Err(message) => write_event(&mut output, &WireEvent::Failed { message })?,
         }
     }
     Ok(())
@@ -423,11 +476,9 @@ fn generate_in_child(
     session: &mut GenerationSession<'_>,
     tokenizer: &ByteBpeTokenizer,
     request: &WireRequest,
+    reused_prompt_tokens: usize,
     output: &mut impl Write,
 ) -> Result<(), String> {
-    session
-        .prefill(&request.prompt)
-        .map_err(|error| error.to_string())?;
     let stop = ["<|im_end|>", "<|endoftext|>"].map(|token| tokenizer.special_token_id(token));
     let mut decoder = ByteBpeDecoder::new();
     for step in 0..request.max_tokens {
@@ -459,6 +510,7 @@ fn generate_in_child(
                 &WireEvent::Finished {
                     reason: reason.into(),
                     completion_tokens,
+                    reused_prompt_tokens,
                 },
             )
             .map_err(|error| error.to_string())?;

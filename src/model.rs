@@ -67,6 +67,32 @@ impl KvCache {
     pub(crate) fn position(&self) -> usize {
         self.position
     }
+
+    pub(crate) fn truncate(&mut self, position: usize) {
+        debug_assert!(position <= self.position);
+        for layer in &mut self.layers {
+            layer.keys.truncate(position);
+            layer.values.truncate(position);
+            layer.keys.shrink_to_fit();
+            layer.values.shrink_to_fit();
+        }
+        self.position = position;
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| {
+                (layer.keys.capacity() + layer.values.capacity()) * size_of::<Vec<f32>>()
+                    + layer
+                        .keys
+                        .iter()
+                        .chain(layer.values.iter())
+                        .map(|values| values.capacity() * size_of::<f32>())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
 }
 
 impl Model {

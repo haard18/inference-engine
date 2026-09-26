@@ -67,6 +67,30 @@ impl Coordinator {
         }
         selected
     }
+
+    pub async fn owner_if_available(
+        &self,
+        device_id: &str,
+        model_id: &str,
+        required_positions: usize,
+        max_completion_tokens: usize,
+    ) -> Option<PeerClient> {
+        let peer = self
+            .peers
+            .iter()
+            .find(|peer| peer.device_id() == device_id)?;
+        if peer.cooling_down() {
+            return None;
+        }
+        let snapshot = peer.snapshot().await.ok()?;
+        peer_can_take(
+            &snapshot,
+            model_id,
+            required_positions,
+            max_completion_tokens,
+        )
+        .then(|| peer.clone())
+    }
 }
 
 fn peer_can_take(
