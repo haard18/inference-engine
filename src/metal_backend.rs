@@ -141,6 +141,7 @@ pub(crate) struct MetalBackend<'a> {
     rotate_and_store: ComputePipelineState,
     attention_scores: ComputePipelineState,
     attention_reduce: ComputePipelineState,
+    silu_multiply: ComputePipelineState,
     weights: HashMap<usize, (Buffer, u32)>,
 }
 
@@ -194,6 +195,12 @@ impl<'a> MetalBackend<'a> {
         let attention_reduce = device
             .new_compute_pipeline_state_with_function(&reduce_function)
             .map_err(|error| EngineError::Backend(format!("Metal attention pipeline: {error}")))?;
+        let silu_function = library
+            .get_function("silu_multiply", None)
+            .map_err(|error| EngineError::Backend(format!("Metal function: {error}")))?;
+        let silu_multiply = device
+            .new_compute_pipeline_state_with_function(&silu_function)
+            .map_err(|error| EngineError::Backend(format!("Metal activation pipeline: {error}")))?;
         let queue = device.new_command_queue();
         let mut weights = HashMap::new();
         for matrix in model.matrices() {
@@ -218,6 +225,7 @@ impl<'a> MetalBackend<'a> {
             rotate_and_store,
             attention_scores,
             attention_reduce,
+            silu_multiply,
             weights,
         })
     }
@@ -430,6 +438,138 @@ impl<'a> MetalBackend<'a> {
         Ok(unsafe {
             std::slice::from_raw_parts(output.contents().cast::<f32>(), query_matrix.rows())
                 .to_vec()
+        })
+    }
+
+    /// Keep gate, up, and their activation on the GPU until the down projection completes.
+    pub(crate) fn feed_forward(
+        &mut self,
+        gate: &Matrix,
+        up: &Matrix,
+        down: &Matrix,
+        input: &[f32],
+    ) -> Result<Vec<f32>, EngineError> {
+        if gate.cols() != input.len()
+            || up.cols() != input.len()
+            || gate.rows() != up.rows()
+            || down.cols() != gate.rows()
+        {
+            return Err(EngineError::InvalidConfig("Metal feed-forward dimensions"));
+        }
+        let intermediate_count = u32::try_from(gate.rows())
+            .map_err(|_| EngineError::Backend("Metal feed-forward width too large".into()))?;
+        let bytes = |values: usize| {
+            values
+                .checked_mul(size_of::<f32>())
+                .filter(|&bytes| bytes as u64 <= self.device.max_buffer_length())
+                .map(|bytes| bytes as u64)
+                .ok_or_else(|| EngineError::Backend("Metal feed-forward buffer limit".into()))
+        };
+        let input_bytes = bytes(input.len())?;
+        let intermediate_bytes = bytes(gate.rows())?;
+        let output_bytes = bytes(down.rows())?;
+        let matrix_info = |matrix: &Matrix| -> Result<(&Buffer, Params), EngineError> {
+            let (weight, kind) = self
+                .weights
+                .get(&(matrix as *const Matrix as usize))
+                .ok_or_else(|| EngineError::Backend("matrix was not uploaded to Metal".into()))?;
+            Ok((
+                weight,
+                Params {
+                    rows: u32::try_from(matrix.rows())
+                        .map_err(|_| EngineError::Backend("matrix has too many rows".into()))?,
+                    cols: u32::try_from(matrix.cols())
+                        .map_err(|_| EngineError::Backend("matrix has too many columns".into()))?,
+                    kind: *kind,
+                    reserved: 0,
+                },
+            ))
+        };
+        let (gate_weight, gate_params) = matrix_info(gate)?;
+        let (up_weight, up_params) = matrix_info(up)?;
+        let (down_weight, down_params) = matrix_info(down)?;
+        let input_buffer = self.device.new_buffer_with_data(
+            input.as_ptr().cast(),
+            input_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let gate_output = self
+            .device
+            .new_buffer(intermediate_bytes, MTLResourceOptions::StorageModeShared);
+        let up_output = self
+            .device
+            .new_buffer(intermediate_bytes, MTLResourceOptions::StorageModeShared);
+        let activated = self
+            .device
+            .new_buffer(intermediate_bytes, MTLResourceOptions::StorageModeShared);
+        let output = self
+            .device
+            .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+
+        let command = self.queue.new_command_buffer();
+        let projection = command.new_compute_command_encoder();
+        projection.set_compute_pipeline_state(&self.pipeline);
+        projection.set_buffer(1, Some(&input_buffer), 0);
+        for (weight, target, params) in [
+            (gate_weight, &gate_output, gate_params),
+            (up_weight, &up_output, up_params),
+        ] {
+            projection.set_buffer(0, Some(weight), 0);
+            projection.set_buffer(2, Some(target), 0);
+            projection.set_bytes(
+                3,
+                size_of::<Params>() as u64,
+                (&params as *const Params).cast(),
+            );
+            projection.dispatch_threads(
+                MTLSize::new(u64::from(params.rows), 1, 1),
+                MTLSize::new(self.pipeline.thread_execution_width(), 1, 1),
+            );
+        }
+        projection.end_encoding();
+
+        let activation = command.new_compute_command_encoder();
+        activation.set_compute_pipeline_state(&self.silu_multiply);
+        activation.set_buffer(0, Some(&gate_output), 0);
+        activation.set_buffer(1, Some(&up_output), 0);
+        activation.set_buffer(2, Some(&activated), 0);
+        activation.set_bytes(
+            3,
+            size_of::<u32>() as u64,
+            (&intermediate_count as *const u32).cast(),
+        );
+        activation.dispatch_threads(
+            MTLSize::new(u64::from(intermediate_count), 1, 1),
+            MTLSize::new(self.silu_multiply.thread_execution_width(), 1, 1),
+        );
+        activation.end_encoding();
+
+        let down_projection = command.new_compute_command_encoder();
+        down_projection.set_compute_pipeline_state(&self.pipeline);
+        down_projection.set_buffer(0, Some(down_weight), 0);
+        down_projection.set_buffer(1, Some(&activated), 0);
+        down_projection.set_buffer(2, Some(&output), 0);
+        down_projection.set_bytes(
+            3,
+            size_of::<Params>() as u64,
+            (&down_params as *const Params).cast(),
+        );
+        down_projection.dispatch_threads(
+            MTLSize::new(u64::from(down_params.rows), 1, 1),
+            MTLSize::new(self.pipeline.thread_execution_width(), 1, 1),
+        );
+        down_projection.end_encoding();
+
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::Backend(format!(
+                "Metal feed-forward command ended with {:?}",
+                command.status()
+            )));
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(output.contents().cast::<f32>(), down.rows()).to_vec()
         })
     }
 

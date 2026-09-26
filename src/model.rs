@@ -488,22 +488,9 @@ impl Model {
                 &layer.feed_forward_norm,
                 self.config.rms_norm_epsilon,
             )?;
-            let [gate, up]: [Vec<f32>; 2] = backend
-                .mul_vec_many(&[&layer.gate, &layer.up], &normalized)?
-                .try_into()
-                .map_err(|_| EngineError::Backend("feed-forward projection count".into()))?;
-            let activated: Vec<f32> = gate
-                .into_iter()
-                .zip(up)
-                .map(|(gate_value, up_value)| silu(gate_value) * up_value)
-                .collect();
-            let feed_forward_output = backend.mul_vec_many(&[&layer.down], &activated)?;
-            add_in_place(
-                &mut hidden,
-                feed_forward_output
-                    .first()
-                    .ok_or_else(|| EngineError::Backend("missing feed-forward output".into()))?,
-            );
+            let feed_forward_output =
+                backend.feed_forward(&layer.gate, &layer.up, &layer.down, &normalized)?;
+            add_in_place(&mut hidden, &feed_forward_output);
         }
         let logits = self.project_logits(&hidden, &mut |matrices, input| {
             backend.mul_vec_many(matrices, input)

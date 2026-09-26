@@ -113,6 +113,17 @@ kernel void matvec(
     output[row] = sum;
 }
 
+kernel void silu_multiply(
+    device const float *gate [[buffer(0)]],
+    device const float *up [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= count) return;
+    float value = gate[index];
+    output[index] = (value / (1.0f + exp(-value))) * up[index];
+}
+
 kernel void rotate_and_store(
     device float *query [[buffer(0)]],
     device const float *key [[buffer(1)]],

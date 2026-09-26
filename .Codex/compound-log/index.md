@@ -10,6 +10,7 @@
 - [Metal attention and key/value state](plans/metal-attention.md)
 - [Metal projection-to-attention boundary](plans/metal-projection-attention.md)
 - [Capacity probes during split inference](plans/split-capacity-readiness.md)
+- [Metal feed-forward command](plans/metal-feed-forward.md)
 
 ## Learnings
 
@@ -43,6 +44,7 @@
 - [Metal attention and key/value state](learnings/2026-09-26-metal-attention.md)
 - [Metal projection-to-attention boundary](learnings/2026-09-26-metal-projection-attention.md)
 - [Capacity probes during split inference](learnings/2026-09-26-split-capacity-readiness.md)
+- [Metal feed-forward command](learnings/2026-09-26-metal-feed-forward.md)
 
 ## Reviews
 
@@ -75,3 +77,4 @@
 - [Metal attention review](reviews/2026-09-26-metal-attention.md)
 - [Metal projection-to-attention review](reviews/2026-09-26-metal-projection-attention.md)
 - [Split capacity readiness review](reviews/2026-09-26-split-capacity-readiness.md)
+- [Metal feed-forward review](reviews/2026-09-26-metal-feed-forward.md)

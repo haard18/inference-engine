@@ -40,7 +40,7 @@ Build the model execution core before device pooling. The core must produce corr
 - [x] Make uploaded Metal weights reusable across generation sessions.
 - [ ] Keep attention and KV state on the GPU and remove per-operation CPU/GPU synchronization.
 
-Metal attention and per-session key/value buffers now run through GPU commands. Query/key/value projection, rotary positions, and attention share one command, so those three projection vectors no longer return to CPU. Normalization, activation, residual, and output boundaries still synchronize with CPU. The remaining checkbox tracks removal of those boundaries.
+Metal attention and per-session key/value buffers now run through GPU commands. Query/key/value projection, rotary positions, and attention share one command, so those three projection vectors no longer return to CPU. Gate/up projection, feed-forward activation, and down projection share another command. Normalization, residual, and output boundaries still synchronize with CPU. The remaining checkbox tracks removal of those boundaries.
 
 ## Risks
 
