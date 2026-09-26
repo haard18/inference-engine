@@ -27,6 +27,12 @@ const SESSION_IDLE_LIMIT: Duration = Duration::from_millis(LEGACY_STAGE_LEASE_MS
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum StageCommand {
+    Reserve {
+        request_id: String,
+        max_positions: usize,
+        #[serde(default)]
+        lease_ms: Option<u64>,
+    },
     Token {
         request_id: String,
         token_id: usize,
@@ -65,6 +71,9 @@ enum StageEvent<'a> {
         model_max_positions: usize,
         vocab_size: usize,
         stored_weight_bytes: usize,
+    },
+    Reserved {
+        position: usize,
     },
     Activation {
         payload_bytes: usize,
@@ -135,6 +144,8 @@ fn cache_max_positions(
 
 struct SessionEntry<'a> {
     session: StageSession<'a>,
+    reserved_positions: usize,
+    reserved_bytes: usize,
     touched: Instant,
     lease_until: Instant,
     checkpointed: bool,
@@ -157,13 +168,11 @@ pub fn run_stage_worker_stdio_with_backend(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let stage = load_gguf_stage(model_path, start..end)?;
     let cache_budget = cache_budget_bytes()?;
-    let cache_max_positions = cache_max_positions(
-        stage.max_positions(),
-        stage
-            .cache_bytes_per_position()
-            .ok_or("stage cache size overflow")?,
-        cache_budget,
-    )?;
+    let bytes_per_position = stage
+        .cache_bytes_per_position()
+        .ok_or("stage cache size overflow")?;
+    let cache_max_positions =
+        cache_max_positions(stage.max_positions(), bytes_per_position, cache_budget)?;
     #[cfg(target_os = "macos")]
     let metal = (backend == ServingBackend::Metal)
         .then(|| MetalStageRuntime::new(&stage))
@@ -220,6 +229,96 @@ pub fn run_stage_worker_stdio_with_backend(
             }
         });
         match command {
+            StageCommand::Reserve {
+                request_id,
+                max_positions,
+                lease_ms,
+            } => {
+                let lease = match lease_duration(lease_ms) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        fail(&mut output, message)?;
+                        continue;
+                    }
+                };
+                let request_id = match Uuid::parse_str(&request_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        fail(&mut output, "invalid request ID")?;
+                        continue;
+                    }
+                };
+                if !(1..=cache_max_positions).contains(&max_positions) {
+                    fail(&mut output, "stage cache context limit reached")?;
+                    continue;
+                }
+                if sessions
+                    .get(&request_id)
+                    .is_some_and(|entry| entry.session.position() > max_positions)
+                {
+                    fail(&mut output, "reserved context precedes checkpoint")?;
+                    continue;
+                }
+                let Some(reserved_bytes) = max_positions
+                    .checked_next_power_of_two()
+                    .map(|capacity| capacity.min(stage.max_positions()))
+                    .and_then(|capacity| capacity.checked_mul(bytes_per_position))
+                else {
+                    fail(&mut output, "stage cache reservation overflows")?;
+                    continue;
+                };
+                let previous = sessions.get(&request_id).map_or(0, session_charge);
+                let current_allocated = sessions
+                    .get(&request_id)
+                    .map_or(0, |entry| entry.session.allocated_cache_bytes());
+                let mut total: usize = sessions.values().map(session_charge).sum();
+                total = total
+                    .saturating_sub(previous)
+                    .saturating_add(reserved_bytes.max(current_allocated));
+                while total > cache_budget {
+                    let Some(oldest) = sessions
+                        .iter()
+                        .filter(|(id, entry)| **id != request_id && entry.checkpointed)
+                        .min_by_key(|(_, entry)| entry.touched)
+                        .map(|(id, _)| *id)
+                    else {
+                        break;
+                    };
+                    if let Some(removed) = sessions.remove(&oldest) {
+                        total = total.saturating_sub(session_charge(&removed));
+                    }
+                }
+                if total > cache_budget {
+                    fail(&mut output, "stage cache capacity is full")?;
+                    continue;
+                }
+                admit(&mut sessions, request_id);
+                if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&request_id) {
+                    fail(&mut output, "stage session capacity is full")?;
+                    continue;
+                }
+                let now = Instant::now();
+                let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
+                    session: new_session(),
+                    reserved_positions: max_positions,
+                    reserved_bytes,
+                    touched: now,
+                    lease_until: now + lease,
+                    checkpointed: false,
+                });
+                entry.reserved_positions = max_positions;
+                entry.reserved_bytes = reserved_bytes;
+                entry.touched = now;
+                entry.lease_until = now + lease;
+                entry.checkpointed = false;
+                write_event(
+                    &mut output,
+                    &StageEvent::Reserved {
+                        position: entry.session.position(),
+                    },
+                    &[],
+                )?;
+            }
             StageCommand::Token {
                 request_id,
                 token_id,
@@ -243,22 +342,17 @@ pub fn run_stage_worker_stdio_with_backend(
                     fail(&mut output, "token input requires a prefix stage")?;
                     continue;
                 }
-                admit(&mut sessions, request_id);
-                if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&request_id) {
-                    fail(&mut output, "stage session capacity is full")?;
+                let Some(entry) = sessions.get_mut(&request_id) else {
+                    fail(&mut output, "stage reservation is missing")?;
+                    continue;
+                };
+                if entry.checkpointed {
+                    fail(&mut output, "stage reservation is missing")?;
                     continue;
                 }
-                let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
-                    session: new_session(),
-                    touched: Instant::now(),
-                    lease_until: Instant::now() + lease,
-                    checkpointed: false,
-                });
-                entry.checkpointed = false;
                 entry.lease_until = Instant::now() + lease;
                 let position = entry.session.position();
-                if position >= cache_max_positions {
-                    sessions.remove(&request_id);
+                if position >= entry.reserved_positions {
                     fail(&mut output, "stage cache context limit reached")?;
                     continue;
                 }
@@ -317,26 +411,21 @@ pub fn run_stage_worker_stdio_with_backend(
                     fail(&mut output, "activation input requires a suffix stage")?;
                     continue;
                 }
-                admit(&mut sessions, request_id);
-                if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&request_id) {
-                    fail(&mut output, "stage session capacity is full")?;
+                let Some(entry) = sessions.get_mut(&request_id) else {
+                    fail(&mut output, "stage reservation is missing")?;
+                    continue;
+                };
+                if entry.checkpointed {
+                    fail(&mut output, "stage reservation is missing")?;
                     continue;
                 }
-                let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
-                    session: new_session(),
-                    touched: Instant::now(),
-                    lease_until: Instant::now() + lease,
-                    checkpointed: false,
-                });
-                entry.checkpointed = false;
                 entry.lease_until = Instant::now() + lease;
                 if entry
                     .session
                     .position()
                     .checked_add(frame_count)
-                    .is_none_or(|end| end > cache_max_positions)
+                    .is_none_or(|end| end > entry.reserved_positions)
                 {
-                    sessions.remove(&request_id);
                     fail(&mut output, "stage cache context limit reached")?;
                     continue;
                 }
@@ -415,12 +504,20 @@ pub fn run_stage_worker_stdio_with_backend(
                     continue;
                 }
                 entry.touched = Instant::now();
+                entry.reserved_positions = position;
+                entry.reserved_bytes = entry.session.allocated_cache_bytes();
                 entry.checkpointed = true;
                 write_event(&mut output, &StageEvent::Rewound { position }, &[])?;
             }
         }
     }
     Ok(())
+}
+
+fn session_charge(entry: &SessionEntry<'_>) -> usize {
+    entry
+        .reserved_bytes
+        .max(entry.session.allocated_cache_bytes())
 }
 
 fn admit(sessions: &mut HashMap<Uuid, SessionEntry<'_>>, request_id: Uuid) {
@@ -450,10 +547,7 @@ fn finish_step(
                 sessions.remove(&request_id);
                 return fail(output, "stage scores exceed response limit");
             }
-            let mut allocated: usize = sessions
-                .values()
-                .map(|entry| entry.session.allocated_cache_bytes())
-                .sum();
+            let mut allocated: usize = sessions.values().map(session_charge).sum();
             while allocated > cache_budget {
                 let Some(oldest) = sessions
                     .iter()
@@ -464,7 +558,7 @@ fn finish_step(
                     break;
                 };
                 if let Some(removed) = sessions.remove(&oldest) {
-                    allocated = allocated.saturating_sub(removed.session.allocated_cache_bytes());
+                    allocated = allocated.saturating_sub(session_charge(&removed));
                 }
             }
             if allocated > cache_budget {

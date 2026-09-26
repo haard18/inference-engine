@@ -143,6 +143,7 @@ impl PeerClient {
                 || snapshot.hidden_size == 0
                 || snapshot.vocab_size == 0
                 || snapshot.max_positions == 0
+                || snapshot.max_positions > snapshot.model_max_positions
                 || snapshot.stored_weight_bytes == 0
                 || snapshot.queue_capacity == 0
                 || snapshot.queue_capacity > 16
@@ -159,6 +160,88 @@ impl PeerClient {
             self.clear_failure();
         }
         result
+    }
+
+    pub async fn reserve_stage(
+        &self,
+        request_id: Uuid,
+        max_positions: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<usize, PoolError> {
+        if max_positions == 0 {
+            return Err(PoolError::Invalid("reserved stage context is empty"));
+        }
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(PoolError::Transport("stage deadline expired".into()))?;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/stage/reserve")
+            .header("host", "peer")
+            .header("x-inference-request-id", request_id.to_string())
+            .header(
+                "x-inference-deadline-ms",
+                (remaining.as_millis().clamp(1, 120_000) as u64).to_string(),
+            )
+            .header(
+                "x-inference-session-lease-ms",
+                (remaining
+                    .as_millis()
+                    .clamp(1, u128::from(MAX_STAGE_LEASE_MS)) as u64)
+                    .to_string(),
+            )
+            .header("x-inference-max-positions", max_positions.to_string())
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| PoolError::Transport(error.to_string()))?;
+        let response = match self.send(request, deadline).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.mark_failure();
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        let body = match tokio::time::timeout_at(
+            deadline,
+            to_bytes(Body::new(response.into_body()), 4096),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) => {
+                self.mark_failure();
+                return Err(PoolError::Transport(error.to_string()));
+            }
+            Err(_) => {
+                self.mark_failure();
+                return Err(PoolError::Transport("stage reserve timed out".into()));
+            }
+        };
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            self.clear_failure();
+            return Err(PoolError::Overloaded(
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
+        }
+        if status != StatusCode::OK {
+            if status.is_server_error() {
+                self.mark_failure();
+            } else {
+                self.clear_failure();
+            }
+            return Err(PoolError::Transport(format!(
+                "stage reserve returned HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        let reply: serde_json::Value = serde_json::from_slice(&body)?;
+        let position = reply["position"]
+            .as_u64()
+            .and_then(|position| usize::try_from(position).ok())
+            .filter(|position| *position <= max_positions)
+            .ok_or(PoolError::Invalid("stage reserve position is invalid"))?;
+        self.clear_failure();
+        Ok(position)
     }
 
     /// Send one activation without replaying it after a connection or stage failure.

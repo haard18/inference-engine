@@ -343,7 +343,7 @@ async fn supervise(
             }
         }
         // A failed step can leave the local pipe or cache out of sync. Replace that child.
-        if result.is_ok() && !cached && !discard_child {
+        if !cached && !discard_child {
             let cleanup = tokio::time::timeout(CLEANUP_TIMEOUT, prefix.close(request_id)).await;
             if !matches!(cleanup, Ok(Ok(()))) {
                 discard_child = true;
@@ -417,6 +417,43 @@ async fn run_job(
     } else {
         (0, Vec::new())
     };
+    let requested_positions = job
+        .prompt
+        .len()
+        .checked_add(job.max_tokens)
+        .filter(|positions| *positions <= ready.max_positions.min(snapshot.max_positions))
+        .ok_or_else(|| JobFailure::Execution("request exceeds stage context".into()))?;
+    let deadline = tokio::time::Instant::from_std(job.deadline);
+    let remote_position = client
+        .reserve_stage(*request_id, requested_positions, deadline)
+        .await
+        .map_err(|error| match error {
+            crate::pool::PoolError::Overloaded(message) => JobFailure::Overloaded(message),
+            other => JobFailure::Execution(format!("suffix reservation: {other}")),
+        })?;
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .ok_or(JobFailure::Deadline)?;
+    let lease_ms = remaining
+        .as_millis()
+        .clamp(1, u128::from(MAX_STAGE_LEASE_MS)) as u64;
+    let local_position = tokio::time::timeout_at(
+        deadline,
+        prefix.reserve(*request_id, requested_positions, lease_ms),
+    )
+    .await
+    .map_err(|_| JobFailure::Deadline)?
+    .map_err(|error| match error {
+        StageStepError::Rejected(message) if message.contains("capacity") => {
+            JobFailure::Overloaded(message)
+        }
+        other => JobFailure::Execution(stage_error(other)),
+    })?;
+    if local_position != position || remote_position != position {
+        return Err(JobFailure::Execution(
+            "stage reservation changed the prompt position".into(),
+        ));
+    }
     let reused_prompt_tokens = position;
     let frame_bytes = ready
         .hidden_size

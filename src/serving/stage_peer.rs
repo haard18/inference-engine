@@ -201,6 +201,7 @@ pub async fn start_stage_peer_with_backend(
     });
     let routes = Router::new()
         .route("/internal/stage/capacity", get(capacity))
+        .route("/internal/stage/reserve", post(reserve))
         .route("/internal/stage/activation", post(activation))
         .route("/internal/stage/close", post(close))
         .route("/internal/stage/probe", post(probe))
@@ -285,6 +286,62 @@ async fn capacity(State(state): State<Arc<StageState>>) -> Json<StageCapacitySna
         queue_capacity: state.queue_capacity,
         queue_available: state.queue.available_permits(),
     })
+}
+
+async fn reserve(
+    State(state): State<Arc<StageState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let request_id = request_id(&headers)?;
+    let deadline = deadline(&headers)?;
+    let lease_ms = session_lease(&headers)?;
+    let max_positions = headers
+        .get("x-inference-max-positions")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=state.expected.max_positions).contains(value))
+        .ok_or((StatusCode::BAD_REQUEST, "invalid reserved context".into()))?;
+    let _permit = state
+        .queue
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| (StatusCode::TOO_MANY_REQUESTS, "stage queue is full".into()))?;
+    let mut worker = tokio::time::timeout_at(deadline, state.worker.lock())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "stage queue wait timed out".into(),
+            )
+        })?;
+    ensure_worker(&state, &mut worker, deadline).await?;
+    let mut child =
+        StageChildLease::new(worker.take().expect("worker started"), &state.worker_ready);
+    let result = tokio::time::timeout_at(
+        deadline,
+        child.child().reserve(request_id, max_positions, lease_ms),
+    )
+    .await;
+    match result {
+        Ok(Ok(position)) => {
+            child.restore(&mut worker);
+            Ok(Json(json!({"position": position})))
+        }
+        Ok(Err(StageStepError::Rejected(message))) => {
+            child.restore(&mut worker);
+            let status = if message.contains("capacity") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            Err((status, message))
+        }
+        Ok(Err(StageStepError::Broken(message))) => Err((StatusCode::SERVICE_UNAVAILABLE, message)),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "stage reserve timed out".into(),
+        )),
+    }
 }
 
 async fn activation(
@@ -628,6 +685,53 @@ impl StageChild {
 
     pub(super) fn running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    pub(super) async fn reserve(
+        &mut self,
+        request_id: Uuid,
+        max_positions: usize,
+        lease_ms: u64,
+    ) -> Result<usize, StageStepError> {
+        if !(1..=self.ready.max_positions).contains(&max_positions) {
+            return Err(StageStepError::Rejected(
+                "stage context limit reached".into(),
+            ));
+        }
+        let command = json!({
+            "kind": "reserve",
+            "request_id": request_id.to_string(),
+            "max_positions": max_positions,
+            "lease_ms": lease_ms,
+        });
+        let mut line = serde_json::to_vec(&command)
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        line.push(b'\n');
+        self.input
+            .write_all(&line)
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        self.input
+            .flush()
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        let reply = self.read_reply().await?;
+        match reply["kind"].as_str() {
+            Some("failed") => Err(StageStepError::Rejected(
+                reply["message"]
+                    .as_str()
+                    .unwrap_or("stage rejected reservation")
+                    .into(),
+            )),
+            Some("reserved") => reply["position"]
+                .as_u64()
+                .and_then(|position| usize::try_from(position).ok())
+                .filter(|position| *position <= max_positions)
+                .ok_or_else(|| StageStepError::Broken("stage reserved position is invalid".into())),
+            _ => Err(StageStepError::Broken(
+                "stage sent an invalid reserve response".into(),
+            )),
+        }
     }
 
     pub(super) async fn token(

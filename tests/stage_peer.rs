@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use inference_engine::pool::client::PeerClient;
-use inference_engine::pool::{DeviceIdentity, PeerStore};
+use inference_engine::pool::{DeviceIdentity, PeerStore, PoolError};
 use inference_engine::{
     load_gguf, load_gguf_stage, ActivationFrame, GenerationSession, StageSession,
 };
@@ -91,6 +91,13 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
     let mut whole = GenerationSession::new(&model);
     let mut first = StageSession::new(&prefix);
     let id = Uuid::new_v4();
+    assert_eq!(
+        client
+            .reserve_stage(id, 4, tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .unwrap(),
+        0
+    );
     for token in [1, 2, 3, 30] {
         whole.prefill(&[token]).unwrap();
         let position = first.position();
@@ -121,6 +128,14 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         .await
         .unwrap();
     let batch_id = Uuid::new_v4();
+    client
+        .reserve_stage(
+            batch_id,
+            4,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
     let mut batch_prefix = StageSession::new(&prefix);
     let mut batch_whole = GenerationSession::new(&model);
     let mut batch = Vec::new();
@@ -163,6 +178,14 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         .await
         .unwrap();
     let invalid_id = Uuid::new_v4();
+    client
+        .reserve_stage(
+            invalid_id,
+            2,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
     let mut invalid_prefix = StageSession::new(&prefix);
     let hidden = invalid_prefix.forward_token(1).unwrap();
     let frame = ActivationFrame::new(&prefix, invalid_id, 0, hidden)
@@ -193,6 +216,14 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
     let mut active = Vec::new();
     for _ in 0..8 {
         let stage_id = Uuid::new_v4();
+        client
+            .reserve_stage(
+                stage_id,
+                1,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         let mut stage_session = StageSession::new(&prefix);
         let hidden = stage_session.forward_token(1).unwrap();
         let frame = ActivationFrame::new(&prefix, stage_id, 0, hidden)
@@ -216,10 +247,9 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         .unwrap()
         .encode();
     assert!(client
-        .forward_stage(
-            frame.clone(),
+        .reserve_stage(
             ninth,
-            model.config().vocab_size,
+            1,
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await
@@ -227,6 +257,14 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
     client
         .rewind_stage(
             active[0],
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    client
+        .reserve_stage(
+            ninth,
             1,
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
@@ -266,4 +304,84 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         )
         .await
         .is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires SMOLLM2_1_7B_GGUF with a 128 MiB stage cache budget"]
+async fn remote_stage_reserves_full_context_before_admitting_another_request() {
+    let path = PathBuf::from(env::var("SMOLLM2_1_7B_GGUF").expect("set SMOLLM2_1_7B_GGUF"));
+    let server_dir = tempfile::tempdir().unwrap();
+    let approved_dir = tempfile::tempdir().unwrap();
+    let server = DeviceIdentity::load_or_create(server_dir.path()).unwrap();
+    let approved = DeviceIdentity::load_or_create(approved_dir.path()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut server_peers = PeerStore::load(server_dir.path()).unwrap();
+    server_peers
+        .trust(
+            &server.device_id,
+            &approved.offer(),
+            address,
+            &approved.fingerprint,
+        )
+        .unwrap();
+    let mut approved_peers = PeerStore::load(approved_dir.path()).unwrap();
+    approved_peers
+        .trust(
+            &approved.device_id,
+            &server.offer(),
+            address,
+            &server.fingerprint,
+        )
+        .unwrap();
+    drop(listener);
+    let mut serving = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--metal")
+        .arg("--stage-suffix")
+        .arg(server_dir.path())
+        .arg(address.to_string())
+        .arg(&path)
+        .arg("12")
+        .arg("24")
+        .env("INFERENCE_STAGE_CACHE_MIB", "128")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(serving.stdout.take().unwrap());
+    let mut ready = String::new();
+    tokio::time::timeout(Duration::from_secs(30), output.read_line(&mut ready))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ready.contains("Serving approved suffix stage"), "{ready}");
+    let client = PeerClient::new(&approved, approved_peers.peers()[0].clone()).unwrap();
+    let snapshot = client.stage_snapshot().await.unwrap();
+    assert_eq!(snapshot.max_positions, 512);
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(10);
+    assert_eq!(
+        client.reserve_stage(first, 400, deadline()).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        client.probe_stage(first, deadline()).await.unwrap(),
+        Some(0)
+    );
+    assert!(matches!(
+        client.reserve_stage(second, 400, deadline()).await,
+        Err(PoolError::Overloaded(_))
+    ));
+    assert_eq!(client.probe_stage(second, deadline()).await.unwrap(), None);
+    client.close_stage(first, deadline()).await.unwrap();
+    assert_eq!(
+        client.reserve_stage(second, 400, deadline()).await.unwrap(),
+        0
+    );
+    client.close_stage(second, deadline()).await.unwrap();
+    serving.kill().await.unwrap();
+    serving.wait().await.unwrap();
 }

@@ -57,6 +57,14 @@ impl StageProcess {
         self.output.read_exact(&mut payload).unwrap();
         (response, payload)
     }
+
+    fn reserve(&mut self, request_id: Uuid, max_positions: usize, lease_ms: u64) -> Value {
+        self.request(
+            json!({"kind":"reserve","request_id":request_id.to_string(),"max_positions":max_positions,"lease_ms":lease_ms}),
+            &[],
+        )
+        .0
+    }
 }
 
 impl Drop for StageProcess {
@@ -80,12 +88,15 @@ fn two_stage_processes_match_the_complete_real_model() {
     assert_eq!(prefix.ready["layer_end"], 15);
     assert_eq!(suffix.ready["layer_start"], 15);
     assert_eq!(suffix.ready["layer_end"], 30);
-    assert_eq!(prefix.ready["max_positions"], 8192);
+    assert_eq!(prefix.ready["max_positions"], 4096);
+    assert_eq!(prefix.ready["model_max_positions"], 8192);
     assert_eq!(suffix.ready["vocab_size"], 49152);
     assert!(prefix.ready["stored_weight_bytes"].as_u64().unwrap() < full_bytes);
     assert!(suffix.ready["stored_weight_bytes"].as_u64().unwrap() < full_bytes);
 
     let id = Uuid::new_v4();
+    assert_eq!(prefix.reserve(id, 4, 3000)["kind"], "reserved");
+    assert_eq!(suffix.reserve(id, 4, 3000)["kind"], "reserved");
     let mut whole = GenerationSession::new(&model);
     for (step, token) in [1, 2, 3, 30].into_iter().enumerate() {
         whole.prefill(&[token]).unwrap();
@@ -130,6 +141,7 @@ fn two_stage_processes_match_the_complete_real_model() {
 
     let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
     for id in &ids {
+        assert_eq!(prefix.reserve(*id, 1, 3000)["kind"], "reserved");
         let (kind, _) = prefix.request(
             json!({"kind":"token","request_id":id.to_string(),"token_id":1}),
             &[],
@@ -137,10 +149,7 @@ fn two_stage_processes_match_the_complete_real_model() {
         assert_eq!(kind["kind"], "activation");
     }
     let extra = Uuid::new_v4();
-    let (full, _) = prefix.request(
-        json!({"kind":"token","request_id":extra.to_string(),"token_id":1}),
-        &[],
-    );
+    let full = prefix.reserve(extra, 1, 3000);
     assert_eq!(full["kind"], "failed");
     assert_eq!(
         prefix
@@ -148,6 +157,7 @@ fn two_stage_processes_match_the_complete_real_model() {
             .0["kind"],
         "closed"
     );
+    assert_eq!(prefix.reserve(extra, 1, 3000)["kind"], "reserved");
     let (admitted, _) = prefix.request(
         json!({"kind":"token","request_id":extra.to_string(),"token_id":1}),
         &[],
@@ -162,12 +172,14 @@ fn expired_active_stage_session_is_removed_but_checkpoint_remains() {
     let path = Path::new(&directory).join("SmolLM2-135M-Q4_K_M.gguf");
     let mut prefix = StageProcess::start(&path, 0, 15);
     let active = Uuid::new_v4();
+    assert_eq!(prefix.reserve(active, 1, 3000)["kind"], "reserved");
     let (event, _) = prefix.request(
         json!({"kind":"token","request_id":active.to_string(),"token_id":1,"lease_ms":3000}),
         &[],
     );
     assert_eq!(event["kind"], "activation");
     let checkpoint = Uuid::new_v4();
+    assert_eq!(prefix.reserve(checkpoint, 1, 3000)["kind"], "reserved");
     let (event, _) = prefix.request(
         json!({"kind":"token","request_id":checkpoint.to_string(),"token_id":1,"lease_ms":3000}),
         &[],
