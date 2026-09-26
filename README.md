@@ -4,7 +4,7 @@ A Rust inference engine for language models on user-owned devices. The engine lo
 
 ## Architecture
 
-- **Engine library:** Tensor storage, CPU and Metal matrix operations, a direct Llama-style model executor, a per-request KV cache, and token selection. A GGUF stage loader can now read a prefix or suffix of the decoder layers into separate CPU stage sessions.
+- **Engine library:** Tensor storage, CPU and Metal matrix operations, a direct Llama-style model executor, a per-request KV cache, and token selection. A GGUF stage loader reads a prefix or suffix of the decoder layers into separate CPU or Metal stage sessions.
 - **Model input:** Safetensors with separate configuration and GGUF with Q8_0 or mixed Q4_K_M matrix weights. A project-owned byte-level BPE tokenizer reads the supported SmolLM2 layout from JSON or GGUF metadata.
 - **Device backends:** A 32-bit CPU path checks numerical correctness. CPU execution keeps f16, bf16, Q8_0, Q5_0, and Q4_K matrix weights compact while accumulating in f32. On macOS, a reusable Metal runtime uploads matrix weights once and runs matrix operations and attention on the GPU. Each Metal session keeps its key/value history in growing Metal buffers.
 - **Serving:** A per-device server exposes an authenticated, streaming chat API. It limits queues and memory use and reports overload clearly. The server keeps inference in a child process that it can replace after a timeout or process failure.
@@ -198,11 +198,11 @@ For a repeatable one-host Metal check, build the release binaries and run the lo
 ```sh
 cargo build --release --bin serve --bin device --bin pool-bench
 python3 scripts/split-soak.py /path/to/SmolLM2-135M-Q4_K_M.gguf \
-  --requests 20 --trials 3 --concurrency 2 --max-tokens 16 \
+  --requests 30 --trials 6 --concurrency 2 --max-tokens 16 \
   --output /path/to/benchmark-reports
 ```
 
-On one Apple Silicon Mac, three 20-request trials at concurrency two completed all 240 measured requests across ordinary and streaming modes. Complete Metal serving had a median 4.231 ordinary requests/s and 472 ms response p50; split Metal serving had 3.911 requests/s and 511 ms. Median streaming rates were 4.232 and 3.548 requests/s, with first visible content at 372 and 402 ms. The same text digest appeared in every report, and no worker restarted. These one-host results do not measure transfer over a physical LAN; the split streaming trials varied more than the complete-worker trials.
+On one Apple Silicon Mac, six 30-request trials per scenario and mode completed all 720 measured requests at concurrency two after the active-session lease change. Complete Metal serving had median ordinary throughput of 4.177 requests/s and a 478 ms response p50; split Metal served 3.860 requests/s and had a 518 ms p50. Median streaming rates were 4.183 and 3.863 requests/s, with first visible content at 376 and 404 ms. Every report had the same completed-text digest, and no worker restarted. Sampled process-tree resident memory reached 275,984 KiB for the complete server, 152,784 KiB for the prefix, and 155,216 KiB for the suffix. These one-host samples do not measure transfer over a physical LAN or all GPU allocations.
 
 The split prefix probes its suffix once a second. Two failed probes make `/health` and new chat requests return HTTP 503; one successful probe restores admission. A full suffix queue does not count as an unhealthy device. The suffix answers capacity probes while a token step is running, so a busy worker does not delay the probe behind model computation. A stream already in progress still reports an inference error if the suffix disappears after output begins.
 
