@@ -34,6 +34,7 @@
 - [Split chat serving](learnings/2026-09-26-split-chat-serving.md)
 - [Split conversation checkpoints](learnings/2026-09-26-split-conversation-reuse.md)
 - [One-host serving measurement](learnings/2026-09-26-serving-measurement.md)
+- [Split serving readiness](learnings/2026-09-26-split-readiness.md)
 
 ## Reviews
 
@@ -61,3 +62,4 @@
 - [Split chat serving review](reviews/2026-09-26-split-chat-serving.md)
 - [Split conversation reuse review](reviews/2026-09-26-split-conversation-reuse.md)
 - [Serving measurement review](reviews/2026-09-26-serving-measurement.md)
+- [Split readiness review](reviews/2026-09-26-split-readiness.md)

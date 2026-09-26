@@ -137,6 +137,7 @@ impl AppState {
 struct WorkerStatus {
     active_deadline: Mutex<Option<Instant>>,
     unavailable: AtomicBool,
+    remote_unavailable: AtomicBool,
 }
 
 impl WorkerStatus {
@@ -159,7 +160,9 @@ impl WorkerStatus {
     }
 
     fn unavailable(&self) -> bool {
-        self.unavailable.load(Ordering::Acquire) || self.overdue()
+        self.unavailable.load(Ordering::Acquire)
+            || self.remote_unavailable.load(Ordering::Acquire)
+            || self.overdue()
     }
 
     fn active(&self) -> bool {
@@ -170,6 +173,11 @@ impl WorkerStatus {
 
     fn set_unavailable(&self, unavailable: bool) {
         self.unavailable.store(unavailable, Ordering::Release);
+    }
+
+    fn set_remote_unavailable(&self, unavailable: bool) {
+        self.remote_unavailable
+            .store(unavailable, Ordering::Release);
     }
 }
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -27,6 +27,8 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CACHED_CONVERSATIONS: usize = 8;
 const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(300);
+const SUFFIX_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const SUFFIX_FAILED_PROBES: u8 = 2;
 
 /// Serve the usual chat API while each model step crosses one approved stage boundary.
 /// The prefix process loads only its layer range; the suffix service must already be running.
@@ -92,15 +94,45 @@ pub async fn start_split_prefix(
         coordinator: None,
     });
     let runtime = SplitRuntime {
-        ready,
+        ready: ready.clone(),
         status,
         tokenizer,
-        client,
+        client: client.clone(),
         executable,
         model_path,
     };
+    tokio::spawn(monitor_suffix(
+        Arc::downgrade(&runtime.status),
+        client,
+        ready,
+    ));
     let task = tokio::spawn(supervise(receiver, child, runtime));
     Ok((router(state), task))
+}
+
+async fn monitor_suffix(status: Weak<WorkerStatus>, client: PeerClient, ready: StageReady) {
+    let mut interval = tokio::time::interval(SUFFIX_PROBE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut failed_probes = 0_u8;
+    loop {
+        interval.tick().await;
+        let Some(status) = status.upgrade() else {
+            break;
+        };
+        let healthy = client
+            .stage_snapshot()
+            .await
+            .is_ok_and(|snapshot| snapshot.ready && validate_pair(&ready, &snapshot).is_ok());
+        if healthy {
+            failed_probes = 0;
+            status.set_remote_unavailable(false);
+        } else {
+            failed_probes = failed_probes.saturating_add(1);
+            if failed_probes >= SUFFIX_FAILED_PROBES {
+                status.set_remote_unavailable(true);
+            }
+        }
+    }
 }
 
 fn validate_pair(prefix: &StageReady, suffix: &StageCapacitySnapshot) -> Result<(), String> {

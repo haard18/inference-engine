@@ -115,6 +115,29 @@ fn stream_content(body: &str) -> String {
     content
 }
 
+async fn wait_for_health(router: axum::Router, expected: StatusCode) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("split health did not become {expected}"));
+}
+
 #[tokio::test]
 #[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
 async fn split_chat_matches_whole_model_and_reports_peer_loss() {
@@ -254,6 +277,10 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     );
     suffix_handle.graceful_shutdown(Some(Duration::from_secs(1)));
     suffix_task.await.unwrap().unwrap();
+    wait_for_health(split.clone(), StatusCode::SERVICE_UNAVAILABLE).await;
+    let (lost_status, lost_body, _) = chat(split.clone(), false).await;
+    assert_eq!(lost_status, StatusCode::SERVICE_UNAVAILABLE, "{lost_body}");
+    assert!(lost_body.contains("worker_unavailable"), "{lost_body}");
     let listener = TcpListener::bind(address).unwrap();
     let suffix = start_stage_peer(
         &model,
@@ -282,6 +309,7 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     })
     .await
     .unwrap();
+    wait_for_health(split.clone(), StatusCode::OK).await;
     let (status, _, after_restart) =
         conversation_chat(split.clone(), changed, Some(&conversation_id)).await;
     assert_eq!(status, StatusCode::OK);
@@ -329,13 +357,10 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     }
     assert!(observed.contains("inference_failed"), "{observed}");
     assert!(observed.contains("data: [DONE]"), "{observed}");
+    wait_for_health(split.clone(), StatusCode::SERVICE_UNAVAILABLE).await;
     let (lost_status, lost_body, _) = chat(split.clone(), false).await;
-    assert_eq!(
-        lost_status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "{lost_body}"
-    );
-    assert!(lost_body.contains("suffix"), "{lost_body}");
+    assert_eq!(lost_status, StatusCode::SERVICE_UNAVAILABLE, "{lost_body}");
+    assert!(lost_body.contains("worker_unavailable"), "{lost_body}");
     split_worker.abort();
     whole_worker.abort();
 }
