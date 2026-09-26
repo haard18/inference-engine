@@ -114,6 +114,32 @@ kernel void matvec(
                 }
             }
         }
+    } else if (params.kind == 6) {
+        device const uchar *row_bytes = weights + row * (cols / 256) * 210;
+        for (uint block_index = 0; block_index < cols / 256; ++block_index) {
+            device const uchar *block = row_bytes + block_index * 210;
+            float scale = half_at(block, 208);
+            for (uint segment = 0; segment < 2; ++segment) {
+                for (uint i = 0; i < 32; ++i) {
+                    uchar low_first = block[segment * 64 + i];
+                    uchar low_second = block[segment * 64 + i + 32];
+                    uchar high = block[128 + segment * 32 + i];
+                    uint scale_index = 192 + segment * 8 + i / 16;
+                    uint quants[4] = {
+                        uint(low_first & 15) | (uint(high & 3) << 4),
+                        uint(low_second & 15) | (uint((high >> 2) & 3) << 4),
+                        uint(low_first >> 4) | (uint((high >> 4) & 3) << 4),
+                        uint(low_second >> 4) | (uint(high >> 6) << 4),
+                    };
+                    for (uint group = 0; group < 4; ++group) {
+                        int group_scale = int(block[scale_index + group * 2]);
+                        if (group_scale >= 128) group_scale -= 256;
+                        uint input_index = block_index * 256 + segment * 128 + group * 32 + i;
+                        sum += (scale * float(group_scale) * (float(quants[group]) - 32.0f)) * input[input_index];
+                    }
+                }
+            }
+        }
     }
     output[row] = sum;
 }

@@ -125,6 +125,8 @@ def main() -> None:
     parser.add_argument('--trials', type=int, default=3)
     parser.add_argument('--concurrency', type=int, default=2)
     parser.add_argument('--max-tokens', type=int, default=16)
+    parser.add_argument('--layer-count', type=int, default=30)
+    parser.add_argument('--split-layer', type=int, default=15)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if sys.platform != 'darwin':
@@ -135,8 +137,9 @@ def main() -> None:
         or not 1 <= args.trials <= 20
         or not 1 <= args.concurrency <= 4
         or not 1 <= args.max_tokens <= 256
+        or not 1 <= args.split_layer < args.layer_count
     ):
-        parser.error('model must exist; requests 1..10000, trials 1..20, concurrency 1..4, tokens 1..256')
+        parser.error('model must exist; requests 1..10000, trials 1..20, concurrency 1..4, tokens 1..256, and split-layer within layer-count')
     env = os.environ.copy()
     env['INFERENCE_API_KEY'] = secrets.token_hex(32)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -177,11 +180,12 @@ def main() -> None:
                                  str(suffix_offer), f'127.0.0.1:{suffix_port}', suffix_data['fingerprint']])
                     suffix = start([str(BIN / 'serve'), '--metal', '--stage-suffix',
                                     str(suffix_state), f'127.0.0.1:{suffix_port}',
-                                    str(args.model.resolve()), '15', '30'], env, logs, processes)
+                                    str(args.model.resolve()), str(args.split_layer),
+                                    str(args.layer_count)], env, logs, processes)
                     wait_listener(suffix_port, suffix)
                     prefix = start([str(BIN / 'serve'), '--metal', '--split-prefix',
                                     str(prefix_state), suffix_data['device_id'],
-                                    str(args.model.resolve()), '15', str(port)], env, logs, processes)
+                                    str(args.model.resolve()), str(args.split_layer), str(port)], env, logs, processes)
                     wait_health(port, prefix)
                     if suffix.poll() is not None:
                         raise RuntimeError('suffix exited before split readiness')

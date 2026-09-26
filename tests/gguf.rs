@@ -250,6 +250,62 @@ fn real_q4_metal_stages_match_full_metal_scores() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "requires SMOLLM2_1_7B_GGUF with the official Q4_K_M checkpoint"]
+fn larger_q4_metal_stages_match_full_metal_scores() {
+    use inference_engine::{MetalRuntime, MetalStageRuntime};
+
+    let path = PathBuf::from(env::var("SMOLLM2_1_7B_GGUF").expect("set SMOLLM2_1_7B_GGUF"));
+    let model = load_gguf(&path).expect("load complete model");
+    let layer_count = model.config().num_layers;
+    assert_eq!(layer_count, 24);
+    let prefix = load_gguf_stage(&path, 0..12).expect("load prefix stage");
+    let suffix = load_gguf_stage(&path, 12..layer_count).expect("load suffix stage");
+    ModelStage::validate_pair(&prefix, &suffix).expect("matching stages");
+    let full_bytes = model.stored_weight_bytes();
+    assert!(prefix.stored_weight_bytes() < full_bytes);
+    assert!(suffix.stored_weight_bytes() < full_bytes);
+    println!(
+        "stored weight bytes: full={full_bytes}, prefix={}, suffix={}",
+        prefix.stored_weight_bytes(),
+        suffix.stored_weight_bytes()
+    );
+
+    let full_runtime = MetalRuntime::new(&model).expect("create complete Metal runtime");
+    let prefix_runtime = MetalStageRuntime::new(&prefix).expect("create prefix Metal runtime");
+    let suffix_runtime = MetalStageRuntime::new(&suffix).expect("create suffix Metal runtime");
+    let mut full = full_runtime.session();
+    let mut first = prefix_runtime.session();
+    let mut second = suffix_runtime.session();
+    for (position, token) in [1, 2, 3, 30].into_iter().enumerate() {
+        full.prefill(&[token]).unwrap();
+        let hidden = first.forward_token(token).unwrap();
+        let scores = second.forward_hidden(hidden).unwrap();
+        let full_scores = full.next_token_scores().unwrap();
+        let largest_difference = scores
+            .iter()
+            .zip(full_scores)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            largest_difference < 1e-3,
+            "position {position}: score difference {largest_difference}"
+        );
+        let best = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .unwrap()
+                .0
+        };
+        assert_eq!(best(&scores), best(full_scores));
+        assert_eq!(first.position(), full.position());
+        assert_eq!(second.position(), full.position());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 #[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
 fn real_q4_mixed_cpu_metal_stages_match_full_scores() {
     use inference_engine::MetalStageRuntime;

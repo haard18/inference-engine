@@ -250,6 +250,7 @@ pub fn load_gguf_tokenizer(path: impl AsRef<Path>) -> Result<ByteBpeTokenizer, G
                     | "tokenizer.ggml.add_space_prefix"
                     | "tokenizer.ggml.bos_token_id"
                     | "tokenizer.ggml.eos_token_id"
+                    | "tokenizer.ggml.padding_token_id"
                     | "tokenizer.ggml.unknown_token_id"
                     | "tokenizer.ggml.add_bos_token"
             )
@@ -275,6 +276,11 @@ pub fn load_gguf_tokenizer(path: impl AsRef<Path>) -> Result<ByteBpeTokenizer, G
             return Err(GgufError::Invalid(format!(
                 "invalid special token ID {key}"
             )));
+        }
+    }
+    if let Some(index) = source.optional_integer("tokenizer.ggml.padding_token_id")? {
+        if types.get(index as usize) != Some(&3) {
+            return Err(GgufError::Invalid("invalid padding token ID".into()));
         }
     }
     ByteBpeTokenizer::from_gguf_parts(tokens, source.take_strings("tokenizer.ggml.merges")?, types)
@@ -470,6 +476,7 @@ impl GgufReader {
             6 => Matrix::from_q5_0(rows, cols, data).map_err(GgufError::from),
             8 => Matrix::from_q8_0(rows, cols, data).map_err(GgufError::from),
             12 => Matrix::from_q4_k(rows, cols, data).map_err(GgufError::from),
+            14 => Matrix::from_q6_k(rows, cols, data).map_err(GgufError::from),
             30 => Matrix::from_bf16_bits(rows, cols, decode_u16(&data)?).map_err(GgufError::from),
             _ => Err(GgufError::Unsupported(format!("tensor type {kind}"))),
         }
@@ -508,7 +515,8 @@ fn tensor_size(kind: u32, dims: &[usize]) -> Result<u64, GgufError> {
         6 if dims[0].is_multiple_of(32) => (elements / 32).checked_mul(22),
         8 if dims[0].is_multiple_of(32) => (elements / 32).checked_mul(34),
         12 if dims[0].is_multiple_of(256) => (elements / 256).checked_mul(144),
-        6 | 8 | 12 => {
+        14 if dims[0].is_multiple_of(256) => (elements / 256).checked_mul(210),
+        6 | 8 | 12 | 14 => {
             return Err(GgufError::Invalid(
                 "quantized tensor width must divide by block width".into(),
             ))

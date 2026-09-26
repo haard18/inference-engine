@@ -13,6 +13,7 @@ enum MatrixData {
     Q5_0(Vec<u8>),
     Q8_0(Vec<u8>),
     Q4K(Vec<u8>),
+    Q6K(Vec<u8>),
 }
 
 /// A contiguous row-major tensor with two dimensions.
@@ -129,6 +130,24 @@ impl Matrix {
         })
     }
 
+    /// Q6_K stores 256 weights in a 210-byte block.
+    pub fn from_q6_k(rows: usize, cols: usize, data: Vec<u8>) -> Result<Self, EngineError> {
+        validate_quantized_length(rows, cols, data.len(), 256, 210, "Q6_K matrix")?;
+        if !data
+            .as_chunks::<210>()
+            .0
+            .iter()
+            .all(|block| f16::from_bits(u16::from_le_bytes([block[208], block[209]])).is_finite())
+        {
+            return Err(EngineError::InvalidValue("Q6_K matrix scale"));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            data: MatrixData::Q6K(data),
+        })
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -146,6 +165,7 @@ impl Matrix {
             MatrixData::Q8_0(values) => (values.as_ptr().cast(), values.len(), 3),
             MatrixData::Q5_0(values) => (values.as_ptr().cast(), values.len(), 4),
             MatrixData::Q4K(values) => (values.as_ptr().cast(), values.len(), 5),
+            MatrixData::Q6K(values) => (values.as_ptr().cast(), values.len(), 6),
         }
     }
 
@@ -154,9 +174,10 @@ impl Matrix {
         match &self.data {
             MatrixData::F32(values) => values.len() * size_of::<f32>(),
             MatrixData::F16(values) | MatrixData::Bf16(values) => values.len() * size_of::<u16>(),
-            MatrixData::Q5_0(values) | MatrixData::Q8_0(values) | MatrixData::Q4K(values) => {
-                values.len()
-            }
+            MatrixData::Q5_0(values)
+            | MatrixData::Q8_0(values)
+            | MatrixData::Q4K(values)
+            | MatrixData::Q6K(values) => values.len(),
         }
     }
 
@@ -206,6 +227,15 @@ impl Matrix {
                     .0
                     .iter()
                     .flat_map(dequantize_q4_k)
+                    .collect()
+            }
+            MatrixData::Q6K(values) => {
+                let row_bytes = self.cols / 256 * 210;
+                values[index * row_bytes..(index + 1) * row_bytes]
+                    .as_chunks::<210>()
+                    .0
+                    .iter()
+                    .flat_map(dequantize_q6_k)
                     .collect()
             }
         })
@@ -312,6 +342,24 @@ impl Matrix {
                     }
                 });
             }
+            MatrixData::Q6K(values) => {
+                let row_bytes = self.cols / 256 * 210;
+                for_each_output_row(&mut result, elements, |index, output| {
+                    let row = &values[index * row_bytes..(index + 1) * row_bytes];
+                    for (block, input_block) in row
+                        .as_chunks::<210>()
+                        .0
+                        .iter()
+                        .zip(input.as_chunks::<256>().0)
+                    {
+                        *output += dequantize_q6_k(block)
+                            .iter()
+                            .zip(input_block)
+                            .map(|(weight, value)| weight * value)
+                            .sum::<f32>();
+                    }
+                });
+            }
         }
         Ok(result)
     }
@@ -399,6 +447,31 @@ fn dequantize_q4_k(block: &[u8; 144]) -> [f32; 256] {
                 (scale * low_scale) * f32::from(packed & 15) - minimum * low_minimum;
             output[group * 64 + 32 + index] =
                 (scale * high_scale) * f32::from(packed >> 4) - minimum * high_minimum;
+        }
+    }
+    output
+}
+
+fn dequantize_q6_k(block: &[u8; 210]) -> [f32; 256] {
+    let scale = f16::from_bits(u16::from_le_bytes([block[208], block[209]])).to_f32();
+    let mut output = [0.0; 256];
+    for half in 0..2 {
+        for index in 0..32 {
+            let low_first = block[half * 64 + index];
+            let low_second = block[half * 64 + index + 32];
+            let high = block[128 + half * 32 + index];
+            let scale_index = 192 + half * 8 + index / 16;
+            let quants = [
+                (low_first & 15) | ((high & 3) << 4),
+                (low_second & 15) | (((high >> 2) & 3) << 4),
+                (low_first >> 4) | (((high >> 4) & 3) << 4),
+                (low_second >> 4) | ((high >> 6) << 4),
+            ];
+            for (group, quant) in quants.into_iter().enumerate() {
+                let group_scale = block[scale_index + group * 2] as i8 as f32;
+                output[half * 128 + group * 32 + index] =
+                    scale * group_scale * (f32::from(quant) - 32.0);
+            }
         }
     }
     output

@@ -363,3 +363,29 @@ fn q4_k_blocks_decode_subscales_and_compute() {
     assert_eq!(matrix.mul_vec(&[1.0; 256]).unwrap(), [1920.0]);
     assert!(Matrix::from_q4_k(1, 255, vec![]).is_err());
 }
+
+#[test]
+fn q6_k_blocks_decode_signed_scales_and_compute() {
+    let mut block = vec![0_u8; 210];
+    block[..128].fill(0x12);
+    block[128..192].fill(0xe4);
+    block[192..200].fill(1);
+    block[200..208].fill(254); // -2 as a signed scale
+    block[208..].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+    let matrix = Matrix::from_q6_k(1, 256, block).unwrap();
+    assert_eq!(matrix.storage_bytes(), 210);
+    let row = matrix.row(0).unwrap();
+    assert_eq!([row[0], row[32], row[64], row[96]], [-15.0, -7.0, 0.5, 8.5]);
+    assert_eq!(
+        [row[128], row[160], row[192], row[224]],
+        [30.0, 14.0, -1.0, -17.0]
+    );
+    assert_eq!(matrix.mul_vec(&[1.0; 256]).unwrap(), [416.0]);
+    assert!(Matrix::from_q6_k(1, 255, vec![]).is_err());
+    let mut invalid_scale = vec![0; 210];
+    invalid_scale[208..].copy_from_slice(&f16::NAN.to_bits().to_le_bytes());
+    assert_eq!(
+        Matrix::from_q6_k(1, 256, invalid_scale).unwrap_err(),
+        EngineError::InvalidValue("Q6_K matrix scale")
+    );
+}
