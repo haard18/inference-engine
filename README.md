@@ -193,6 +193,17 @@ The loopback API then accepts the same `/v1/chat/completions` requests as a comp
 
 In a one-host pilot with the Q4_K_M model, 12 ordinary requests and concurrency one gave 0.615 requests/s for the complete worker and 0.606 requests/s for a 15/15 split over loopback TLS. Median complete response times were 1,627 ms and 1,653 ms. Separate streaming runs measured median first visible content at 950 ms and 962 ms. With concurrency two, the complete worker and split served 0.614 and 0.603 requests/s; two complete workers with whole-request routing served 1.214 requests/s in one run and 1.039 in a second run. All these requests completed successfully. The short sample and uneven 7/5 routing in the second pool run prevent a stable throughput claim.
 
+For a repeatable one-host Metal check, build the release binaries and run the load script. It creates temporary approved device identities, starts complete and split services in turn, checks ordinary and streaming output, watches worker stability, and saves full benchmark reports in the chosen output directory:
+
+```sh
+cargo build --release --bin serve --bin device --bin pool-bench
+python3 scripts/split-soak.py /path/to/SmolLM2-135M-Q4_K_M.gguf \
+  --requests 20 --trials 3 --concurrency 2 --max-tokens 16 \
+  --output /path/to/benchmark-reports
+```
+
+On one Apple Silicon Mac, three 20-request trials at concurrency two completed all 240 measured requests across ordinary and streaming modes. Complete Metal serving had a median 4.231 ordinary requests/s and 472 ms response p50; split Metal serving had 3.911 requests/s and 511 ms. Median streaming rates were 4.232 and 3.548 requests/s, with first visible content at 372 and 402 ms. The same text digest appeared in every report, and no worker restarted. These one-host results do not measure transfer over a physical LAN; the split streaming trials varied more than the complete-worker trials.
+
 The split prefix probes its suffix once a second. Two failed probes make `/health` and new chat requests return HTTP 503; one successful probe restores admission. A full suffix queue does not count as an unhealthy device. The suffix answers capacity probes while a token step is running, so a busy worker does not delay the probe behind model computation. A stream already in progress still reports an inference error if the suffix disappears after output begins.
 
 During the concurrency-two runs, `ps` sampling with a 100 ms sleep between samples found peak process-tree RSS of 155.5 MiB for the complete worker, 99.0 MiB for the split prefix device, 82.4 MiB for the split suffix device, and about 157 MiB for each complete worker in the pool. The actual sample spacing included `ps` execution time. These are sampled process-tree values on one Mac, including each server and its child process. They do not establish peak memory on two machines or performance over a real network. Repeatable two-Mac comparison remains the open acceptance check.
