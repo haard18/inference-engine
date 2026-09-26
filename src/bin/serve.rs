@@ -44,6 +44,49 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         return serving::run_stage_worker_stdio(&args[2], args[3].parse()?, args[4].parse()?);
     }
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--stage-suffix")
+    {
+        if args.len() != 7 {
+            return Err(format!(
+                "usage: {} --stage-suffix STATE_DIR IP:PORT MODEL_GGUF LAYER_START LAYER_END",
+                args[0]
+            )
+            .into());
+        }
+        let address: SocketAddr = args[3].parse()?;
+        if address.port() == 0 {
+            return Err("stage peer listener needs a nonzero port".into());
+        }
+        let identity = DeviceIdentity::load(&args[2])?;
+        let peers = PeerStore::load(&args[2])?;
+        let listener = TcpListener::bind(address)?;
+        let server = serving::start_stage_peer(
+            &args[4],
+            env::current_exe()?,
+            args[5].parse()?,
+            args[6].parse()?,
+            4,
+            &identity,
+            &peers,
+        )
+        .await?;
+        println!(
+            "Serving approved suffix stage at https://{}",
+            listener.local_addr()?
+        );
+        let handle = axum_server::Handle::new();
+        let mut running = tokio::spawn(server.serve(listener, handle.clone()));
+        tokio::select! {
+            result = &mut running => result??,
+            _ = tokio::signal::ctrl_c() => {
+                handle.graceful_shutdown(Some(Duration::from_secs(5)));
+                running.await??;
+            }
+        }
+        return Ok(());
+    }
     let mut index = 1;
     let metal = args
         .get(index)

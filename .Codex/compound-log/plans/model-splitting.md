@@ -28,4 +28,6 @@ Run one model across two approved owner-owned devices when it does not fit on on
 - [x] Load and own only each stage's GGUF weights and key/value cache. A local real-model test checks score parity and stored-weight reduction for each stage. Cross-device operation and process resident-memory measurements remain open.
 - [x] Define a bounded, versioned binary activation frame and validate model, request, position, width, and finite values before suffix execution. The real-model stage parity test now passes encoded activations through this boundary.
 - [x] Run prefix and suffix stages in independent bounded worker processes and check real-model parity through their binary activation exchange on one host. A single idle resident-memory snapshot confirmed that each stage process used less memory than the full worker.
-- [ ] Carry activation frames over the approved peer connection and add stage-aware admission, deadline, and failure handling.
+- [x] Carry a suffix activation over mutually approved TLS to a partial-weight child process. Verify exact real-model scores, certificate rejection, request identity, and peer loss. Bound the peer queue and per-step deadline; discard a canceled child before reuse.
+- [ ] Orchestrate a full chat request across a local prefix and remote suffix, including admission on both devices, one shared deadline, generation, streaming, session close, and stage-loss behavior.
+- [ ] Measure split serving on two physical Macs under sustained load and compare it with complete-model routing and one-device execution.

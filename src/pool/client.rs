@@ -16,17 +16,19 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
 use super::tls::{client_config, server_name};
 use super::{DeviceIdentity, PoolError, TrustedPeer};
-use crate::serving::CapacitySnapshot;
 use crate::serving::CONVERSATION_HEADER;
+use crate::serving::{CapacitySnapshot, StageCapacitySnapshot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(750);
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_SNAPSHOT_BYTES: usize = 8 * 1024;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
 const STREAM_ERROR: &[u8] = b"\n\ndata: {\"error\":{\"message\":\"peer stream ended before completion\",\"type\":\"server_error\",\"code\":\"peer_stream_lost\"}}\n\ndata: [DONE]\n\n";
 const DONE_MARKER: &[u8] = b"data: [DONE]\n\n";
 
@@ -105,6 +107,165 @@ impl PeerClient {
                 self.mark_failure();
                 Err(error)
             }
+        }
+    }
+
+    pub async fn stage_snapshot(&self) -> Result<StageCapacitySnapshot, PoolError> {
+        let deadline = tokio::time::Instant::now() + SNAPSHOT_TIMEOUT;
+        let request = Request::builder()
+            .uri("/internal/stage/capacity")
+            .header("host", "peer")
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| PoolError::Transport(error.to_string()))?;
+        let result = async {
+            let response = self.send(request, deadline).await?;
+            if response.status() != StatusCode::OK {
+                return Err(PoolError::Transport(format!(
+                    "stage capacity returned {}",
+                    response.status()
+                )));
+            }
+            let bytes = tokio::time::timeout_at(
+                deadline,
+                to_bytes(Body::new(response.into_body()), MAX_SNAPSHOT_BYTES),
+            )
+            .await
+            .map_err(|_| PoolError::Transport("stage capacity timed out".into()))?
+            .map_err(|error| PoolError::Transport(error.to_string()))?;
+            let snapshot: StageCapacitySnapshot = serde_json::from_slice(&bytes)?;
+            if snapshot.model_digest.len() != 64
+                || hex::decode(&snapshot.model_digest).is_err()
+                || snapshot.layer_start >= snapshot.layer_end
+                || snapshot.hidden_size == 0
+                || snapshot.vocab_size == 0
+                || snapshot.max_positions == 0
+                || snapshot.stored_weight_bytes == 0
+                || snapshot.queue_capacity == 0
+                || snapshot.queue_capacity > 16
+                || snapshot.queue_available > snapshot.queue_capacity
+            {
+                return Err(PoolError::Invalid("stage capacity snapshot is invalid"));
+            }
+            Ok(snapshot)
+        }
+        .await;
+        if result.is_err() {
+            self.mark_failure();
+        } else {
+            self.clear_failure();
+        }
+        result
+    }
+
+    /// Send one activation without replaying it after a connection or stage failure.
+    pub async fn forward_stage(
+        &self,
+        frame: Vec<u8>,
+        request_id: Uuid,
+        expected_vocab_size: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<f32>, PoolError> {
+        let expected_bytes = expected_vocab_size
+            .checked_mul(4)
+            .filter(|bytes| *bytes > 0 && *bytes <= MAX_STAGE_BYTES)
+            .ok_or(PoolError::Invalid("stage vocabulary size is invalid"))?;
+        if !(64..=MAX_STAGE_BYTES).contains(&frame.len()) {
+            return Err(PoolError::Invalid("stage activation size is invalid"));
+        }
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(PoolError::Transport("stage deadline expired".into()))?;
+        let remaining_ms = remaining.as_millis().clamp(1, 120_000) as u64;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/stage/activation")
+            .header("host", "peer")
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header("x-inference-request-id", request_id.to_string())
+            .header("x-inference-deadline-ms", remaining_ms.to_string())
+            .body(Full::new(Bytes::from(frame)))
+            .map_err(|error| PoolError::Transport(error.to_string()))?;
+        let response = match self.send(request, deadline).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.mark_failure();
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        let limit = if status == StatusCode::OK {
+            MAX_STAGE_BYTES
+        } else {
+            4096
+        };
+        let body = match tokio::time::timeout_at(
+            deadline,
+            to_bytes(Body::new(response.into_body()), limit),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) => {
+                self.mark_failure();
+                return Err(PoolError::Transport(error.to_string()));
+            }
+            Err(_) => {
+                self.mark_failure();
+                return Err(PoolError::Transport("stage response timed out".into()));
+            }
+        };
+        if status != StatusCode::OK {
+            if status.is_server_error() {
+                self.mark_failure();
+            }
+            return Err(PoolError::Transport(format!(
+                "stage returned HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        if body.len() != expected_bytes {
+            self.mark_failure();
+            return Err(PoolError::Transport("stage score length is invalid".into()));
+        }
+        let scores: Vec<f32> = body
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        if !scores.iter().all(|score| score.is_finite()) {
+            self.mark_failure();
+            return Err(PoolError::Transport("stage scores are not finite".into()));
+        }
+        self.clear_failure();
+        Ok(scores)
+    }
+
+    pub async fn close_stage(
+        &self,
+        request_id: Uuid,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), PoolError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(PoolError::Transport("stage deadline expired".into()))?;
+        let remaining_ms = remaining.as_millis().clamp(1, 120_000) as u64;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/stage/close")
+            .header("host", "peer")
+            .header("x-inference-request-id", request_id.to_string())
+            .header("x-inference-deadline-ms", remaining_ms.to_string())
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| PoolError::Transport(error.to_string()))?;
+        let response = self.send(request, deadline).await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            Err(PoolError::Transport(format!(
+                "stage close returned {}",
+                response.status()
+            )))
         }
     }
 

@@ -117,4 +117,14 @@ A local split-stage test loads layers 0–14 and 15–29 of the Q4_K_M model sep
 
 The stage boundary uses a versioned binary activation frame. For this model, it carries 2,304 bytes of f32 hidden values plus a 64-byte header with the model digest, request ID, and token position. The suffix checks those fields, the frame length, and finite values before it runs. Local and separate-process parity tests both pass encoded frames between stages.
 
-A separate process test now starts one worker for each 15-layer stage and passes activation frames between them through a parent process. Both workers retain their assigned weights and at most eight request sessions, with a 128 MiB total key/value cache limit and five-minute idle cleanup. The split scores matched the complete model at four token positions. At startup on one Apple Silicon Mac, a single resident-memory snapshot showed 119.5 MiB for the complete model worker and 65.5 MiB for each stage worker. This is a single idle snapshot, not peak memory under load. Encrypted transfer between approved devices and stage-aware request admission remain open.
+A separate process test now starts one worker for each 15-layer stage and passes activation frames between them through a parent process. Both workers retain their assigned weights and at most eight request sessions, with a 128 MiB total key/value cache limit and five-minute idle cleanup. The split scores matched the complete model at four token positions. At startup on one Apple Silicon Mac, a single resident-memory snapshot showed 119.5 MiB for the complete model worker and 65.5 MiB for each stage worker. This is a single idle snapshot, not peak memory under load.
+
+An approved device can now serve a suffix stage over mutual TLS. After pairing both devices, start the suffix endpoint on its device with the same state directory used for pairing:
+
+```sh
+cargo run --release --bin serve -- \
+  --stage-suffix /path/to/device-state 0.0.0.0:8444 \
+  /path/to/SmolLM2-135M-Q4_K_M.gguf 15 30
+```
+
+The endpoint starts a partial-weight child process. It reports stage capacity and accepts bounded activation frames only from approved certificates. A real-model test sent four activations over mutual TLS and got the same scores as the complete model. It also rejected an unapproved certificate and a wrong request ID. Each remote step has a remaining-deadline header; a timed-out or canceled step discards its child process before another request can use it. The local chat API does not yet select this remote suffix automatically.

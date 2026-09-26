@@ -30,6 +30,7 @@
 - [Selective model-stage loading](learnings/2026-09-26-selective-stage-loading.md)
 - [Activation frame boundary](learnings/2026-09-26-activation-frame.md)
 - [Separate model-stage processes](learnings/2026-09-26-stage-processes.md)
+- [Approved remote suffix stage](learnings/2026-09-26-remote-stage.md)
 
 ## Reviews
 
@@ -53,3 +54,4 @@
 - [Selective stage loading review](reviews/2026-09-26-selective-stage-loading.md)
 - [Activation frame review](reviews/2026-09-26-activation-frame.md)
 - [Stage process review](reviews/2026-09-26-stage-processes.md)
+- [Remote stage review](reviews/2026-09-26-remote-stage.md)
