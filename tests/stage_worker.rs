@@ -2,6 +2,7 @@ use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Duration;
 
 use inference_engine::{load_gguf, GenerationSession};
 use serde_json::{json, Value};
@@ -152,4 +153,49 @@ fn two_stage_processes_match_the_complete_real_model() {
         &[],
     );
     assert_eq!(admitted["kind"], "activation");
+}
+
+#[test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+fn expired_active_stage_session_is_removed_but_checkpoint_remains() {
+    let directory = env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR");
+    let path = Path::new(&directory).join("SmolLM2-135M-Q4_K_M.gguf");
+    let mut prefix = StageProcess::start(&path, 0, 15);
+    let active = Uuid::new_v4();
+    let (event, _) = prefix.request(
+        json!({"kind":"token","request_id":active.to_string(),"token_id":1,"lease_ms":3000}),
+        &[],
+    );
+    assert_eq!(event["kind"], "activation");
+    let checkpoint = Uuid::new_v4();
+    let (event, _) = prefix.request(
+        json!({"kind":"token","request_id":checkpoint.to_string(),"token_id":1,"lease_ms":3000}),
+        &[],
+    );
+    assert_eq!(event["kind"], "activation");
+    let (rewound, _) = prefix.request(
+        json!({"kind":"rewind","request_id":checkpoint.to_string(),"position":1}),
+        &[],
+    );
+    assert_eq!(rewound["kind"], "rewound");
+    std::thread::sleep(Duration::from_millis(3100));
+    let (expired, _) = prefix.request(json!({"kind":"probe","request_id":active.to_string()}), &[]);
+    assert_eq!(expired["position"], Value::Null);
+    let (position, _) = prefix.request(
+        json!({"kind":"probe","request_id":checkpoint.to_string()}),
+        &[],
+    );
+    assert_eq!(position["kind"], "position");
+    assert_eq!(position["position"], 1);
+    let invalid = Uuid::new_v4();
+    let (failed, _) = prefix.request(
+        json!({"kind":"token","request_id":invalid.to_string(),"token_id":1,"lease_ms":0}),
+        &[],
+    );
+    assert_eq!(failed["kind"], "failed");
+    let (missing, _) = prefix.request(
+        json!({"kind":"probe","request_id":invalid.to_string()}),
+        &[],
+    );
+    assert_eq!(missing["position"], Value::Null);
 }

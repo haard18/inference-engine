@@ -49,6 +49,9 @@ pub use stage_peer::{
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_STAGE_BATCH_FRAMES: usize = 16;
+pub(crate) const LEGACY_STAGE_LEASE_MS: u64 = 300_000;
+// Keep this equal to the maximum request timeout in milliseconds.
+pub(crate) const MAX_STAGE_LEASE_MS: u64 = 600_000;
 const OUTPUT_CHANNEL_CAPACITY: usize = 8;
 const SLOW_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(10);

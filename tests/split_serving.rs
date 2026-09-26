@@ -454,7 +454,7 @@ async fn split_backend_case(prefix_backend: ServingBackend, suffix_backend: Serv
     )
     .await
     .unwrap();
-    let (whole_status, whole_body, _) = chat(whole, false).await;
+    let (whole_status, whole_body, _) = chat(whole.clone(), false).await;
     let (split_status, split_body, _) = chat(split.clone(), false).await;
     assert_eq!(whole_status, StatusCode::OK, "{whole_body}");
     assert_eq!(split_status, StatusCode::OK, "{split_body}");
@@ -481,6 +481,52 @@ async fn split_backend_case(prefix_backend: ServingBackend, suffix_backend: Serv
     assert_eq!(
         repeated["usage"]["prompt_tokens_details"]["cached_tokens"],
         repeated["usage"]["prompt_tokens"]
+    );
+    let extended = json!([
+        {"role": "user", "content": "Say hello."},
+        {"role": "assistant", "content": "Hello."},
+        {"role": "user", "content": "Say it again."}
+    ]);
+    let (status, _, extended_cached) =
+        conversation_chat(split.clone(), extended.clone(), Some(&conversation_id)).await;
+    let (fresh_status, _, extended_fresh) = conversation_chat(whole, extended.clone(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fresh_status, StatusCode::OK);
+    assert_eq!(extended_cached["choices"], extended_fresh["choices"]);
+    assert!(
+        extended_cached["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    suffix_handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    suffix_task.await.unwrap().unwrap();
+    wait_for_health(split.clone(), StatusCode::SERVICE_UNAVAILABLE).await;
+    let listener = TcpListener::bind(address).unwrap();
+    let suffix = start_stage_peer_with_backend(
+        &model,
+        executable,
+        15,
+        30,
+        StagePeerOptions {
+            queue_capacity: 4,
+            backend: suffix_backend,
+        },
+        &suffix_identity,
+        &suffix_peers,
+    )
+    .await
+    .unwrap();
+    let suffix_handle = axum_server::Handle::new();
+    let handle = suffix_handle.clone();
+    let suffix_task = tokio::spawn(async move { suffix.serve(listener, handle).await });
+    wait_for_health(split.clone(), StatusCode::OK).await;
+    let (status, _, recovered) = conversation_chat(split, extended, Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recovered["choices"], extended_cached["choices"]);
+    assert_eq!(
+        recovered["usage"]["prompt_tokens_details"]["cached_tokens"],
+        0
     );
     suffix_handle.graceful_shutdown(Some(Duration::from_secs(1)));
     suffix_task.await.unwrap().unwrap();

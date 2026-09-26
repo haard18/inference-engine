@@ -15,7 +15,7 @@ use super::stage_peer::{StageChild, StageReady, StageStepError};
 use super::{
     check_job, router, validate_config, ActiveJob, AppState, Job, JobFailure, ServingBackend,
     ServingConfig, ServingError, StageCapacitySnapshot, WorkerEvent, WorkerStatus,
-    MAX_STAGE_BATCH_FRAMES, SLOW_CLIENT_TIMEOUT,
+    MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS, SLOW_CLIENT_TIMEOUT,
 };
 use crate::pool::client::PeerClient;
 use crate::pool::DeviceIdentity;
@@ -502,9 +502,17 @@ async fn prefix_frame(
 ) -> Result<Vec<u8>, JobFailure> {
     check_job(job)?;
     let deadline = tokio::time::Instant::from_std(job.deadline);
+    let lease_ms = job
+        .deadline
+        .checked_duration_since(Instant::now())
+        .map_or(1, |remaining| {
+            remaining
+                .as_millis()
+                .clamp(1, u128::from(MAX_STAGE_LEASE_MS)) as u64
+        });
     let frame = tokio::select! {
         _ = job.output.closed() => return Err(JobFailure::ClientGone),
-        result = tokio::time::timeout_at(deadline, prefix.token(request_id, token)) => {
+        result = tokio::time::timeout_at(deadline, prefix.token(request_id, token, lease_ms)) => {
             result.map_err(|_| JobFailure::Deadline)?
                 .map_err(|error| JobFailure::Execution(stage_error(error)))?
         }

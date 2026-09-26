@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::ServingBackend;
-use crate::serving::MAX_STAGE_BATCH_FRAMES;
+use crate::serving::{LEGACY_STAGE_LEASE_MS, MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS};
 #[cfg(target_os = "macos")]
 use crate::MetalStageRuntime;
 use crate::{load_gguf_stage, ActivationFrame, StageSession};
@@ -20,7 +20,7 @@ const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_ACTIVATION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SCORE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COMMAND_LINE_BYTES: usize = 4096;
-const SESSION_IDLE_LIMIT: Duration = Duration::from_secs(300);
+const SESSION_IDLE_LIMIT: Duration = Duration::from_millis(LEGACY_STAGE_LEASE_MS);
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -28,12 +28,16 @@ enum StageCommand {
     Token {
         request_id: String,
         token_id: usize,
+        #[serde(default)]
+        lease_ms: Option<u64>,
     },
     Activation {
         request_id: String,
         payload_bytes: usize,
         #[serde(default = "one_frame")]
         frame_count: usize,
+        #[serde(default)]
+        lease_ms: Option<u64>,
     },
     Close {
         request_id: String,
@@ -81,9 +85,20 @@ fn one_frame() -> usize {
     1
 }
 
+fn lease_duration(lease_ms: Option<u64>) -> Result<Duration, &'static str> {
+    match lease_ms {
+        None => Ok(SESSION_IDLE_LIMIT),
+        Some(value) if (1..=MAX_STAGE_LEASE_MS).contains(&value) => {
+            Ok(Duration::from_millis(value))
+        }
+        Some(_) => Err("invalid stage session lease"),
+    }
+}
+
 struct SessionEntry<'a> {
     session: StageSession<'a>,
     touched: Instant,
+    lease_until: Instant,
     checkpointed: bool,
 }
 
@@ -149,12 +164,27 @@ pub fn run_stage_worker_stdio_with_backend(
             return Err("stage command exceeds line limit".into());
         }
         let command: StageCommand = serde_json::from_slice(&line)?;
-        sessions.retain(|_, entry| entry.touched.elapsed() < SESSION_IDLE_LIMIT);
+        let now = Instant::now();
+        sessions.retain(|_, entry| {
+            if entry.checkpointed {
+                now.duration_since(entry.touched) < SESSION_IDLE_LIMIT
+            } else {
+                now < entry.lease_until
+            }
+        });
         match command {
             StageCommand::Token {
                 request_id,
                 token_id,
+                lease_ms,
             } => {
+                let lease = match lease_duration(lease_ms) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        fail(&mut output, message)?;
+                        continue;
+                    }
+                };
                 let request_id = match Uuid::parse_str(&request_id) {
                     Ok(id) => id,
                     Err(_) => {
@@ -174,9 +204,11 @@ pub fn run_stage_worker_stdio_with_backend(
                 let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
                     session: new_session(),
                     touched: Instant::now(),
+                    lease_until: Instant::now() + lease,
                     checkpointed: false,
                 });
                 entry.checkpointed = false;
+                entry.lease_until = Instant::now() + lease;
                 let position = entry.session.position();
                 let result = entry
                     .session
@@ -193,6 +225,7 @@ pub fn run_stage_worker_stdio_with_backend(
                 request_id,
                 payload_bytes,
                 frame_count,
+                lease_ms,
             } => {
                 let frame_bytes = stage
                     .hidden_size()
@@ -207,6 +240,13 @@ pub fn run_stage_worker_stdio_with_backend(
                 }
                 let mut payload = vec![0; payload_bytes];
                 input.read_exact(&mut payload)?;
+                let lease = match lease_duration(lease_ms) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        fail(&mut output, message)?;
+                        continue;
+                    }
+                };
                 let request_id = match Uuid::parse_str(&request_id) {
                     Ok(id) => id,
                     Err(_) => {
@@ -226,9 +266,11 @@ pub fn run_stage_worker_stdio_with_backend(
                 let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
                     session: new_session(),
                     touched: Instant::now(),
+                    lease_until: Instant::now() + lease,
                     checkpointed: false,
                 });
                 entry.checkpointed = false;
+                entry.lease_until = Instant::now() + lease;
                 let result = (|| -> Result<Vec<u8>, String> {
                     let mut scores = Vec::new();
                     for frame in payload.chunks_exact(frame_bytes) {

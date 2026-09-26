@@ -66,6 +66,7 @@
 - [Metal split serving through child processes](learnings/2026-09-26-metal-split-serving.md)
 - [One-host Metal split load](learnings/2026-09-26-metal-split-load.md)
 - [Mixed CPU and Metal stages](learnings/2026-09-26-mixed-stage-backends.md)
+- [Deadline-bound active stage sessions](learnings/2026-09-26-stage-session-leases.md)
 
 ## Reviews
 

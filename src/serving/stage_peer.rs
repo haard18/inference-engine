@@ -24,7 +24,9 @@ use uuid::Uuid;
 
 use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 
-use super::{ServingBackend, ServingError, MAX_STAGE_BATCH_FRAMES};
+use super::{
+    ServingBackend, ServingError, LEGACY_STAGE_LEASE_MS, MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -33,6 +35,7 @@ const MAX_DEADLINE_MS: u64 = 120_000;
 const MAX_QUEUE: usize = 16;
 const REQUEST_ID_HEADER: &str = "x-inference-request-id";
 const DEADLINE_HEADER: &str = "x-inference-deadline-ms";
+const SESSION_LEASE_HEADER: &str = "x-inference-session-lease-ms";
 const FRAME_COUNT_HEADER: &str = "x-inference-frame-count";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -311,6 +314,7 @@ async fn activation(
     }
     let request_id = request_id(&headers)?;
     let deadline = deadline(&headers)?;
+    let lease_ms = session_lease(&headers)?;
     let _permit = state
         .queue
         .clone()
@@ -328,8 +332,11 @@ async fn activation(
     // Cancellation drops this child and discards any incomplete pipe response.
     let mut child =
         StageChildLease::new(worker.take().expect("worker started"), &state.worker_ready);
-    let result =
-        tokio::time::timeout_at(deadline, child.child().step(request_id, &body, frame_count)).await;
+    let result = tokio::time::timeout_at(
+        deadline,
+        child.child().step(request_id, &body, frame_count, lease_ms),
+    )
+    .await;
     match result {
         Ok(Ok(scores)) => {
             child.restore(&mut worker);
@@ -538,6 +545,21 @@ fn deadline(headers: &HeaderMap) -> Result<tokio::time::Instant, (StatusCode, St
     Ok(tokio::time::Instant::now() + Duration::from_millis(millis))
 }
 
+fn session_lease(headers: &HeaderMap) -> Result<u64, (StatusCode, String)> {
+    match headers.get(SESSION_LEASE_HEADER) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=MAX_STAGE_LEASE_MS).contains(value))
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "invalid stage session lease".into(),
+            )),
+        None => Ok(LEGACY_STAGE_LEASE_MS),
+    }
+}
+
 pub(super) enum StageStepError {
     Rejected(String),
     Broken(String),
@@ -608,11 +630,13 @@ impl StageChild {
         &mut self,
         request_id: Uuid,
         token_id: usize,
+        lease_ms: u64,
     ) -> Result<Vec<u8>, StageStepError> {
         let command = json!({
             "kind": "token",
             "request_id": request_id.to_string(),
             "token_id": token_id,
+            "lease_ms": lease_ms,
         });
         let mut line = serde_json::to_vec(&command)
             .map_err(|error| StageStepError::Broken(error.to_string()))?;
@@ -669,12 +693,14 @@ impl StageChild {
         request_id: Uuid,
         body: &[u8],
         frame_count: usize,
+        lease_ms: u64,
     ) -> Result<Vec<u8>, StageStepError> {
         let command = json!({
             "kind":"activation",
             "request_id":request_id.to_string(),
             "payload_bytes":body.len(),
-            "frame_count":frame_count
+            "frame_count":frame_count,
+            "lease_ms":lease_ms
         });
         let mut line = serde_json::to_vec(&command)
             .map_err(|error| StageStepError::Broken(error.to_string()))?;
@@ -845,6 +871,19 @@ mod tests {
             .header(DEADLINE_HEADER, "3000")
             .body(Body::from(vec![0_u8; 72]))
             .unwrap()
+    }
+
+    #[test]
+    fn session_lease_header_is_bounded() {
+        let mut headers = HeaderMap::new();
+        let default_lease = session_lease(&headers).unwrap();
+        assert_eq!(default_lease, LEGACY_STAGE_LEASE_MS);
+        headers.insert(SESSION_LEASE_HEADER, "600000".parse().unwrap());
+        assert_eq!(session_lease(&headers).unwrap(), 600_000);
+        headers.insert(SESSION_LEASE_HEADER, "0".parse().unwrap());
+        assert!(session_lease(&headers).is_err());
+        headers.insert(SESSION_LEASE_HEADER, "600001".parse().unwrap());
+        assert!(session_lease(&headers).is_err());
     }
 
     #[tokio::test]

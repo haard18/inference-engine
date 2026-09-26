@@ -21,7 +21,9 @@ use uuid::Uuid;
 use super::tls::{client_config, server_name};
 use super::{DeviceIdentity, PoolError, TrustedPeer};
 use crate::serving::CONVERSATION_HEADER;
-use crate::serving::{CapacitySnapshot, StageCapacitySnapshot, MAX_STAGE_BATCH_FRAMES};
+use crate::serving::{
+    CapacitySnapshot, StageCapacitySnapshot, MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -194,6 +196,9 @@ impl PeerClient {
             .checked_duration_since(tokio::time::Instant::now())
             .ok_or(PoolError::Transport("stage deadline expired".into()))?;
         let remaining_ms = remaining.as_millis().clamp(1, 120_000) as u64;
+        let lease_ms = remaining
+            .as_millis()
+            .clamp(1, u128::from(MAX_STAGE_LEASE_MS)) as u64;
         let request = Request::builder()
             .method("POST")
             .uri("/internal/stage/activation")
@@ -201,6 +206,7 @@ impl PeerClient {
             .header(CONTENT_TYPE, "application/octet-stream")
             .header("x-inference-request-id", request_id.to_string())
             .header("x-inference-deadline-ms", remaining_ms.to_string())
+            .header("x-inference-session-lease-ms", lease_ms.to_string())
             .header("x-inference-frame-count", frame_count.to_string())
             .body(Full::new(Bytes::from(frames)))
             .map_err(|error| PoolError::Transport(error.to_string()))?;
