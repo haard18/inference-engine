@@ -6,6 +6,7 @@ description = "A Rust inference engine for user-owned devices"
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 fancy-regex = "0.14.0"
 half = "2.7.1"
 hex = "0.4.3"

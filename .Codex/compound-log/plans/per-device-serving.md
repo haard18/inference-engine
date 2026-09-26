@@ -23,7 +23,7 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 - [ ] Measure throughput, latency, memory, and behavior under concurrent and disconnected clients.
 - [ ] Measure restart latency and resource use under repeated worker failures.
 - [x] Add stable device identities, explicit owner-approved pairing, and verified mutual TLS configurations.
-- [ ] Connect the mutual TLS transport to a peer listener before listening beyond loopback.
+- [x] Connect the mutual TLS transport to a peer listener before listening beyond loopback.
 - [ ] Route whole requests across paired devices with health and loss handling.
 - [ ] Reuse conversation state safely across requests and devices.
 - [ ] Explore model splitting across devices after whole-request routing works.
@@ -31,4 +31,4 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 
 ## Limits
 
-This API is an intentional subset of chat completions. It supports one model, one choice, greedy decoding, and text messages. It does not claim full OpenAI API compatibility. The CLI still listens only on loopback. Pairing and mutual TLS are implemented and tested, but the peer listener is not connected to them yet.
+This API is an intentional subset of chat completions. It supports one model, one choice, greedy decoding, and text messages. It does not claim full OpenAI API compatibility. The local listener is loopback-only; an optional second listener accepts mutually approved peers over TLS. Pool routing is not implemented yet.

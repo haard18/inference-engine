@@ -1,4 +1,4 @@
-//! A bounded, authenticated, loopback serving layer for the supported text model.
+//! Bounded local and mutually authenticated peer serving for the supported text model.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -29,7 +29,9 @@ use crate::MetalRuntime;
 use crate::{ByteBpeDecoder, ByteBpeTokenizer, GenerationSession, Model};
 
 mod isolated;
-pub use isolated::{run_worker_stdio, start_isolated};
+mod peer;
+pub use isolated::{run_worker_stdio, start_isolated, start_isolated_paired};
+pub use peer::PeerServer;
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 8;
@@ -56,6 +58,7 @@ pub struct ServingConfig {
 pub enum ServingError {
     Configuration(&'static str),
     Worker(String),
+    Peer(String),
 }
 
 impl fmt::Display for ServingError {
@@ -63,6 +66,7 @@ impl fmt::Display for ServingError {
         match self {
             Self::Configuration(message) => write!(f, "invalid serving configuration: {message}"),
             Self::Worker(message) => write!(f, "inference worker failed to start: {message}"),
+            Self::Peer(message) => write!(f, "peer serving failed to start: {message}"),
         }
     }
 }
@@ -333,17 +337,28 @@ fn validate_config(config: &ServingConfig) -> Result<(), ServingError> {
 }
 
 fn router(state: Arc<AppState>) -> Router {
+    routed(state, true)
+}
+
+fn peer_router(state: Arc<AppState>) -> Router {
+    routed(state, false)
+}
+
+fn routed(state: Arc<AppState>, bearer_auth: bool) -> Router {
+    let requests = Router::new()
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions));
+    let requests = if bearer_auth {
+        requests.route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            authenticate,
+        ))
+    } else {
+        requests
+    };
     Router::new()
         .route("/health", get(health))
-        .merge(
-            Router::new()
-                .route("/v1/models", get(models))
-                .route("/v1/chat/completions", post(chat_completions))
-                .route_layer(middleware::from_fn_with_state(
-                    Arc::clone(&state),
-                    authenticate,
-                )),
-        )
+        .merge(requests)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

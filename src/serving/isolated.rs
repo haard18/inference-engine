@@ -1,4 +1,4 @@
-//! Restartable model process for the local HTTP server.
+//! Restartable model process shared by local and peer HTTP servers.
 
 use std::error::Error;
 use std::fs;
@@ -15,9 +15,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
 use super::{
-    router, validate_config, ActiveJob, AppState, Job, ServingBackend, ServingConfig, ServingError,
-    WorkerEvent, WorkerStatus, SLOW_CLIENT_TIMEOUT,
+    router, validate_config, ActiveJob, AppState, Job, PeerServer, ServingBackend, ServingConfig,
+    ServingError, WorkerEvent, WorkerStatus, SLOW_CLIENT_TIMEOUT,
 };
+use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 #[cfg(target_os = "macos")]
 use crate::MetalRuntime;
 use crate::{load_gguf, load_gguf_tokenizer, ByteBpeDecoder, ByteBpeTokenizer, GenerationSession};
@@ -69,6 +70,35 @@ pub async fn start_isolated(
     config: ServingConfig,
     executable: impl AsRef<Path>,
 ) -> Result<(Router, tokio::task::JoinHandle<()>), ServingError> {
+    let (state, task) = start_isolated_state(model_path, tokenizer, config, executable).await?;
+    Ok((router(state), task))
+}
+
+/// Start the local API and a peer API that can only be served with mutual TLS.
+pub async fn start_isolated_paired(
+    model_path: impl AsRef<Path>,
+    tokenizer: ByteBpeTokenizer,
+    config: ServingConfig,
+    executable: impl AsRef<Path>,
+    identity: &DeviceIdentity,
+    peers: &PeerStore,
+) -> Result<(Router, PeerServer, tokio::task::JoinHandle<()>), ServingError> {
+    let tls =
+        server_config(identity, peers).map_err(|error| ServingError::Peer(error.to_string()))?;
+    let (state, task) = start_isolated_state(model_path, tokenizer, config, executable).await?;
+    Ok((
+        router(Arc::clone(&state)),
+        PeerServer::new(state, tls),
+        task,
+    ))
+}
+
+async fn start_isolated_state(
+    model_path: impl AsRef<Path>,
+    tokenizer: ByteBpeTokenizer,
+    config: ServingConfig,
+    executable: impl AsRef<Path>,
+) -> Result<(Arc<AppState>, tokio::task::JoinHandle<()>), ServingError> {
     validate_config(&config)?;
     let model_path = fs::canonicalize(model_path)
         .map_err(|error| ServingError::Worker(format!("model path: {error}")))?;
@@ -97,7 +127,7 @@ pub async fn start_isolated(
         model_path,
         config.backend,
     ));
-    Ok((router(state), task))
+    Ok((state, task))
 }
 
 async fn spawn_child(

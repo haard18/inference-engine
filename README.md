@@ -8,7 +8,7 @@ A Rust inference engine for language models on user-owned devices. The engine lo
 - **Model input:** Safetensors with separate configuration and GGUF with Q8_0 or mixed Q4_K_M matrix weights. A project-owned byte-level BPE tokenizer reads the supported SmolLM2 layout from JSON or GGUF metadata.
 - **Device backends:** A 32-bit CPU path checks numerical correctness. CPU execution keeps f16, bf16, Q8_0, Q5_0, and Q4_K matrix weights compact while accumulating in f32. On macOS, a reusable Metal runtime uploads matrix weights once and runs matrix operations on the GPU; attention and the KV cache still run on the CPU.
 - **Serving:** A per-device server exposes an authenticated, streaming chat API. It limits queues and memory use and reports overload clearly. The server keeps inference in a child process that it can replace after a timeout or process failure.
-- **Device pool:** Each device has a stable certificate. An owner approves another device by checking its certificate fingerprint. Mutual TLS allows only approved certificates to exchange data. A coordinator that routes whole requests, handles device loss, reuses conversation state, and eventually splits models is being built on this transport.
+- **Device pool:** Each device has a stable certificate. An owner approves another device by checking its certificate fingerprint. Mutual TLS allows only approved certificates to use a peer API on the local worker. A coordinator that routes whole requests, handles device loss, reuses conversation state, and eventually splits models is being built on this transport.
 
 The first real checkpoint target is SmolLM2-135M. We will carry one model family through the engine and serving layers before adding another family. llama.cpp is a reference and benchmark, not the implementation blueprint. We will measure performance and reliability before making comparative claims.
 
@@ -85,6 +85,17 @@ cargo run --release --bin device -- trust /path/to/device-state \
 cargo run --release --bin device -- peers /path/to/device-state
 ```
 
-Repeat in the other direction so both devices trust each other. `device remove STATE_DIR DEVICE_ID` revokes a stored peer. Private keys stay in the state directory; the offer contains only the public certificate. The state directory is restricted to its owner on Unix systems. A live mutual TLS test verifies approved peers can exchange data and that unapproved peers fail. The serving CLI still listens on loopback only; the encrypted peer listener and cross-device request routing are the next layers.
+Repeat in the other direction so both devices trust each other. `device remove STATE_DIR DEVICE_ID` revokes a stored peer. Restart a running peer listener to apply that change. Private keys stay in the state directory; the offer contains only the public certificate. The state directory is restricted to its owner on Unix systems.
+
+Start a peer listener only after at least one peer is approved:
+
+```sh
+cargo run --release --bin serve -- \
+  --peer /path/to/device-state 0.0.0.0:8443 \
+  /path/to/SmolLM2-135M-Q4_K_M.gguf 8080
+# On macOS, put --metal before --peer to use the GPU matrix path.
+```
+
+The local API remains on `127.0.0.1:8080` and still requires the Bearer key. The peer API is on the explicitly chosen address and port. It requires a mutually approved device certificate instead of the Bearer key; requests from unapproved devices cannot reach the API. Both APIs share one bounded worker and its queue. An end-to-end real-model test checks an approved peer request, an unapproved peer rejection, and the command-line launch path. Cross-device request routing and device-loss handling remain open layers.
 
 The current decoder is a correctness baseline. It uses f32 activations, greedy token selection, and one supported model and tokenizer layout. The loader validates the Safetensors header and reads tensor payloads one at a time. On one Apple Silicon Mac, the same one-token text prompt used 120 MB peak resident memory with Q4_K_M GGUF, 162 MB with Q8_0 GGUF, and 358 MB with the bf16 Safetensors checkpoint. The Metal runtime currently keeps CPU weights as well as uploaded GPU weights. One local eight-token Q4_K_M run took 1.20 seconds and 235 MB peak resident memory with Metal, compared with 0.78 seconds and 122 MB on the CPU. These are single local measurements; quantization can change model scores and output quality. GPU-resident attention and lower synchronization cost remain open layers.
