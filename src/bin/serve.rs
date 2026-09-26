@@ -4,8 +4,8 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::process;
 use std::time::Duration;
 
+use inference_engine::load_gguf_tokenizer;
 use inference_engine::serving::{self, ServingBackend, ServingConfig};
-use inference_engine::{load_gguf, load_gguf_tokenizer};
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +17,22 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--internal-worker")
+    {
+        if args.len() < 3 || args.len() > 4 || (args.len() == 4 && args[3] != "--metal") {
+            return Err("invalid worker invocation".into());
+        }
+        return serving::run_worker_stdio(
+            &args[2],
+            if args.len() == 4 {
+                ServingBackend::Metal
+            } else {
+                ServingBackend::Cpu
+            },
+        );
+    }
     let metal = args.get(1).is_some_and(|argument| argument == "--metal");
     let offset = usize::from(metal);
     if args.len() < 2 + offset || args.len() > 3 + offset {
@@ -31,9 +47,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let api_key = env::var("INFERENCE_API_KEY")
         .map_err(|_| "set INFERENCE_API_KEY to a secret with at least 32 visible characters")?;
     let tokenizer = load_gguf_tokenizer(path)?;
-    let model = load_gguf(path)?;
-    let (router, worker) = serving::start(
-        model,
+    let (router, worker) = serving::start_isolated(
+        path,
         tokenizer,
         ServingConfig {
             model_id: "local-smollm2".into(),
@@ -47,7 +62,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 ServingBackend::Cpu
             },
         },
-    )?;
+        env::current_exe()?,
+    )
+    .await?;
     let listener =
         tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
     println!("Serving local-smollm2 at http://{}", listener.local_addr()?);
@@ -56,8 +73,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
-    tokio::task::spawn_blocking(move || worker.join())
-        .await?
-        .map_err(|_| "inference worker panicked during shutdown")?;
+    worker
+        .await
+        .map_err(|_| "inference supervisor panicked during shutdown")?;
     Ok(())
 }

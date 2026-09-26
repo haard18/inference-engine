@@ -16,11 +16,12 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 - [x] Apply a deadline to queued and running requests, report HTTP 504 or a streaming timeout, and abandon expired queue entries.
 - [x] Continue serving after an ordinary model execution error; catch per-request panics and rebuild Metal state if needed.
 - [x] Report an overdue active worker as unavailable through health and new chat requests.
+- [x] Keep the model in a child process and replace it after a hung or failed calculation.
 
 ## Next layers
 
 - [ ] Measure throughput, latency, memory, and behavior under concurrent and disconnected clients.
-- [ ] Isolate model calculations in a restartable worker process so a calculation that never returns cannot occupy the only worker indefinitely.
+- [ ] Measure restart latency and resource use under repeated worker failures.
 - [ ] Add explicit owner-controlled pairing and encrypted transport before listening beyond loopback.
 - [ ] Route whole requests across paired devices with health and loss handling.
 - [ ] Reuse conversation state safely across requests and devices.

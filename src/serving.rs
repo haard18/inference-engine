@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +27,9 @@ use uuid::Uuid;
 #[cfg(target_os = "macos")]
 use crate::MetalRuntime;
 use crate::{ByteBpeDecoder, ByteBpeTokenizer, GenerationSession, Model};
+
+mod isolated;
+pub use isolated::{run_worker_stdio, start_isolated};
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 8;
@@ -79,6 +83,7 @@ struct AppState {
 #[derive(Default)]
 struct WorkerStatus {
     active_deadline: Mutex<Option<Instant>>,
+    unavailable: AtomicBool,
 }
 
 impl WorkerStatus {
@@ -98,6 +103,14 @@ impl WorkerStatus {
         self.active_deadline.lock().map_or(true, |active| {
             active.is_some_and(|deadline| Instant::now() >= deadline)
         })
+    }
+
+    fn unavailable(&self) -> bool {
+        self.unavailable.load(Ordering::Acquire) || self.overdue()
+    }
+
+    fn set_unavailable(&self, unavailable: bool) {
+        self.unavailable.store(unavailable, Ordering::Release);
     }
 }
 
@@ -177,34 +190,7 @@ fn start_state(
     tokenizer: ByteBpeTokenizer,
     config: ServingConfig,
 ) -> Result<(Arc<AppState>, JoinHandle<()>), ServingError> {
-    if config.model_id.is_empty() {
-        return Err(ServingError::Configuration("model ID is empty"));
-    }
-    if config.api_key.len() < 32 || !config.api_key.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err(ServingError::Configuration(
-            "API key must contain at least 32 visible ASCII characters",
-        ));
-    }
-    if config.queue_capacity == 0 || config.queue_capacity > 1024 {
-        return Err(ServingError::Configuration(
-            "queue capacity must be between 1 and 1024",
-        ));
-    }
-    if config.max_completion_tokens == 0 || config.max_completion_tokens > 4096 {
-        return Err(ServingError::Configuration(
-            "maximum completion length must be between 1 and 4096",
-        ));
-    }
-    if config.request_timeout < MIN_REQUEST_TIMEOUT || config.request_timeout > MAX_REQUEST_TIMEOUT
-    {
-        return Err(ServingError::Configuration(
-            "request timeout must be between 10 milliseconds and 10 minutes",
-        ));
-    }
-    #[cfg(not(target_os = "macos"))]
-    if config.backend == ServingBackend::Metal {
-        return Err(ServingError::Configuration("Metal requires macOS"));
-    }
+    validate_config(&config)?;
     let handle = Handle::try_current()
         .map_err(|_| ServingError::Configuration("a Tokio runtime is required"))?;
     let model = Arc::new(model);
@@ -312,6 +298,38 @@ fn start_state(
         requests: sender,
     });
     Ok((state, worker))
+}
+
+fn validate_config(config: &ServingConfig) -> Result<(), ServingError> {
+    if config.model_id.is_empty() {
+        return Err(ServingError::Configuration("model ID is empty"));
+    }
+    if config.api_key.len() < 32 || !config.api_key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(ServingError::Configuration(
+            "API key must contain at least 32 visible ASCII characters",
+        ));
+    }
+    if config.queue_capacity == 0 || config.queue_capacity > 1024 {
+        return Err(ServingError::Configuration(
+            "queue capacity must be between 1 and 1024",
+        ));
+    }
+    if config.max_completion_tokens == 0 || config.max_completion_tokens > 4096 {
+        return Err(ServingError::Configuration(
+            "maximum completion length must be between 1 and 4096",
+        ));
+    }
+    if config.request_timeout < MIN_REQUEST_TIMEOUT || config.request_timeout > MAX_REQUEST_TIMEOUT
+    {
+        return Err(ServingError::Configuration(
+            "request timeout must be between 10 milliseconds and 10 minutes",
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    if config.backend == ServingBackend::Metal {
+        return Err(ServingError::Configuration("Metal requires macOS"));
+    }
+    Ok(())
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -425,7 +443,7 @@ async fn authenticate(
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Response {
-    if state.requests.is_closed() || state.worker_status.overdue() {
+    if state.requests.is_closed() || state.worker_status.unavailable() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "unavailable"})),
@@ -489,7 +507,7 @@ async fn chat_completions(
         output,
     };
     let deadline = job.deadline;
-    if state.worker_status.overdue() {
+    if state.worker_status.unavailable() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "worker_unavailable",

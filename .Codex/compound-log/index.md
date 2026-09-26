@@ -18,6 +18,7 @@
 - [Metal matrix execution](learnings/2026-09-26-metal-parity.md)
 - [Local serving](learnings/2026-09-26-local-serving.md)
 - [Request deadlines](learnings/2026-09-26-request-deadlines.md)
+- [Worker process isolation](learnings/2026-09-26-worker-isolation.md)
 
 ## Reviews
 
@@ -31,3 +32,4 @@
 - [Metal review](reviews/2026-09-26-metal.md)
 - [Local serving review](reviews/2026-09-26-local-serving.md)
 - [Request deadline review](reviews/2026-09-26-request-deadlines.md)
+- [Worker isolation review](reviews/2026-09-26-worker-isolation.md)
