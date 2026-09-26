@@ -32,6 +32,13 @@ enum StageCommand {
     Close {
         request_id: String,
     },
+    Probe {
+        request_id: String,
+    },
+    Rewind {
+        request_id: String,
+        position: usize,
+    },
 }
 
 #[derive(Serialize)]
@@ -53,6 +60,12 @@ enum StageEvent<'a> {
         count: usize,
     },
     Closed,
+    Position {
+        position: Option<usize>,
+    },
+    Rewound {
+        position: usize,
+    },
     Failed {
         message: &'a str,
     },
@@ -61,6 +74,7 @@ enum StageEvent<'a> {
 struct SessionEntry<'a> {
     session: StageSession<'a>,
     touched: Instant,
+    checkpointed: bool,
 }
 
 /// Run one prefix or suffix stage in a private child process.
@@ -118,13 +132,17 @@ pub fn run_stage_worker_stdio(
                     fail(&mut output, "token input requires a prefix stage")?;
                     continue;
                 }
-                if !admit(&sessions, request_id, &mut output)? {
+                admit(&mut sessions, request_id);
+                if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&request_id) {
+                    fail(&mut output, "stage session capacity is full")?;
                     continue;
                 }
                 let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
                     session: StageSession::new(&stage),
                     touched: Instant::now(),
+                    checkpointed: false,
                 });
+                entry.checkpointed = false;
                 let position = entry.session.position();
                 let result = entry
                     .session
@@ -157,13 +175,17 @@ pub fn run_stage_worker_stdio(
                     fail(&mut output, "activation input requires a suffix stage")?;
                     continue;
                 }
-                if !admit(&sessions, request_id, &mut output)? {
+                admit(&mut sessions, request_id);
+                if sessions.len() >= MAX_SESSIONS && !sessions.contains_key(&request_id) {
+                    fail(&mut output, "stage session capacity is full")?;
                     continue;
                 }
                 let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
                     session: StageSession::new(&stage),
                     touched: Instant::now(),
+                    checkpointed: false,
                 });
+                entry.checkpointed = false;
                 let result = entry
                     .session
                     .forward_frame(&payload, request_id)
@@ -195,21 +217,59 @@ pub fn run_stage_worker_stdio(
                 sessions.remove(&id);
                 write_event(&mut output, &StageEvent::Closed, &[])?;
             }
+            StageCommand::Probe { request_id } => {
+                let id = match Uuid::parse_str(&request_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        fail(&mut output, "invalid request ID")?;
+                        continue;
+                    }
+                };
+                let position = sessions.get_mut(&id).map(|entry| {
+                    entry.touched = Instant::now();
+                    entry.session.position()
+                });
+                write_event(&mut output, &StageEvent::Position { position }, &[])?;
+            }
+            StageCommand::Rewind {
+                request_id,
+                position,
+            } => {
+                let id = match Uuid::parse_str(&request_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        fail(&mut output, "invalid request ID")?;
+                        continue;
+                    }
+                };
+                let Some(entry) = sessions.get_mut(&id) else {
+                    fail(&mut output, "stage session is missing")?;
+                    continue;
+                };
+                if let Err(error) = entry.session.rewind(position) {
+                    fail(&mut output, &error.to_string())?;
+                    continue;
+                }
+                entry.touched = Instant::now();
+                entry.checkpointed = true;
+                write_event(&mut output, &StageEvent::Rewound { position }, &[])?;
+            }
         }
     }
     Ok(())
 }
 
-fn admit(
-    sessions: &HashMap<Uuid, SessionEntry<'_>>,
-    request_id: Uuid,
-    output: &mut impl Write,
-) -> io::Result<bool> {
+fn admit(sessions: &mut HashMap<Uuid, SessionEntry<'_>>, request_id: Uuid) {
     if !sessions.contains_key(&request_id) && sessions.len() >= MAX_SESSIONS {
-        fail(output, "stage session capacity is full")?;
-        return Ok(false);
+        if let Some(oldest) = sessions
+            .iter()
+            .filter(|(_, entry)| entry.checkpointed)
+            .min_by_key(|(_, entry)| entry.touched)
+            .map(|(id, _)| *id)
+        {
+            sessions.remove(&oldest);
+        }
     }
-    Ok(true)
 }
 
 fn finish_step(

@@ -1,6 +1,8 @@
 //! One chat request executed by a local prefix and an approved remote suffix.
 
+use std::collections::HashMap;
 use std::fs;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +24,9 @@ use crate::{ByteBpeDecoder, ByteBpeTokenizer};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CACHED_CONVERSATIONS: usize = 8;
+const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Serve the usual chat API while each model step crosses one approved stage boundary.
 /// The prefix process loads only its layer range; the suffix service must already be running.
@@ -74,7 +79,7 @@ pub async fn start_split_prefix(
     let tokenizer = Arc::new(tokenizer);
     let state = Arc::new(AppState {
         device_id,
-        session_reuse: false,
+        session_reuse: true,
         model_id: config.model_id,
         api_key: config.api_key.into_bytes(),
         tokenizer: Arc::clone(&tokenizer),
@@ -121,12 +126,74 @@ struct SplitRuntime {
     model_path: PathBuf,
 }
 
+struct CachedPrompt {
+    prompt: Vec<usize>,
+    stage_id: Uuid,
+    scores: Vec<f32>,
+    touched: Instant,
+}
+
+#[derive(Default)]
+struct SplitCache {
+    entries: HashMap<String, CachedPrompt>,
+}
+
+impl SplitCache {
+    fn take_matching(&mut self, id: &str, prompt: &[usize]) -> Option<CachedPrompt> {
+        self.expire();
+        self.entries
+            .remove(id)
+            .filter(|entry| prompt.starts_with(&entry.prompt))
+    }
+
+    fn insert(&mut self, id: String, mut entry: CachedPrompt) {
+        self.expire();
+        entry.touched = Instant::now();
+        self.entries.insert(id, entry);
+        while self.entries.len() > MAX_CACHED_CONVERSATIONS || self.bytes() > MAX_CACHE_BYTES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn expire(&mut self) {
+        self.entries
+            .retain(|_, entry| entry.touched.elapsed() < CACHE_TTL);
+    }
+
+    fn bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|(id, entry)| {
+                id.capacity()
+                    + entry.prompt.capacity() * size_of::<usize>()
+                    + entry.scores.capacity() * size_of::<f32>()
+            })
+            .sum()
+    }
+}
+
+struct JobOutcome {
+    reason: &'static str,
+    completion_tokens: usize,
+    reused_prompt_tokens: usize,
+    prompt_scores: Vec<f32>,
+}
+
 async fn supervise(
     mut receiver: mpsc::Receiver<Job>,
     first_child: StageChild,
     runtime: SplitRuntime,
 ) {
     let mut child = Some(first_child);
+    let mut cache = SplitCache::default();
     loop {
         if receiver.is_closed() && receiver.is_empty() {
             break;
@@ -135,6 +202,7 @@ async fn supervise(
             child = None;
         }
         if child.is_none() {
+            cache.entries.clear();
             runtime.status.set_unavailable(true);
             let replacement = tokio::time::timeout(
                 STARTUP_TIMEOUT,
@@ -165,25 +233,26 @@ async fn supervise(
             continue;
         }
         let _active = ActiveJob::new(Arc::clone(&runtime.status), job.deadline);
-        let request_id = Uuid::new_v4();
+        let mut request_id = Uuid::new_v4();
+        let mut prefix_touched = false;
         let prefix = child.as_mut().expect("prefix worker started");
         let result = run_job(
             &job,
             prefix,
-            &runtime.ready,
-            &runtime.client,
-            &runtime.tokenizer,
-            request_id,
+            &runtime,
+            &mut cache,
+            &mut request_id,
+            &mut prefix_touched,
         )
         .await;
         match &result {
-            Ok((reason, completion_tokens)) => {
+            Ok(outcome) => {
                 send_terminal(
                     &job,
                     WorkerEvent::Finished {
-                        reason,
-                        completion_tokens: *completion_tokens,
-                        reused_prompt_tokens: 0,
+                        reason: outcome.reason,
+                        completion_tokens: outcome.completion_tokens,
+                        reused_prompt_tokens: outcome.reused_prompt_tokens,
                     },
                 )
                 .await;
@@ -191,36 +260,77 @@ async fn supervise(
             Err(JobFailure::Execution(message)) => {
                 send_terminal(&job, WorkerEvent::Failed(message.clone())).await;
             }
+            Err(JobFailure::Overloaded(message)) => {
+                send_terminal(&job, WorkerEvent::Overloaded(message.clone())).await;
+            }
             Err(JobFailure::Deadline) => send_terminal(&job, WorkerEvent::TimedOut).await,
             Err(JobFailure::ClientGone) => {}
         }
-        // A failed step can leave the local pipe or cache out of sync. Replace that child.
-        if result.is_err() {
-            child = None;
-        } else {
-            let cleanup = tokio::time::timeout(CLEANUP_TIMEOUT, prefix.close(request_id)).await;
-            if !matches!(cleanup, Ok(Ok(()))) {
-                child = None;
+        let mut cached = false;
+        let mut discard_child = result.is_err() && prefix_touched;
+        if let (Ok(outcome), Some(conversation_id)) = (&result, &job.conversation_id) {
+            let deadline = tokio::time::Instant::from_std(job.deadline)
+                .min(tokio::time::Instant::now() + CLEANUP_TIMEOUT);
+            let local_ok = matches!(
+                tokio::time::timeout_at(deadline, prefix.rewind(request_id, job.prompt.len()))
+                    .await,
+                Ok(Ok(()))
+            );
+            let remote_ok = local_ok
+                && runtime
+                    .client
+                    .rewind_stage(request_id, job.prompt.len(), deadline)
+                    .await
+                    .is_ok();
+            if local_ok && remote_ok {
+                cache.insert(
+                    conversation_id.clone(),
+                    CachedPrompt {
+                        prompt: job.prompt.clone(),
+                        stage_id: request_id,
+                        scores: outcome.prompt_scores.clone(),
+                        touched: Instant::now(),
+                    },
+                );
+                cached = true;
+            }
+            if !local_ok {
+                discard_child = true;
             }
         }
-        let _ = tokio::time::timeout(
-            CLEANUP_TIMEOUT,
-            runtime
-                .client
-                .close_stage(request_id, tokio::time::Instant::now() + CLEANUP_TIMEOUT),
-        )
-        .await;
+        // A failed step can leave the local pipe or cache out of sync. Replace that child.
+        if result.is_ok() && !cached && !discard_child {
+            let cleanup = tokio::time::timeout(CLEANUP_TIMEOUT, prefix.close(request_id)).await;
+            if !matches!(cleanup, Ok(Ok(()))) {
+                discard_child = true;
+            }
+        }
+        if discard_child {
+            child = None;
+        }
+        if !cached {
+            let _ = tokio::time::timeout(
+                CLEANUP_TIMEOUT,
+                runtime
+                    .client
+                    .close_stage(request_id, tokio::time::Instant::now() + CLEANUP_TIMEOUT),
+            )
+            .await;
+        }
     }
 }
 
 async fn run_job(
     job: &Job,
     prefix: &mut StageChild,
-    ready: &StageReady,
-    client: &PeerClient,
-    tokenizer: &ByteBpeTokenizer,
-    request_id: Uuid,
-) -> Result<(&'static str, usize), JobFailure> {
+    runtime: &SplitRuntime,
+    cache: &mut SplitCache,
+    request_id: &mut Uuid,
+    prefix_touched: &mut bool,
+) -> Result<JobOutcome, JobFailure> {
+    let ready = &runtime.ready;
+    let client = &runtime.client;
+    let tokenizer = runtime.tokenizer.as_ref();
     check_job(job)?;
     let snapshot = tokio::time::timeout_at(
         tokio::time::Instant::from_std(job.deadline),
@@ -230,17 +340,46 @@ async fn run_job(
     .map_err(|_| JobFailure::Deadline)?
     .map_err(|error| JobFailure::Execution(format!("suffix capacity: {error}")))?;
     validate_pair(ready, &snapshot).map_err(JobFailure::Execution)?;
-    if !snapshot.ready || snapshot.queue_available == 0 {
-        return Err(JobFailure::Execution(
+    if !snapshot.ready {
+        return Err(JobFailure::Execution("suffix stage is unavailable".into()));
+    }
+    if snapshot.queue_available == 0 {
+        return Err(JobFailure::Overloaded(
             "suffix stage has no available capacity".into(),
         ));
     }
-    let mut position = 0;
-    let mut scores = Vec::new();
-    for &token in &job.prompt {
-        scores = step(job, prefix, client, ready, request_id, position, token).await?;
+    let cached = job
+        .conversation_id
+        .as_deref()
+        .and_then(|id| cache.take_matching(id, &job.prompt));
+    let (mut position, mut scores) = if let Some(entry) = cached {
+        let expected = entry.prompt.len();
+        let deadline = tokio::time::Instant::from_std(job.deadline);
+        *prefix_touched = true;
+        let local = tokio::time::timeout_at(deadline, prefix.probe(entry.stage_id))
+            .await
+            .map_err(|_| JobFailure::Deadline)?
+            .map_err(|error| JobFailure::Execution(stage_error(error)))?;
+        let remote = client
+            .probe_stage(entry.stage_id, deadline)
+            .await
+            .map_err(|error| JobFailure::Execution(format!("suffix checkpoint: {error}")))?;
+        if local == Some(expected) && remote == Some(expected) {
+            *request_id = entry.stage_id;
+            (expected, entry.scores)
+        } else {
+            (0, Vec::new())
+        }
+    } else {
+        (0, Vec::new())
+    };
+    let reused_prompt_tokens = position;
+    for &token in &job.prompt[position..] {
+        *prefix_touched = true;
+        scores = step(job, prefix, client, ready, *request_id, position, token).await?;
         position += 1;
     }
+    let prompt_scores = scores.clone();
     let stop = ["<|im_end|>", "<|endoftext|>"].map(|token| tokenizer.special_token_id(token));
     let mut decoder = ByteBpeDecoder::new();
     for index in 0..job.max_tokens {
@@ -274,9 +413,15 @@ async fn run_job(
             if !tail.is_empty() {
                 send(job, WorkerEvent::Delta(tail)).await?;
             }
-            return Ok((if stopped { "stop" } else { "length" }, completion_tokens));
+            return Ok(JobOutcome {
+                reason: if stopped { "stop" } else { "length" },
+                completion_tokens,
+                reused_prompt_tokens,
+                prompt_scores,
+            });
         }
-        scores = step(job, prefix, client, ready, request_id, position, token).await?;
+        *prefix_touched = true;
+        scores = step(job, prefix, client, ready, *request_id, position, token).await?;
         position += 1;
     }
     Err(JobFailure::Execution("empty generation request".into()))
@@ -309,7 +454,10 @@ async fn step(
                 if Instant::now() >= job.deadline {
                     JobFailure::Deadline
                 } else {
-                    JobFailure::Execution(format!("suffix stage failed: {error}"))
+                    match error {
+                        crate::pool::PoolError::Overloaded(message) => JobFailure::Overloaded(message),
+                        other => JobFailure::Execution(format!("suffix stage failed: {other}")),
+                    }
                 }
             })
         }

@@ -218,6 +218,11 @@ impl PeerClient {
             if status.is_server_error() {
                 self.mark_failure();
             }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Err(PoolError::Overloaded(
+                    String::from_utf8_lossy(&body).into_owned(),
+                ));
+            }
             return Err(PoolError::Transport(format!(
                 "stage returned HTTP {status}: {}",
                 String::from_utf8_lossy(&body)
@@ -264,6 +269,83 @@ impl PeerClient {
         } else {
             Err(PoolError::Transport(format!(
                 "stage close returned {}",
+                response.status()
+            )))
+        }
+    }
+
+    /// Check whether the suffix still owns a checkpoint before reusing its key/value state.
+    pub async fn probe_stage(
+        &self,
+        request_id: Uuid,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<usize>, PoolError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(PoolError::Transport("stage deadline expired".into()))?;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/stage/probe")
+            .header("host", "peer")
+            .header("x-inference-request-id", request_id.to_string())
+            .header(
+                "x-inference-deadline-ms",
+                (remaining.as_millis().clamp(1, 120_000) as u64).to_string(),
+            )
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| PoolError::Transport(error.to_string()))?;
+        let response = self.send(request, deadline).await?;
+        if response.status() != StatusCode::OK {
+            return Err(PoolError::Transport(format!(
+                "stage probe returned {}",
+                response.status()
+            )));
+        }
+        let body =
+            tokio::time::timeout_at(deadline, to_bytes(Body::new(response.into_body()), 4096))
+                .await
+                .map_err(|_| PoolError::Transport("stage probe timed out".into()))?
+                .map_err(|error| PoolError::Transport(error.to_string()))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        match value.get("position") {
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Number(number)) => number
+                .as_u64()
+                .and_then(|position| usize::try_from(position).ok())
+                .map(Some)
+                .ok_or(PoolError::Invalid("stage probe position is invalid")),
+            _ => Err(PoolError::Invalid("stage probe response is invalid")),
+        }
+    }
+
+    /// Rewind a suffix session to a prompt checkpoint after generation.
+    pub async fn rewind_stage(
+        &self,
+        request_id: Uuid,
+        position: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), PoolError> {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(PoolError::Transport("stage deadline expired".into()))?;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/stage/rewind")
+            .header("host", "peer")
+            .header("x-inference-request-id", request_id.to_string())
+            .header("x-inference-position", position.to_string())
+            .header(
+                "x-inference-deadline-ms",
+                (remaining.as_millis().clamp(1, 120_000) as u64).to_string(),
+            )
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| PoolError::Transport(error.to_string()))?;
+        let response = self.send(request, deadline).await?;
+        if response.status() == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            Err(PoolError::Transport(format!(
+                "stage rewind returned {}",
                 response.status()
             )))
         }

@@ -125,6 +125,8 @@ pub async fn start_stage_peer(
         .route("/internal/stage/capacity", get(capacity))
         .route("/internal/stage/activation", post(activation))
         .route("/internal/stage/close", post(close))
+        .route("/internal/stage/probe", post(probe))
+        .route("/internal/stage/rewind", post(rewind))
         .layer(DefaultBodyLimit::max(MAX_FRAME_BYTES))
         .with_state(Arc::clone(&state));
     tokio::spawn(supervise_stage(Arc::downgrade(&state)));
@@ -277,6 +279,90 @@ async fn close(
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err((StatusCode::SERVICE_UNAVAILABLE, "stage close failed".into())),
+    }
+}
+
+async fn probe(
+    State(state): State<Arc<StageState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let request_id = request_id(&headers)?;
+    let deadline = deadline(&headers)?;
+    let _permit = state
+        .queue
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| (StatusCode::TOO_MANY_REQUESTS, "stage queue is full".into()))?;
+    let mut worker = tokio::time::timeout_at(deadline, state.worker.lock())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "stage queue wait timed out".into(),
+            )
+        })?;
+    if worker.as_mut().is_some_and(|child| !child.running()) {
+        worker.take();
+    }
+    let Some(mut child) = worker.take() else {
+        return Ok(Json(json!({"position": null})));
+    };
+    match tokio::time::timeout_at(deadline, child.probe(request_id)).await {
+        Ok(Ok(position)) => {
+            *worker = Some(child);
+            Ok(Json(json!({"position": position})))
+        }
+        Ok(Err(StageStepError::Rejected(message))) => {
+            *worker = Some(child);
+            Err((StatusCode::UNPROCESSABLE_ENTITY, message))
+        }
+        Ok(Err(StageStepError::Broken(message))) => Err((StatusCode::SERVICE_UNAVAILABLE, message)),
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "stage probe timed out".into())),
+    }
+}
+
+async fn rewind(
+    State(state): State<Arc<StageState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let request_id = request_id(&headers)?;
+    let deadline = deadline(&headers)?;
+    let position = headers
+        .get("x-inference-position")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|position| *position > 0 && *position <= state.expected.max_positions)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid stage position".into()))?;
+    let _permit = state
+        .queue
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| (StatusCode::TOO_MANY_REQUESTS, "stage queue is full".into()))?;
+    let mut worker = tokio::time::timeout_at(deadline, state.worker.lock())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "stage queue wait timed out".into(),
+            )
+        })?;
+    if worker.as_mut().is_some_and(|child| !child.running()) {
+        worker.take();
+    }
+    let Some(mut child) = worker.take() else {
+        return Err((StatusCode::CONFLICT, "stage session is missing".into()));
+    };
+    match tokio::time::timeout_at(deadline, child.rewind(request_id, position)).await {
+        Ok(Ok(())) => {
+            *worker = Some(child);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(Err(StageStepError::Rejected(message))) => {
+            *worker = Some(child);
+            Err((StatusCode::CONFLICT, message))
+        }
+        Ok(Err(StageStepError::Broken(message))) => Err((StatusCode::SERVICE_UNAVAILABLE, message)),
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "stage rewind timed out".into())),
     }
 }
 
@@ -534,6 +620,73 @@ impl StageChild {
             Ok(())
         } else {
             Err(StageStepError::Broken("stage did not close request".into()))
+        }
+    }
+
+    pub(super) async fn probe(
+        &mut self,
+        request_id: Uuid,
+    ) -> Result<Option<usize>, StageStepError> {
+        let command = json!({"kind":"probe","request_id":request_id.to_string()});
+        let mut line = serde_json::to_vec(&command)
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        line.push(b'\n');
+        self.input
+            .write_all(&line)
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        self.input
+            .flush()
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        let reply = self.read_reply().await?;
+        if reply["kind"] != "position" {
+            return Err(StageStepError::Broken(
+                "stage did not report position".into(),
+            ));
+        }
+        match reply.get("position") {
+            Some(Value::Null) => Ok(None),
+            Some(Value::Number(number)) => number
+                .as_u64()
+                .and_then(|position| usize::try_from(position).ok())
+                .filter(|position| *position <= self.ready.max_positions)
+                .map(Some)
+                .ok_or_else(|| StageStepError::Broken("stage position is invalid".into())),
+            _ => Err(StageStepError::Broken("stage position is invalid".into())),
+        }
+    }
+
+    pub(super) async fn rewind(
+        &mut self,
+        request_id: Uuid,
+        position: usize,
+    ) -> Result<(), StageStepError> {
+        let command =
+            json!({"kind":"rewind","request_id":request_id.to_string(),"position":position});
+        let mut line = serde_json::to_vec(&command)
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        line.push(b'\n');
+        self.input
+            .write_all(&line)
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        self.input
+            .flush()
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        let reply = self.read_reply().await?;
+        match reply["kind"].as_str() {
+            Some("rewound") if reply["position"].as_u64() == Some(position as u64) => Ok(()),
+            Some("failed") => Err(StageStepError::Rejected(
+                reply["message"]
+                    .as_str()
+                    .unwrap_or("stage rewind failed")
+                    .into(),
+            )),
+            _ => Err(StageStepError::Broken(
+                "stage did not rewind session".into(),
+            )),
         }
     }
 

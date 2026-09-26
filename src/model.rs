@@ -271,6 +271,17 @@ impl<'a> StageSession<'a> {
         self.cache.allocated_bytes()
     }
 
+    /// Restore a completed prompt checkpoint after speculative generation.
+    pub fn rewind(&mut self, position: usize) -> Result<(), EngineError> {
+        if position == 0 || position > self.cache.position() {
+            return Err(EngineError::InvalidConfig(
+                "invalid stage checkpoint position",
+            ));
+        }
+        self.cache.truncate(position);
+        Ok(())
+    }
+
     /// Run an input token through a prefix stage and return its hidden activation.
     pub fn forward_token(&mut self, token_id: usize) -> Result<Vec<f32>, EngineError> {
         if self.stage.range.start != 0 {

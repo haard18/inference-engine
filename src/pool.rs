@@ -28,6 +28,7 @@ pub enum PoolError {
     Certificate(String),
     Tls(String),
     Transport(String),
+    Overloaded(String),
     FingerprintMismatch,
 }
 
@@ -40,6 +41,7 @@ impl fmt::Display for PoolError {
             Self::Certificate(message) => write!(f, "device certificate failed: {message}"),
             Self::Tls(message) => write!(f, "peer TLS configuration failed: {message}"),
             Self::Transport(message) => write!(f, "peer request failed: {message}"),
+            Self::Overloaded(message) => write!(f, "peer is overloaded: {message}"),
             Self::FingerprintMismatch => write!(f, "peer certificate fingerprint does not match"),
         }
     }

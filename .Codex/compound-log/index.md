@@ -32,6 +32,7 @@
 - [Separate model-stage processes](learnings/2026-09-26-stage-processes.md)
 - [Approved remote suffix stage](learnings/2026-09-26-remote-stage.md)
 - [Split chat serving](learnings/2026-09-26-split-chat-serving.md)
+- [Split conversation checkpoints](learnings/2026-09-26-split-conversation-reuse.md)
 
 ## Reviews
 
@@ -57,3 +58,4 @@
 - [Stage process review](reviews/2026-09-26-stage-processes.md)
 - [Remote stage review](reviews/2026-09-26-remote-stage.md)
 - [Split chat serving review](reviews/2026-09-26-split-chat-serving.md)
+- [Split conversation reuse review](reviews/2026-09-26-split-conversation-reuse.md)

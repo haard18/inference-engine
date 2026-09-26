@@ -205,12 +205,14 @@ enum WorkerEvent {
         reused_prompt_tokens: usize,
     },
     Failed(String),
+    Overloaded(String),
     TimedOut,
     End,
 }
 
 enum JobFailure {
     Execution(String),
+    Overloaded(String),
     Deadline,
     ClientGone,
 }
@@ -314,6 +316,11 @@ fn start_state(
                     }
                     Ok(Err(JobFailure::Execution(message))) => {
                         if send_event(&handle, &job.output, WorkerEvent::Failed(message)) {
+                            let _ = send_event(&handle, &job.output, WorkerEvent::End);
+                        }
+                    }
+                    Ok(Err(JobFailure::Overloaded(message))) => {
+                        if send_event(&handle, &job.output, WorkerEvent::Overloaded(message)) {
                             let _ = send_event(&handle, &job.output, WorkerEvent::End);
                         }
                     }
@@ -813,6 +820,7 @@ fn deadline_stream(
                         event,
                         WorkerEvent::Finished { .. }
                             | WorkerEvent::Failed(_)
+                            | WorkerEvent::Overloaded(_)
                             | WorkerEvent::TimedOut
                             | WorkerEvent::End
                     );
@@ -998,6 +1006,9 @@ async fn collect_response(
                     &message,
                 )
             }
+            WorkerEvent::Overloaded(message) => {
+                return error_response(StatusCode::TOO_MANY_REQUESTS, "queue_full", &message)
+            }
             WorkerEvent::TimedOut => return timeout_response(),
         }
     }
@@ -1025,6 +1036,10 @@ fn stream_data(event: WorkerEvent, id: &str, created: u64, model_id: &str) -> St
         WorkerEvent::Finished { reason, .. } => base(json!({}), Some(reason)),
         WorkerEvent::Failed(message) => json!({
             "error": {"message": message, "type": "server_error", "code": "inference_failed"}
+        })
+        .to_string(),
+        WorkerEvent::Overloaded(message) => json!({
+            "error": {"message": message, "type": "rate_limit_error", "code": "queue_full"}
         })
         .to_string(),
         WorkerEvent::TimedOut => json!({
@@ -1266,6 +1281,45 @@ mod tests {
         assert!(text.contains("\"code\":\"request_timeout\""));
         assert!(text.contains("data: [DONE]"));
         assert!(jobs.recv().await.unwrap().output.is_closed());
+    }
+
+    #[tokio::test]
+    async fn worker_overload_keeps_its_status_in_json_and_streaming() {
+        let (app, mut jobs, _) = stalled_app(Duration::from_secs(1));
+        let responder = tokio::spawn(async move {
+            let job = jobs.recv().await.unwrap();
+            job.output
+                .send(WorkerEvent::Overloaded("suffix queue is full".into()))
+                .await
+                .unwrap();
+            let job = jobs.recv().await.unwrap();
+            job.output
+                .send(WorkerEvent::Overloaded("suffix queue is full".into()))
+                .await
+                .unwrap();
+        });
+        let response = app
+            .clone()
+            .oneshot(request("/v1/chat/completions", Some(chat(false)), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_json(response).await["error"]["code"], "queue_full");
+        let response = app
+            .oneshot(request("/v1/chat/completions", Some(chat(true)), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("\"code\":\"queue_full\""));
+        assert!(text.contains("data: [DONE]"));
+        responder.await.unwrap();
     }
 
     #[tokio::test]

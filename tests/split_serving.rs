@@ -11,6 +11,7 @@ use inference_engine::pool::client::PeerClient;
 use inference_engine::pool::{DeviceIdentity, PeerStore};
 use inference_engine::serving::{
     start_isolated, start_split_prefix, start_stage_peer, ServingBackend, ServingConfig,
+    CONVERSATION_HEADER,
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -28,7 +29,7 @@ fn config() -> ServingConfig {
     }
 }
 
-async fn chat(router: axum::Router, stream: bool) -> (StatusCode, String) {
+async fn chat(router: axum::Router, stream: bool) -> (StatusCode, String, Option<String>) {
     let request = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -47,8 +48,57 @@ async fn chat(router: axum::Router, stream: bool) -> (StatusCode, String) {
         .unwrap();
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
+    let conversation_id = response
+        .headers()
+        .get(CONVERSATION_HEADER)
+        .map(|value| value.to_str().unwrap().to_owned());
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    (status, String::from_utf8(body.to_vec()).unwrap())
+    (
+        status,
+        String::from_utf8(body.to_vec()).unwrap(),
+        conversation_id,
+    )
+}
+
+async fn conversation_chat(
+    router: axum::Router,
+    messages: Value,
+    conversation_id: Option<&str>,
+) -> (StatusCode, String, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {KEY}"))
+        .header("content-type", "application/json");
+    if let Some(id) = conversation_id {
+        request = request.header(CONVERSATION_HEADER, id);
+    }
+    let response = router
+        .oneshot(
+            request
+                .body(Body::from(
+                    json!({
+                        "model": "local-smollm2",
+                        "messages": messages,
+                        "max_tokens": 5,
+                        "temperature": 0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let id = response
+        .headers()
+        .get(CONVERSATION_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, id, serde_json::from_slice(&body).unwrap())
 }
 
 fn stream_content(body: &str) -> String {
@@ -106,9 +156,11 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     )
     .await
     .unwrap();
-    let handle = axum_server::Handle::new();
+    let suffix_handle = axum_server::Handle::new();
+    let handle = suffix_handle.clone();
     let suffix_task = tokio::spawn(async move { suffix.serve(listener, handle).await });
     let client = PeerClient::new(&prefix_identity, prefix_peers.peers()[0].clone()).unwrap();
+    let inspector = client.clone();
     let mismatched = start_split_prefix(
         &model,
         load_gguf_tokenizer(&model).unwrap(),
@@ -139,20 +191,103 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     )
     .await
     .unwrap();
-    let (whole_status, whole_body) = chat(whole, false).await;
-    let (split_status, split_body) = chat(split.clone(), false).await;
+    let (whole_status, whole_body, _) = chat(whole, false).await;
+    let (split_status, split_body, _) = chat(split.clone(), false).await;
     assert_eq!(whole_status, StatusCode::OK, "{whole_body}");
     assert_eq!(split_status, StatusCode::OK, "{split_body}");
     let whole_json: Value = serde_json::from_str(&whole_body).unwrap();
     let split_json: Value = serde_json::from_str(&split_body).unwrap();
     assert_eq!(split_json["choices"], whole_json["choices"]);
     assert_eq!(split_json["usage"], whole_json["usage"]);
-    let (stream_status, stream_body) = chat(split.clone(), true).await;
+    let (stream_status, stream_body, stream_id) = chat(split.clone(), true).await;
     assert_eq!(stream_status, StatusCode::OK, "{stream_body}");
     assert!(stream_body.contains("data: [DONE]"));
     assert_eq!(
         stream_content(&stream_body),
         split_json["choices"][0]["message"]["content"]
+    );
+    let messages = json!([{"role": "user", "content": "Say hello."}]);
+    let (status, _, after_stream) =
+        conversation_chat(split.clone(), messages.clone(), stream_id.as_deref()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        after_stream["usage"]["prompt_tokens_details"]["cached_tokens"],
+        after_stream["usage"]["prompt_tokens"]
+    );
+    let (status, conversation_id, initial) =
+        conversation_chat(split.clone(), messages.clone(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        initial["usage"]["prompt_tokens_details"]["cached_tokens"],
+        0
+    );
+    let (status, same_id, repeated) =
+        conversation_chat(split.clone(), messages.clone(), Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same_id, conversation_id);
+    assert_eq!(repeated["choices"], initial["choices"]);
+    assert_eq!(
+        repeated["usage"]["prompt_tokens_details"]["cached_tokens"],
+        repeated["usage"]["prompt_tokens"]
+    );
+    let extended = json!([
+        {"role": "user", "content": "Say hello."},
+        {"role": "assistant", "content": "Hello."},
+        {"role": "user", "content": "Say it again."}
+    ]);
+    let (status, _, extended_response) =
+        conversation_chat(split.clone(), extended, Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        extended_response["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let changed = json!([{"role": "user", "content": "Different prompt."}]);
+    let (status, _, changed_response) =
+        conversation_chat(split.clone(), changed.clone(), Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        changed_response["usage"]["prompt_tokens_details"]["cached_tokens"],
+        0
+    );
+    suffix_handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    suffix_task.await.unwrap().unwrap();
+    let listener = TcpListener::bind(address).unwrap();
+    let suffix = start_stage_peer(
+        &model,
+        executable,
+        15,
+        30,
+        4,
+        &suffix_identity,
+        &suffix_peers,
+    )
+    .await
+    .unwrap();
+    let handle = axum_server::Handle::new();
+    let suffix_task = tokio::spawn(async move { suffix.serve(listener, handle).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if inspector
+                .stage_snapshot()
+                .await
+                .is_ok_and(|snapshot| snapshot.ready)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (status, _, after_restart) =
+        conversation_chat(split.clone(), changed, Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        after_restart["usage"]["prompt_tokens_details"]["cached_tokens"],
+        0
     );
     let request = Request::builder()
         .method("POST")
@@ -194,7 +329,7 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     }
     assert!(observed.contains("inference_failed"), "{observed}");
     assert!(observed.contains("data: [DONE]"), "{observed}");
-    let (lost_status, lost_body) = chat(split.clone(), false).await;
+    let (lost_status, lost_body, _) = chat(split.clone(), false).await;
     assert_eq!(
         lost_status,
         StatusCode::INTERNAL_SERVER_ERROR,

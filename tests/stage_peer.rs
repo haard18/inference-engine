@@ -120,6 +120,67 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         .close_stage(id, tokio::time::Instant::now() + Duration::from_secs(5))
         .await
         .unwrap();
+    let mut active = Vec::new();
+    for _ in 0..8 {
+        let stage_id = Uuid::new_v4();
+        let mut stage_session = StageSession::new(&prefix);
+        let hidden = stage_session.forward_token(1).unwrap();
+        let frame = ActivationFrame::new(&prefix, stage_id, 0, hidden)
+            .unwrap()
+            .encode();
+        client
+            .forward_stage(
+                frame,
+                stage_id,
+                model.config().vocab_size,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        active.push(stage_id);
+    }
+    let ninth = Uuid::new_v4();
+    let mut stage_session = StageSession::new(&prefix);
+    let hidden = stage_session.forward_token(1).unwrap();
+    let frame = ActivationFrame::new(&prefix, ninth, 0, hidden)
+        .unwrap()
+        .encode();
+    assert!(client
+        .forward_stage(
+            frame.clone(),
+            ninth,
+            model.config().vocab_size,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .is_err());
+    client
+        .rewind_stage(
+            active[0],
+            1,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    client
+        .forward_stage(
+            frame,
+            ninth,
+            model.config().vocab_size,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .probe_stage(
+                active[0],
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .unwrap(),
+        None
+    );
     serving.kill().await.unwrap();
     serving.wait().await.unwrap();
     let hidden = first.forward_token(1).unwrap();
