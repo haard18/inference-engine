@@ -33,6 +33,7 @@
 - [Approved remote suffix stage](learnings/2026-09-26-remote-stage.md)
 - [Split chat serving](learnings/2026-09-26-split-chat-serving.md)
 - [Split conversation checkpoints](learnings/2026-09-26-split-conversation-reuse.md)
+- [One-host serving measurement](learnings/2026-09-26-serving-measurement.md)
 
 ## Reviews
 
@@ -59,3 +60,4 @@
 - [Remote stage review](reviews/2026-09-26-remote-stage.md)
 - [Split chat serving review](reviews/2026-09-26-split-chat-serving.md)
 - [Split conversation reuse review](reviews/2026-09-26-split-conversation-reuse.md)
+- [Serving measurement review](reviews/2026-09-26-serving-measurement.md)
