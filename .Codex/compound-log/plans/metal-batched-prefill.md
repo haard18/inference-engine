@@ -29,5 +29,5 @@ The corrected warm-server check serves the 1.7B Q4_K_M model at about one reques
 - [x] Repeat the warm-server comparison after the projection change; ordinary throughput rose from 0.987 to 1.068 requests/s in separate short runs.
 - [x] Repeat the warm-server comparison after batched prompt evaluation; median ordinary and streaming rates rose to 2.238 and 2.245 requests/s with the same digest.
 - [x] Run four local Metal serving waves; all 80 requests completed with one stable worker.
-- [ ] Extend the batch path to split Metal stages and verify parity and failure behavior.
+- [x] Extend the batch path to split Metal stages and verify parity and failure behavior on one Mac.
 - [ ] Measure sustained two-Mac serving and loss recovery when the second Mac is available.

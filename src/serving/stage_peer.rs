@@ -25,7 +25,8 @@ use uuid::Uuid;
 use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 
 use super::{
-    ServingBackend, ServingError, LEGACY_STAGE_LEASE_MS, MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS,
+    ServingBackend, ServingError, LEGACY_STAGE_LEASE_MS, MAX_STAGE_BATCH_FRAMES,
+    MAX_STAGE_LEASE_MS, MAX_STAGE_TOKEN_BATCH,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -789,6 +790,74 @@ impl StageChild {
                     .await
                     .map_err(|error| StageStepError::Broken(error.to_string()))?;
                 Ok(frame)
+            }
+            _ => Err(StageStepError::Broken(
+                "stage sent an invalid response".into(),
+            )),
+        }
+    }
+
+    pub(super) async fn token_batch(
+        &mut self,
+        request_id: Uuid,
+        token_ids: &[usize],
+        lease_ms: u64,
+    ) -> Result<Vec<u8>, StageStepError> {
+        if !(1..=MAX_STAGE_TOKEN_BATCH).contains(&token_ids.len()) {
+            return Err(StageStepError::Broken(
+                "invalid stage token batch size".into(),
+            ));
+        }
+        let command = json!({
+            "kind": "tokens",
+            "request_id": request_id.to_string(),
+            "token_ids": token_ids,
+            "lease_ms": lease_ms,
+        });
+        let mut line = serde_json::to_vec(&command)
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        line.push(b'\n');
+        self.input
+            .write_all(&line)
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        self.input
+            .flush()
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        let reply = self.read_reply().await?;
+        match reply["kind"].as_str() {
+            Some("failed") => Err(StageStepError::Rejected(
+                reply["message"]
+                    .as_str()
+                    .unwrap_or("stage rejected tokens")
+                    .into(),
+            )),
+            Some("activation") => {
+                let size = reply["payload_bytes"]
+                    .as_u64()
+                    .and_then(|size| usize::try_from(size).ok())
+                    .ok_or_else(|| {
+                        StageStepError::Broken("stage omitted activation size".into())
+                    })?;
+                let frame_bytes = self
+                    .ready
+                    .hidden_size
+                    .checked_mul(4)
+                    .and_then(|size| size.checked_add(64))
+                    .ok_or_else(|| StageStepError::Broken("activation size overflows".into()))?;
+                if token_ids.len().checked_mul(frame_bytes) != Some(size) || size > MAX_FRAME_BYTES
+                {
+                    return Err(StageStepError::Broken(
+                        "stage activation size is invalid".into(),
+                    ));
+                }
+                let mut frames = vec![0; size];
+                self.output
+                    .read_exact(&mut frames)
+                    .await
+                    .map_err(|error| StageStepError::Broken(error.to_string()))?;
+                Ok(frames)
             }
             _ => Err(StageStepError::Broken(
                 "stage sent an invalid response".into(),

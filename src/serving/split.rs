@@ -15,7 +15,7 @@ use super::stage_peer::{StageChild, StageReady, StageStepError};
 use super::{
     check_job, router, validate_config, ActiveJob, AppState, Job, JobFailure, ServingBackend,
     ServingConfig, ServingError, StageCapacitySnapshot, WorkerEvent, WorkerStatus,
-    MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS, SLOW_CLIENT_TIMEOUT,
+    MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS, MAX_STAGE_TOKEN_BATCH, SLOW_CLIENT_TIMEOUT,
 };
 use crate::pool::client::PeerClient;
 use crate::pool::DeviceIdentity;
@@ -460,7 +460,9 @@ async fn run_job(
         .checked_mul(4)
         .and_then(|bytes| bytes.checked_add(64))
         .ok_or_else(|| JobFailure::Execution("activation size overflows".into()))?;
-    let frames_per_batch = (MAX_FRAME_BYTES / frame_bytes).min(MAX_STAGE_BATCH_FRAMES);
+    let frames_per_batch = (MAX_FRAME_BYTES / frame_bytes)
+        .min(MAX_STAGE_BATCH_FRAMES)
+        .min(MAX_STAGE_TOKEN_BATCH);
     if frames_per_batch == 0 {
         return Err(JobFailure::Execution("activation exceeds limit".into()));
     }
@@ -469,12 +471,10 @@ async fn run_job(
             .checked_mul(tokens.len())
             .filter(|bytes| *bytes <= MAX_FRAME_BYTES)
             .ok_or_else(|| JobFailure::Execution("activation batch exceeds limit".into()))?;
-        let mut frames = Vec::with_capacity(batch_bytes);
-        for &token in tokens {
-            *prefix_touched = true;
-            frames.extend(prefix_frame(job, prefix, ready, *request_id, position, token).await?);
-            position += 1;
-        }
+        *prefix_touched = true;
+        let frames = prefix_frames(job, prefix, ready, *request_id, position, tokens).await?;
+        debug_assert_eq!(frames.len(), batch_bytes);
+        position += tokens.len();
         scores = forward_suffix(job, client, frames, tokens.len(), *request_id, ready).await?;
     }
     let prompt_scores = scores.clone();
@@ -566,6 +566,44 @@ async fn prefix_frame(
     validate_frame(&frame, ready, request_id, position).map_err(JobFailure::Execution)?;
     check_job(job)?;
     Ok(frame)
+}
+
+async fn prefix_frames(
+    job: &Job,
+    prefix: &mut StageChild,
+    ready: &StageReady,
+    request_id: Uuid,
+    position: usize,
+    tokens: &[usize],
+) -> Result<Vec<u8>, JobFailure> {
+    check_job(job)?;
+    let deadline = tokio::time::Instant::from_std(job.deadline);
+    let lease_ms = job
+        .deadline
+        .checked_duration_since(Instant::now())
+        .map_or(1, |remaining| {
+            remaining
+                .as_millis()
+                .clamp(1, u128::from(MAX_STAGE_LEASE_MS)) as u64
+        });
+    let frames = tokio::select! {
+        _ = job.output.closed() => return Err(JobFailure::ClientGone),
+        result = tokio::time::timeout_at(deadline, prefix.token_batch(request_id, tokens, lease_ms)) => {
+            result.map_err(|_| JobFailure::Deadline)?
+                .map_err(|error| JobFailure::Execution(stage_error(error)))?
+        }
+    };
+    let frame_bytes = ready
+        .hidden_size
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(|| JobFailure::Execution("activation size overflows".into()))?;
+    for (offset, frame) in frames.chunks_exact(frame_bytes).enumerate() {
+        validate_frame(frame, ready, request_id, position + offset)
+            .map_err(JobFailure::Execution)?;
+    }
+    check_job(job)?;
+    Ok(frames)
 }
 
 async fn forward_suffix(

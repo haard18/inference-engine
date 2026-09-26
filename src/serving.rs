@@ -50,6 +50,7 @@ pub use stage_peer::{
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_STAGE_BATCH_FRAMES: usize = 16;
+pub(crate) const MAX_STAGE_TOKEN_BATCH: usize = 8;
 pub(crate) const LEGACY_STAGE_LEASE_MS: u64 = 300_000;
 // Keep this equal to the maximum request timeout in milliseconds.
 pub(crate) const MAX_STAGE_LEASE_MS: u64 = 600_000;

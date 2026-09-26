@@ -580,6 +580,23 @@ impl MetalBackend {
         cache: &mut MetalKvCache,
         step: BatchDecoderStep<'_>,
     ) -> Result<Vec<f32>, EngineError> {
+        self.run_prompt_batch_inner(cache, step, false)
+    }
+
+    pub(crate) fn run_stage_prompt_batch(
+        &mut self,
+        cache: &mut MetalKvCache,
+        step: BatchDecoderStep<'_>,
+    ) -> Result<Vec<f32>, EngineError> {
+        self.run_prompt_batch_inner(cache, step, true)
+    }
+
+    fn run_prompt_batch_inner(
+        &mut self,
+        cache: &mut MetalKvCache,
+        step: BatchDecoderStep<'_>,
+        all_rows: bool,
+    ) -> Result<Vec<f32>, EngineError> {
         let batch_count = step.batch_count;
         let hidden_size = step.hidden.len().checked_div(batch_count).unwrap_or(0);
         let head_size = hidden_size.checked_div(step.head_count).unwrap_or(0);
@@ -695,10 +712,13 @@ impl MetalBackend {
                 command.status()
             )));
         }
-        let offset = (batch_count - 1) * result_width;
+        let (offset, count) = if all_rows {
+            (0, batch_count * result_width)
+        } else {
+            ((batch_count - 1) * result_width, result_width)
+        };
         Ok(unsafe {
-            std::slice::from_raw_parts(result.contents().cast::<f32>().add(offset), result_width)
-                .to_vec()
+            std::slice::from_raw_parts(result.contents().cast::<f32>().add(offset), count).to_vec()
         })
     }
 

@@ -167,6 +167,52 @@ fn two_stage_processes_match_the_complete_real_model() {
 
 #[test]
 #[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+fn batched_stage_protocol_matches_complete_model() {
+    let directory = env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR");
+    let path = Path::new(&directory).join("SmolLM2-135M-Q4_K_M.gguf");
+    let model = load_gguf(&path).unwrap();
+    let mut prefix = StageProcess::start(&path, 0, 15);
+    let mut suffix = StageProcess::start(&path, 15, 30);
+    let id = Uuid::new_v4();
+    assert_eq!(prefix.reserve(id, 8, 3000)["kind"], "reserved");
+    assert_eq!(suffix.reserve(id, 8, 3000)["kind"], "reserved");
+    let (event, frames) = prefix.request(
+        json!({"kind":"tokens","request_id":id.to_string(),"token_ids":[1,2,3,30]}),
+        &[],
+    );
+    assert_eq!(event["kind"], "activation");
+    assert_eq!(frames.len(), 4 * (64 + model.config().hidden_size * 4));
+    let (event, scores) = suffix.request(
+        json!({"kind":"activation","request_id":id.to_string(),"payload_bytes":frames.len(),"frame_count":4}),
+        &frames,
+    );
+    assert_eq!(event["kind"], "scores");
+    let mut whole = GenerationSession::new(&model);
+    whole.prefill(&[1, 2, 3, 30]).unwrap();
+    let actual: Vec<f32> = scores
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect();
+    assert_eq!(actual, whole.next_token_scores().unwrap());
+    let (prefix_position, _) =
+        prefix.request(json!({"kind":"probe","request_id":id.to_string()}), &[]);
+    let (suffix_position, _) =
+        suffix.request(json!({"kind":"probe","request_id":id.to_string()}), &[]);
+    assert_eq!(prefix_position["position"], 4);
+    assert_eq!(suffix_position["position"], 4);
+    let (event, _) = prefix.request(
+        json!({"kind":"tokens","request_id":id.to_string(),"token_ids":[]}),
+        &[],
+    );
+    assert_eq!(event["kind"], "failed");
+    let (position, _) = prefix.request(json!({"kind":"probe","request_id":id.to_string()}), &[]);
+    assert_eq!(position["position"], 4);
+}
+
+#[test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
 fn expired_active_stage_session_is_removed_but_checkpoint_remains() {
     let directory = env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR");
     let path = Path::new(&directory).join("SmolLM2-135M-Q4_K_M.gguf");

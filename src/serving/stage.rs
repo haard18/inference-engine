@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{cache_budget, ServingBackend};
-use crate::serving::{LEGACY_STAGE_LEASE_MS, MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS};
+use crate::serving::{
+    LEGACY_STAGE_LEASE_MS, MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS, MAX_STAGE_TOKEN_BATCH,
+};
 #[cfg(target_os = "macos")]
 use crate::MetalStageRuntime;
 use crate::{load_gguf_stage, ActivationFrame, StageSession};
@@ -34,6 +36,12 @@ enum StageCommand {
     Token {
         request_id: String,
         token_id: usize,
+        #[serde(default)]
+        lease_ms: Option<u64>,
+    },
+    Tokens {
+        request_id: String,
+        token_ids: Vec<usize>,
         #[serde(default)]
         lease_ms: Option<u64>,
     },
@@ -337,6 +345,76 @@ pub fn run_stage_worker_stdio_with_backend(
                     cache_budget,
                 )?;
             }
+            StageCommand::Tokens {
+                request_id,
+                token_ids,
+                lease_ms,
+            } => {
+                if !(1..=MAX_STAGE_TOKEN_BATCH).contains(&token_ids.len()) {
+                    fail(&mut output, "invalid stage token batch size")?;
+                    continue;
+                }
+                let lease = match lease_duration(lease_ms) {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        fail(&mut output, message)?;
+                        continue;
+                    }
+                };
+                let request_id = match Uuid::parse_str(&request_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        fail(&mut output, "invalid request ID")?;
+                        continue;
+                    }
+                };
+                if !stage.is_prefix() {
+                    fail(&mut output, "token input requires a prefix stage")?;
+                    continue;
+                }
+                let Some(entry) = sessions.get_mut(&request_id) else {
+                    fail(&mut output, "stage reservation is missing")?;
+                    continue;
+                };
+                if entry.checkpointed {
+                    fail(&mut output, "stage reservation is missing")?;
+                    continue;
+                }
+                entry.lease_until = Instant::now() + lease;
+                let position = entry.session.position();
+                if position
+                    .checked_add(token_ids.len())
+                    .is_none_or(|end| end > entry.reserved_positions)
+                {
+                    fail(&mut output, "stage cache context limit reached")?;
+                    continue;
+                }
+                let result = entry
+                    .session
+                    .forward_token_batch(&token_ids)
+                    .map_err(|error| error.to_string())
+                    .and_then(|hiddens| {
+                        let mut frames = Vec::new();
+                        for (offset, hidden) in hiddens.into_iter().enumerate() {
+                            let frame =
+                                ActivationFrame::new(&stage, request_id, position + offset, hidden)
+                                    .map_err(|error| error.to_string())?;
+                            frames.extend(frame.encode());
+                        }
+                        if frames.len() > MAX_ACTIVATION_BYTES {
+                            return Err("stage activation exceeds response limit".into());
+                        }
+                        Ok(frames)
+                    });
+                finish_step(
+                    &mut sessions,
+                    request_id,
+                    result,
+                    &mut output,
+                    true,
+                    cache_budget,
+                )?;
+            }
             StageCommand::Activation {
                 request_id,
                 payload_bytes,
@@ -393,13 +471,25 @@ pub fn run_stage_worker_stdio_with_backend(
                     continue;
                 }
                 let result = (|| -> Result<Vec<u8>, String> {
-                    let mut scores = Vec::new();
-                    for frame in payload.chunks_exact(frame_bytes) {
-                        scores = entry
-                            .session
-                            .forward_frame(frame, request_id)
-                            .map_err(|error| error.to_string())?;
-                    }
+                    let position = entry.session.position();
+                    let hiddens = payload
+                        .chunks_exact(frame_bytes)
+                        .enumerate()
+                        .map(|(offset, frame)| {
+                            ActivationFrame::decode_for_stage(
+                                frame,
+                                &stage,
+                                request_id,
+                                position + offset,
+                            )
+                            .map(|activation| activation.into_hidden())
+                            .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let scores = entry
+                        .session
+                        .forward_hidden_batch(hiddens)
+                        .map_err(|error| error.to_string())?;
                     let size = scores
                         .len()
                         .checked_mul(4)

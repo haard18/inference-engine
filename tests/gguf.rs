@@ -324,6 +324,91 @@ fn real_q4_metal_stages_match_full_metal_scores() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+fn real_q4_metal_stage_batches_match_incremental_stages() {
+    use inference_engine::MetalStageRuntime;
+
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let path = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let prefix = load_gguf_stage(&path, 0..15).unwrap();
+    let suffix = load_gguf_stage(&path, 15..30).unwrap();
+    let prefix_runtime = MetalStageRuntime::new(&prefix).unwrap();
+    let suffix_runtime = MetalStageRuntime::new(&suffix).unwrap();
+    let mut batched_prefix = prefix_runtime.session();
+    let mut batched_suffix = suffix_runtime.session();
+    let mut incremental_prefix = prefix_runtime.session();
+    let mut incremental_suffix = suffix_runtime.session();
+    let tokens = [1, 2, 3, 30, 1, 2, 3, 30, 1, 2, 3, 30];
+    for group in tokens.chunks(9) {
+        let position = batched_prefix.position();
+        let hiddens = batched_prefix.forward_token_batch(group).unwrap();
+        let mut expected = Vec::new();
+        for &token in group {
+            expected.push(incremental_prefix.forward_token(token).unwrap());
+        }
+        for (index, (actual, expected)) in hiddens.iter().zip(&expected).enumerate() {
+            let difference = actual
+                .iter()
+                .zip(expected)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                difference < 1e-3,
+                "position {}: {difference}",
+                position + index
+            );
+        }
+        let actual_scores = batched_suffix.forward_hidden_batch(hiddens).unwrap();
+        let mut expected_scores = Vec::new();
+        for hidden in expected {
+            expected_scores = incremental_suffix.forward_hidden(hidden).unwrap();
+        }
+        let difference = actual_scores
+            .iter()
+            .zip(&expected_scores)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            difference < 1e-3,
+            "suffix position {}: {difference}",
+            position + group.len()
+        );
+    }
+    assert_eq!(batched_prefix.position(), tokens.len());
+    assert_eq!(batched_suffix.position(), tokens.len());
+    assert!(batched_prefix
+        .forward_token_batch(&[1, prefix.vocab_size()])
+        .is_err());
+    assert_eq!(batched_prefix.position(), tokens.len());
+    assert!(batched_suffix
+        .forward_hidden_batch(vec![vec![0.0; suffix.hidden_size()], vec![0.0]])
+        .is_err());
+    assert_eq!(batched_suffix.position(), tokens.len());
+    let hidden = batched_prefix.forward_token(1).unwrap();
+    let scores = batched_suffix.forward_hidden(hidden).unwrap();
+    let incremental_hidden = incremental_prefix.forward_token(1).unwrap();
+    let expected_scores = incremental_suffix
+        .forward_hidden(incremental_hidden)
+        .unwrap();
+    assert_eq!(scores.len(), expected_scores.len());
+    assert_eq!(
+        scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0,
+        expected_scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0,
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 #[ignore = "requires SMOLLM2_1_7B_GGUF with the official Q4_K_M checkpoint"]
 fn larger_q4_metal_stages_match_full_metal_scores() {
     use inference_engine::{MetalRuntime, MetalStageRuntime};
@@ -376,6 +461,61 @@ fn larger_q4_metal_stages_match_full_metal_scores() {
         assert_eq!(first.position(), full.position());
         assert_eq!(second.position(), full.position());
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires SMOLLM2_1_7B_GGUF with the official Q4_K_M checkpoint"]
+fn larger_q4_metal_stage_batches_match_complete_model() {
+    use inference_engine::{MetalRuntime, MetalStageRuntime};
+
+    let path = PathBuf::from(env::var("SMOLLM2_1_7B_GGUF").expect("set SMOLLM2_1_7B_GGUF"));
+    let tokenizer = inference_engine::load_gguf_tokenizer(&path).unwrap();
+    let model = load_gguf(&path).unwrap();
+    let prefix = load_gguf_stage(&path, 0..12).unwrap();
+    let suffix = load_gguf_stage(&path, 12..24).unwrap();
+    ModelStage::validate_pair(&prefix, &suffix).unwrap();
+    let prompt = "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\nGive a short factual answer: what is two plus two?<|im_end|>\n<|im_start|>assistant\n";
+    let tokens: Vec<usize> = tokenizer
+        .encode(prompt)
+        .unwrap()
+        .into_iter()
+        .map(|token| token as usize)
+        .collect();
+    assert_eq!(tokens.len(), 42);
+    let full_runtime = MetalRuntime::new(&model).unwrap();
+    let prefix_runtime = MetalStageRuntime::new(&prefix).unwrap();
+    let suffix_runtime = MetalStageRuntime::new(&suffix).unwrap();
+    let mut full = full_runtime.session();
+    let mut first = prefix_runtime.session();
+    let mut second = suffix_runtime.session();
+    full.prefill(&tokens).unwrap();
+    let mut scores = Vec::new();
+    for batch in tokens.chunks(8) {
+        let hiddens = first.forward_token_batch(batch).unwrap();
+        scores = second.forward_hidden_batch(hiddens).unwrap();
+    }
+    assert_eq!(first.position(), tokens.len());
+    assert_eq!(second.position(), tokens.len());
+    let expected = full.next_token_scores().unwrap();
+    let difference = scores
+        .iter()
+        .zip(expected)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        difference < 1e-3,
+        "1.7B batch score difference {difference}"
+    );
+    let best = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap()
+            .0
+    };
+    assert_eq!(best(&scores), best(expected));
 }
 
 #[cfg(target_os = "macos")]

@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
-use crate::metal_backend::{BatchDecoderStep, DecoderStep, MetalBackend, MetalKvCache};
+use crate::metal_backend::{
+    BatchDecoderStep, DecoderStep, MetalBackend, MetalKvCache, MAX_METAL_BATCH,
+};
 use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
@@ -239,6 +241,66 @@ impl ModelStage {
         Ok(result)
     }
 
+    #[cfg(target_os = "macos")]
+    fn forward_batch_metal(
+        &self,
+        hidden: &[f32],
+        count: usize,
+        cache: &mut KvCache,
+        metal_cache: &mut MetalKvCache,
+        backend: &mut MetalBackend,
+    ) -> Result<Vec<f32>, EngineError> {
+        if !(1..=MAX_METAL_BATCH).contains(&count)
+            || hidden.len() != count * self.config.hidden_size
+            || !hidden.iter().all(|value| value.is_finite())
+        {
+            return Err(EngineError::InvalidConfig("stage prompt batch dimensions"));
+        }
+        if cache.position > self.config.max_positions
+            || count > self.config.max_positions - cache.position
+        {
+            return Err(EngineError::ContextFull);
+        }
+        let head_count = self.config.num_attention_heads;
+        let head_size = self.config.hidden_size / head_count;
+        let mut rotations = Vec::with_capacity(count * head_size);
+        for position in cache.position..cache.position + count {
+            for pair in 0..head_size / 2 {
+                let frequency = self
+                    .config
+                    .rope_theta
+                    .powf(-((2 * pair) as f32) / head_size as f32);
+                let (sine, cosine) = (position as f32 * frequency).sin_cos();
+                rotations.extend([sine, cosine]);
+            }
+        }
+        let step = BatchDecoderStep {
+            first_position: cache.position,
+            batch_count: count,
+            head_count,
+            kv_head_count: self.config.num_key_value_heads,
+            layers: &self.weights.layers,
+            hidden,
+            final_norm: self.weights.final_norm.as_deref(),
+            output: self.weights.output.as_ref(),
+            epsilon: self.config.rms_norm_epsilon,
+            rotations: &rotations,
+            interleaved: self.config.rope_interleaved,
+        };
+        let result = if self.is_prefix() {
+            backend.run_stage_prompt_batch(metal_cache, step)?
+        } else {
+            backend.run_prompt_batch(metal_cache, step)?
+        };
+        if !result.iter().all(|value| value.is_finite()) {
+            return Err(EngineError::InvalidValue("stage output"));
+        }
+        for _ in 0..count {
+            cache.commit(Vec::new(), Vec::new());
+        }
+        Ok(result)
+    }
+
     pub(crate) fn new(
         config: ModelConfig,
         range: Range<usize>,
@@ -463,6 +525,67 @@ impl<'a> StageSession<'a> {
         Ok(run.hidden)
     }
 
+    /// Evaluate a bounded group of known prompt tokens through a prefix stage.
+    pub fn forward_token_batch(&mut self, tokens: &[usize]) -> Result<Vec<Vec<f32>>, EngineError> {
+        if !self.stage.is_prefix() {
+            return Err(EngineError::InvalidConfig(
+                "token input requires a prefix stage",
+            ));
+        }
+        if tokens.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        if self.cache.position > self.stage.config.max_positions
+            || tokens.len() > self.stage.config.max_positions - self.cache.position
+        {
+            return Err(EngineError::ContextFull);
+        }
+        for &token in tokens {
+            if token >= self.stage.config.vocab_size {
+                return Err(EngineError::InvalidToken(token));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if let Some((backend, metal_cache)) = &mut self.metal {
+            let mut backend = backend
+                .lock()
+                .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?;
+            let mut hiddens = Vec::with_capacity(tokens.len());
+            for group in tokens.chunks(MAX_METAL_BATCH) {
+                let mut hidden = Vec::with_capacity(group.len() * self.stage.config.hidden_size);
+                for &token in group {
+                    hidden.extend(
+                        self.stage
+                            .weights
+                            .token_embeddings
+                            .as_ref()
+                            .expect("validated prefix embedding")
+                            .row(token)?,
+                    );
+                }
+                let result = objc::rc::autoreleasepool(|| {
+                    self.stage.forward_batch_metal(
+                        &hidden,
+                        group.len(),
+                        &mut self.cache,
+                        metal_cache,
+                        &mut backend,
+                    )
+                })?;
+                hiddens.extend(
+                    result
+                        .chunks_exact(self.stage.config.hidden_size)
+                        .map(<[f32]>::to_vec),
+                );
+            }
+            return Ok(hiddens);
+        }
+        tokens
+            .iter()
+            .map(|&token| self.forward_token(token))
+            .collect()
+    }
+
     /// Run a received activation through a suffix stage and return next-token scores.
     pub fn forward_hidden(&mut self, hidden: Vec<f32>) -> Result<Vec<f32>, EngineError> {
         if self.stage.range.end != self.stage.config.num_layers {
@@ -507,6 +630,57 @@ impl<'a> StageSession<'a> {
             &mut cpu_multiply,
         )?;
         self.cache.commit(run.keys, run.values);
+        Ok(scores)
+    }
+
+    /// Evaluate a bounded group of received prompt activations through a suffix stage.
+    pub fn forward_hidden_batch(
+        &mut self,
+        hiddens: Vec<Vec<f32>>,
+    ) -> Result<Vec<f32>, EngineError> {
+        if !self.stage.is_suffix() {
+            return Err(EngineError::InvalidConfig(
+                "score output requires a suffix stage",
+            ));
+        }
+        if hiddens.is_empty() {
+            return Err(EngineError::EmptyPrompt);
+        }
+        if self.cache.position > self.stage.config.max_positions
+            || hiddens.len() > self.stage.config.max_positions - self.cache.position
+        {
+            return Err(EngineError::ContextFull);
+        }
+        if hiddens.iter().any(|hidden| {
+            hidden.len() != self.stage.config.hidden_size
+                || !hidden.iter().all(|value| value.is_finite())
+        }) {
+            return Err(EngineError::InvalidConfig("stage hidden dimensions"));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some((backend, metal_cache)) = &mut self.metal {
+            let mut backend = backend
+                .lock()
+                .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?;
+            let mut scores = Vec::new();
+            for group in hiddens.chunks(MAX_METAL_BATCH) {
+                let hidden: Vec<f32> = group.iter().flatten().copied().collect();
+                scores = objc::rc::autoreleasepool(|| {
+                    self.stage.forward_batch_metal(
+                        &hidden,
+                        group.len(),
+                        &mut self.cache,
+                        metal_cache,
+                        &mut backend,
+                    )
+                })?;
+            }
+            return Ok(scores);
+        }
+        let mut scores = Vec::new();
+        for hidden in hiddens {
+            scores = self.forward_hidden(hidden)?;
+        }
         Ok(scores)
     }
 
