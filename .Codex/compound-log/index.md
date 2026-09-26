@@ -6,6 +6,7 @@
 - [Per-device serving](plans/per-device-serving.md)
 - [Device pooling](plans/device-pooling.md)
 - [Model splitting](plans/model-splitting.md)
+- [Repeated worker recovery](plans/worker-recovery.md)
 
 ## Learnings
 
@@ -35,6 +36,7 @@
 - [Split conversation checkpoints](learnings/2026-09-26-split-conversation-reuse.md)
 - [One-host serving measurement](learnings/2026-09-26-serving-measurement.md)
 - [Split serving readiness](learnings/2026-09-26-split-readiness.md)
+- [Repeated worker recovery](learnings/2026-09-26-worker-recovery.md)
 
 ## Reviews
 
@@ -63,3 +65,4 @@
 - [Split conversation reuse review](reviews/2026-09-26-split-conversation-reuse.md)
 - [Serving measurement review](reviews/2026-09-26-serving-measurement.md)
 - [Split readiness review](reviews/2026-09-26-split-readiness.md)
+- [Worker recovery review](reviews/2026-09-26-worker-recovery.md)

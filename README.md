@@ -70,6 +70,8 @@ The response includes an `x-inference-conversation-id` header. Send that header 
 
 The API supports string chat messages, one choice, and greedy decoding. It rejects other settings explicitly. One child process runs model calculations, up to four requests wait in the queue, and a full queue returns HTTP 429. Accepted requests have a 120-second deadline. An ordinary request returns HTTP 504 if it expires; a stream reports the timeout and closes. The server kills and replaces a child process that hangs or exits. While the worker is unavailable, health and new chat requests return HTTP 503. The server limits request bodies to 64 KiB and completion length to 256 tokens. It requires a Bearer token for model and chat routes; the child process does not receive that secret. The health route is public.
 
+To repeat the local worker-crash check after building the release binary, run `python3 scripts/worker-recovery.py /path/to/model.gguf --cycles 5`. Add `--metal` to exercise the Metal worker. The tool starts and stops its own loopback server, kills its child in each cycle, and reports readiness time, completed-chat time, and sampled process-tree memory. On one Mac with SmolLM2-135M Q4_K_M, five CPU crashes recovered readiness in 673–714 ms and three Metal crashes in 711–728 ms. Each cycle returned HTTP 503 during restart, then completed a real chat. These short idle-crash runs do not measure recovery under concurrent load.
+
 ## Pairing devices
 
 On each device, create a private state directory and show its public pairing offer:

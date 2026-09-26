@@ -21,7 +21,7 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 ## Next layers
 
 - [ ] Measure throughput, latency, memory, and behavior under concurrent and disconnected clients.
-- [ ] Measure restart latency and resource use under repeated worker failures.
+- [x] Measure restart latency and sampled process-tree memory under repeated worker failures on one host, for both CPU and Metal workers. Physical-device load trials remain open.
 - [x] Add stable device identities, explicit owner-approved pairing, and verified mutual TLS configurations.
 - [x] Connect the mutual TLS transport to a peer listener before listening beyond loopback.
 - [ ] Route whole requests across paired devices with health and loss handling.
