@@ -24,6 +24,7 @@ The corrected warm-server check serves the 1.7B Q4_K_M model at about one reques
 - [x] Record a matching-prompt warm-server baseline.
 - [x] Measure prompt evaluation separately from generation for the 42-token 1.7B Q4_K_M prompt.
 - [x] Avoid unused prompt-token score projections and verify real-model output and conversation reuse.
+- [x] Test a four-token Metal command batch without shared matrix work. It kept real-model scores but made the 42-token prompt slower in five local runs, so the implementation was removed.
 - [ ] Add and verify bounded batched prompt evaluation.
 - [x] Repeat the warm-server comparison after the projection change; ordinary throughput rose from 0.987 to 1.068 requests/s in separate short runs.
 - [ ] Repeat the warm-server comparison after batched prompt evaluation.

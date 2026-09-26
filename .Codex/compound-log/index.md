@@ -76,6 +76,7 @@
 - [Split activation connection reuse](learnings/2026-09-26-stage-connection-reuse.md)
 - [Matching prompts in warm serving checks](learnings/2026-09-26-warm-serving-prompt-parity.md)
 - [Skipping unused prompt-token scores](learnings/2026-09-26-unused-prefill-scores.md)
+- [Why command-only prompt batching was removed](learnings/2026-09-26-prefill-command-batching.md)
 
 ## Reviews
 
