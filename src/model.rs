@@ -21,6 +21,16 @@ pub struct ModelConfig {
     pub rope_interleaved: bool,
 }
 
+fn cache_bytes_per_position(config: &ModelConfig, layer_count: usize) -> Option<usize> {
+    let head_size = config.hidden_size.checked_div(config.num_attention_heads)?;
+    let kv_size = config.num_key_value_heads.checked_mul(head_size)?;
+    layer_count.checked_mul(2)?.checked_mul(
+        kv_size
+            .checked_mul(size_of::<f32>())?
+            .checked_add(size_of::<Vec<f32>>())?,
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct LayerWeights {
     pub attention_norm: Vec<f32>,
@@ -320,18 +330,7 @@ impl ModelStage {
     }
 
     pub(crate) fn cache_bytes_per_position(&self) -> Option<usize> {
-        let head_size = self
-            .config
-            .hidden_size
-            .checked_div(self.config.num_attention_heads)?;
-        let kv_size = self.config.num_key_value_heads.checked_mul(head_size)?;
-        (self.range.end - self.range.start)
-            .checked_mul(2)?
-            .checked_mul(
-                kv_size
-                    .checked_mul(size_of::<f32>())?
-                    .checked_add(size_of::<Vec<f32>>())?,
-            )
+        cache_bytes_per_position(&self.config, self.range.end - self.range.start)
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -537,6 +536,10 @@ impl Model {
 
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    pub(crate) fn cache_bytes_per_position(&self) -> Option<usize> {
+        cache_bytes_per_position(&self.config, self.config.num_layers)
     }
 
     #[cfg(target_os = "macos")]

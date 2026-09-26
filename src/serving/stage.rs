@@ -1,7 +1,6 @@
 //! Private, bounded process protocol for one decoder stage.
 
 use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -10,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::ServingBackend;
+use super::{cache_budget, ServingBackend};
 use crate::serving::{LEGACY_STAGE_LEASE_MS, MAX_STAGE_BATCH_FRAMES, MAX_STAGE_LEASE_MS};
 #[cfg(target_os = "macos")]
 use crate::MetalStageRuntime;
@@ -18,7 +17,6 @@ use crate::{load_gguf_stage, ActivationFrame, StageSession};
 
 const MAX_SESSIONS: usize = 8;
 const DEFAULT_CACHE_MIB: usize = 128;
-const MAX_CACHE_MIB: usize = 8192;
 const MAX_ACTIVATION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SCORE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COMMAND_LINE_BYTES: usize = 4096;
@@ -107,41 +105,6 @@ fn lease_duration(lease_ms: Option<u64>) -> Result<Duration, &'static str> {
     }
 }
 
-fn cache_budget_bytes() -> Result<usize, String> {
-    let mib = match env::var("INFERENCE_STAGE_CACHE_MIB") {
-        Ok(value) => value
-            .parse::<usize>()
-            .map_err(|_| "INFERENCE_STAGE_CACHE_MIB must be an integer".to_owned())?,
-        Err(env::VarError::NotPresent) => DEFAULT_CACHE_MIB,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err("INFERENCE_STAGE_CACHE_MIB must be text".into());
-        }
-    };
-    if !(16..=MAX_CACHE_MIB).contains(&mib) {
-        return Err(format!(
-            "INFERENCE_STAGE_CACHE_MIB must be between 16 and {MAX_CACHE_MIB}"
-        ));
-    }
-    mib.checked_mul(1024 * 1024)
-        .ok_or_else(|| "stage cache budget overflows this platform".into())
-}
-
-fn cache_max_positions(
-    model_max_positions: usize,
-    bytes_per_position: usize,
-    cache_budget: usize,
-) -> Result<usize, String> {
-    if bytes_per_position == 0 {
-        return Err("stage cache size is invalid".into());
-    }
-    let possible = cache_budget / bytes_per_position;
-    if possible == 0 || (possible < 16 && model_max_positions > possible) {
-        return Err("stage cache budget is too small for this model".into());
-    }
-    let power_of_two = 1_usize << (usize::BITS - 1 - possible.leading_zeros());
-    Ok(model_max_positions.min(power_of_two))
-}
-
 struct SessionEntry<'a> {
     session: StageSession<'a>,
     reserved_positions: usize,
@@ -167,12 +130,12 @@ pub fn run_stage_worker_stdio_with_backend(
     backend: ServingBackend,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let stage = load_gguf_stage(model_path, start..end)?;
-    let cache_budget = cache_budget_bytes()?;
+    let cache_budget = cache_budget::bytes("INFERENCE_STAGE_CACHE_MIB", DEFAULT_CACHE_MIB)?;
     let bytes_per_position = stage
         .cache_bytes_per_position()
         .ok_or("stage cache size overflow")?;
     let cache_max_positions =
-        cache_max_positions(stage.max_positions(), bytes_per_position, cache_budget)?;
+        cache_budget::max_positions(stage.max_positions(), bytes_per_position, cache_budget)?;
     #[cfg(target_os = "macos")]
     let metal = (backend == ServingBackend::Metal)
         .then(|| MetalStageRuntime::new(&stage))
@@ -602,23 +565,4 @@ fn write_event(output: &mut impl Write, event: &StageEvent<'_>, payload: &[u8]) 
     output.write_all(b"\n")?;
     output.write_all(payload)?;
     output.flush()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::cache_max_positions;
-
-    #[test]
-    fn advertised_stage_context_fits_the_cache_budget() {
-        let per_position = 12 * 2 * (2048 * 4 + std::mem::size_of::<Vec<f32>>());
-        assert_eq!(
-            cache_max_positions(8192, per_position, 128 * 1024 * 1024).unwrap(),
-            512
-        );
-        assert_eq!(
-            cache_max_positions(8192, per_position, 2048 * 1024 * 1024).unwrap(),
-            8192
-        );
-        assert!(cache_max_positions(8192, per_position, 1024).is_err());
-    }
 }

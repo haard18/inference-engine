@@ -8,9 +8,71 @@ use http_body_util::BodyExt;
 use inference_engine::load_gguf_tokenizer;
 use inference_engine::serving::{start_isolated, ServingBackend, ServingConfig};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tower::ServiceExt;
 
 const KEY: &str = "test-only-key-with-at-least-32-characters";
+
+#[tokio::test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+async fn complete_worker_rejects_context_beyond_its_cache_budget_before_work() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let model_path = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_serve"))
+        .arg("--internal-worker")
+        .arg(&model_path)
+        .env("INFERENCE_WORKER_CACHE_MIB", "16")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(30), output.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(ready["kind"], "ready");
+    assert_eq!(ready["max_positions"], 256);
+
+    let oversized = json!({"prompt": vec![1; 256], "max_tokens": 1});
+    input
+        .write_all(format!("{oversized}\n").as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let rejected: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(rejected["kind"], "failed");
+    assert_eq!(rejected["message"], "worker cache context limit reached");
+
+    input
+        .write_all(b"{\"prompt\":[1],\"max_tokens\":1}\n")
+        .await
+        .unwrap();
+    loop {
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(10), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let event: Value = serde_json::from_str(&line).unwrap();
+        if event["kind"] == "finished" {
+            break;
+        }
+        assert_eq!(event["kind"], "delta", "{event}");
+    }
+    drop(input);
+    child.wait().await.unwrap();
+}
 
 fn request(stream: bool) -> Request<Body> {
     Request::builder()

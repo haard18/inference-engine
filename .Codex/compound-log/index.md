@@ -17,6 +17,7 @@
 - [CPU matrix-row execution](plans/cpu-matrix-rows.md)
 - [Repeated local serving check](plans/local-serving-soak.md)
 - [Varied conversation parity](plans/varied-conversation-parity.md)
+- [Complete-worker cache admission](plans/whole-worker-cache.md)
 
 ## Learnings
 
@@ -68,6 +69,8 @@
 - [Mixed CPU and Metal stages](learnings/2026-09-26-mixed-stage-backends.md)
 - [Deadline-bound active stage sessions](learnings/2026-09-26-stage-session-leases.md)
 - [Longer Metal split serving check](learnings/2026-09-26-metal-split-lease-soak.md)
+- [Split-stage cache reservations](learnings/2026-09-26-stage-cache-reservations.md)
+- [Complete-worker cache admission](learnings/2026-09-26-whole-worker-cache.md)
 
 ## Reviews
 
@@ -107,3 +110,5 @@
 - [CPU output-row review](reviews/2026-09-26-cpu-matrix-rows.md)
 - [Local serving load review](reviews/2026-09-26-local-serving-soak.md)
 - [Varied conversation review](reviews/2026-09-26-varied-conversations.md)
+- [Split-stage cache reservation review](reviews/2026-09-26-stage-reservations.md)
+- [Complete-worker cache admission review](reviews/2026-09-26-whole-worker-cache.md)

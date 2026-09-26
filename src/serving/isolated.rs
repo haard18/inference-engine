@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::{
-    router, validate_config, ActiveJob, AppState, Coordinator, Job, PeerServer, ServingBackend,
-    ServingConfig, ServingError, WorkerEvent, WorkerStatus, SLOW_CLIENT_TIMEOUT,
+    cache_budget, router, validate_config, ActiveJob, AppState, Coordinator, Job, PeerServer,
+    ServingBackend, ServingConfig, ServingError, WorkerEvent, WorkerStatus, SLOW_CLIENT_TIMEOUT,
 };
 use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 #[cfg(target_os = "macos")]
@@ -29,6 +29,7 @@ use session_cache::SessionCache;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
+const DEFAULT_CACHE_MIB: usize = 512;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -63,6 +64,11 @@ struct ChildWorker {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
+}
+
+struct WorkerContract {
+    max_positions: usize,
+    model_digest: String,
 }
 
 enum ProcessFailure {
@@ -156,7 +162,10 @@ async fn start_isolated_state(
         executable,
         model_path,
         config.backend,
-        model_digest,
+        WorkerContract {
+            max_positions,
+            model_digest,
+        },
     ));
     Ok((state, task))
 }
@@ -230,7 +239,7 @@ async fn supervise(
     executable: PathBuf,
     model_path: PathBuf,
     backend: ServingBackend,
-    model_digest: String,
+    contract: WorkerContract,
 ) {
     let mut worker = Some(first_child);
     loop {
@@ -239,7 +248,9 @@ async fn supervise(
                 break;
             }
             match spawn_child(&executable, &model_path, backend).await {
-                Ok((child, _, digest)) if digest == model_digest => {
+                Ok((child, positions, digest))
+                    if digest == contract.model_digest && positions == contract.max_positions =>
+                {
                     worker = Some(child);
                     status.set_unavailable(false);
                 }
@@ -411,6 +422,22 @@ pub fn run_worker_stdio(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let model = load_gguf(&model_path)?;
     let tokenizer = load_gguf_tokenizer(&model_path)?;
+    let cache_budget = cache_budget::bytes("INFERENCE_WORKER_CACHE_MIB", DEFAULT_CACHE_MIB)?;
+    let logits_bytes = model
+        .config()
+        .vocab_size
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or("worker score cache size overflow")?;
+    let context_budget = cache_budget
+        .checked_sub(logits_bytes)
+        .ok_or("worker cache budget is too small for model scores")?;
+    let max_positions = cache_budget::max_positions(
+        model.config().max_positions,
+        model
+            .cache_bytes_per_position()
+            .ok_or("worker cache size overflow")?,
+        context_budget,
+    )?;
     #[cfg(target_os = "macos")]
     let metal = if backend == ServingBackend::Metal {
         Some(MetalRuntime::new(&model)?)
@@ -426,7 +453,7 @@ pub fn run_worker_stdio(
     write_event(
         &mut output,
         &WireEvent::Ready {
-            max_positions: model.config().max_positions,
+            max_positions,
             model_digest: hex::encode(crate::gguf::digest_file(&model_path)?),
         },
     )?;
@@ -439,6 +466,20 @@ pub fn run_worker_stdio(
                 &mut output,
                 &WireEvent::Failed {
                     message: "invalid generation length".into(),
+                },
+            )?;
+            continue;
+        }
+        if request
+            .prompt
+            .len()
+            .checked_add(request.max_tokens)
+            .is_none_or(|positions| positions > max_positions)
+        {
+            write_event(
+                &mut output,
+                &WireEvent::Failed {
+                    message: "worker cache context limit reached".into(),
                 },
             )?;
             continue;

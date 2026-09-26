@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::MetalRuntime;
 use crate::{ByteBpeDecoder, ByteBpeTokenizer, GenerationSession, Model};
 
+mod cache_budget;
 mod conversation;
 mod coordinator;
 mod isolated;

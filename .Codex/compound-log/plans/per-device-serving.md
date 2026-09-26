@@ -17,6 +17,7 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 - [x] Continue serving after an ordinary model execution error; catch per-request panics and rebuild Metal state if needed.
 - [x] Report an overdue active worker as unavailable through health and new chat requests.
 - [x] Keep the model in a child process and replace it after a hung or failed calculation.
+- [x] Advertise a cache-safe context for the complete worker, reject oversized requests before model work, and require a replacement child to preserve that context contract.
 
 ## Next layers
 
