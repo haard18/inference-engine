@@ -26,6 +26,7 @@
 - [Capacity-aware request routing](learnings/2026-09-26-capacity-routing.md)
 - [Reusable conversation checkpoints](learnings/2026-09-26-conversation-state.md)
 - [Co-located pool measurement](learnings/2026-09-26-pool-measurement.md)
+- [Decoder layer-range boundary](learnings/2026-09-26-layer-range-boundary.md)
 
 ## Reviews
 
@@ -45,3 +46,4 @@
 - [Capacity routing review](reviews/2026-09-26-capacity-routing.md)
 - [Conversation state review](reviews/2026-09-26-conversation-state.md)
 - [Pool measurement review](reviews/2026-09-26-pool-measurement.md)
+- [Layer-range boundary review](reviews/2026-09-26-layer-range-boundary.md)

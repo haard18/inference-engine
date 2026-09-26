@@ -1,6 +1,7 @@
 use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
+use std::ops::Range;
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -54,6 +55,12 @@ pub(crate) struct LayerCache {
 pub(crate) struct KvCache {
     layers: Vec<LayerCache>,
     position: usize,
+}
+
+struct LayerRun {
+    hidden: Vec<f32>,
+    keys: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
 }
 
 impl KvCache {
@@ -154,6 +161,17 @@ impl Model {
         &self,
         token_id: usize,
         cache: &mut KvCache,
+        multiply: impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
+    ) -> Result<Vec<f32>, EngineError> {
+        let all_layers = 0..self.config.num_layers;
+        self.forward_token_ranges(token_id, cache, std::slice::from_ref(&all_layers), multiply)
+    }
+
+    fn forward_token_ranges(
+        &self,
+        token_id: usize,
+        cache: &mut KvCache,
+        ranges: &[Range<usize>],
         mut multiply: impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
     ) -> Result<Vec<f32>, EngineError> {
         if token_id >= self.config.vocab_size {
@@ -163,108 +181,34 @@ impl Model {
             return Err(EngineError::ContextFull);
         }
         let position = cache.position;
-        let hidden_size = self.config.hidden_size;
-        let head_count = self.config.num_attention_heads;
-        let kv_head_count = self.config.num_key_value_heads;
-        let head_size = hidden_size / head_count;
-        let kv_size = kv_head_count * head_size;
-        let heads_per_kv_head = head_count / kv_head_count;
-        let mut hidden = self.weights.token_embeddings.row(token_id)?;
+        let mut hidden = self.embed_token(token_id)?;
         let mut new_keys = Vec::with_capacity(self.config.num_layers);
         let mut new_values = Vec::with_capacity(self.config.num_layers);
-
-        for (layer_index, layer) in self.weights.layers.iter().enumerate() {
-            let normalized =
-                rms_norm(&hidden, &layer.attention_norm, self.config.rms_norm_epsilon)?;
-            let [mut query, mut key, value]: [Vec<f32>; 3] =
-                multiply(&[&layer.query, &layer.key, &layer.value], &normalized)?
-                    .try_into()
-                    .map_err(|_| EngineError::Backend("attention projection count".into()))?;
-            debug_assert_eq!(query.len(), hidden_size);
-            debug_assert_eq!(key.len(), kv_size);
-
-            for head in query.chunks_exact_mut(head_size) {
-                if self.config.rope_interleaved {
-                    apply_rope_interleaved(head, position, self.config.rope_theta);
-                } else {
-                    apply_rope(head, position, self.config.rope_theta);
-                }
+        let mut next_layer = 0;
+        for range in ranges {
+            if range.start != next_layer || range.is_empty() || range.end > self.config.num_layers {
+                return Err(EngineError::InvalidConfig("invalid decoder layer ranges"));
             }
-            for head in key.chunks_exact_mut(head_size) {
-                if self.config.rope_interleaved {
-                    apply_rope_interleaved(head, position, self.config.rope_theta);
-                } else {
-                    apply_rope(head, position, self.config.rope_theta);
-                }
-            }
-
-            let layer_cache = &cache.layers[layer_index];
-            let mut attended = vec![0.0; hidden_size];
-            for query_head in 0..head_count {
-                let kv_head = query_head / heads_per_kv_head;
-                let query_start = query_head * head_size;
-                let kv_start = kv_head * head_size;
-                let query_slice = &query[query_start..query_start + head_size];
-                let scale = (head_size as f32).sqrt().recip();
-                let mut scores = Vec::with_capacity(position + 1);
-                for previous_key in &layer_cache.keys {
-                    scores.push(
-                        dot(query_slice, &previous_key[kv_start..kv_start + head_size]) * scale,
-                    );
-                }
-                scores.push(dot(query_slice, &key[kv_start..kv_start + head_size]) * scale);
-                let probabilities = softmax(&scores);
-                for (step, probability) in probabilities.into_iter().enumerate() {
-                    let values = if step == position {
-                        &value
-                    } else {
-                        &layer_cache.values[step]
-                    };
-                    for offset in 0..head_size {
-                        attended[query_start + offset] += probability * values[kv_start + offset];
-                    }
-                }
-            }
-            add_in_place(
-                &mut hidden,
-                &multiply_one(&mut multiply, &layer.attention_output, &attended)?,
-            );
-
-            let normalized = rms_norm(
-                &hidden,
-                &layer.feed_forward_norm,
-                self.config.rms_norm_epsilon,
+            let run = execute_layers(
+                &self.config,
+                &self.weights.layers[range.clone()],
+                &cache.layers[range.clone()],
+                position,
+                hidden,
+                &mut multiply,
             )?;
-            let [gate, up]: [Vec<f32>; 2] = multiply(&[&layer.gate, &layer.up], &normalized)?
-                .try_into()
-                .map_err(|_| EngineError::Backend("feed-forward projection count".into()))?;
-            let activated: Vec<f32> = gate
-                .into_iter()
-                .zip(up)
-                .map(|(gate_value, up_value)| silu(gate_value) * up_value)
-                .collect();
-            add_in_place(
-                &mut hidden,
-                &multiply_one(&mut multiply, &layer.down, &activated)?,
-            );
-            new_keys.push(key);
-            new_values.push(value);
+            hidden = run.hidden;
+            new_keys.extend(run.keys);
+            new_values.extend(run.values);
+            next_layer = range.end;
+        }
+        if next_layer != self.config.num_layers {
+            return Err(EngineError::InvalidConfig(
+                "incomplete decoder layer ranges",
+            ));
         }
 
-        let normalized = rms_norm(
-            &hidden,
-            &self.weights.final_norm,
-            self.config.rms_norm_epsilon,
-        )?;
-        let output = self
-            .weights
-            .output
-            .as_ref()
-            .unwrap_or(&self.weights.token_embeddings);
-        let logits = multiply_one(&mut multiply, output, &normalized)?;
-        if !logits.iter().all(|value| value.is_finite()) {
-            return Err(EngineError::InvalidValue("next-token scores"));
-        }
+        let logits = self.project_logits(&hidden, &mut multiply)?;
 
         for (layer, (key, value)) in cache
             .layers
@@ -277,6 +221,144 @@ impl Model {
         cache.position += 1;
         Ok(logits)
     }
+
+    fn embed_token(&self, token_id: usize) -> Result<Vec<f32>, EngineError> {
+        self.weights.token_embeddings.row(token_id)
+    }
+
+    fn project_logits(
+        &self,
+        hidden: &[f32],
+        multiply: &mut impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
+    ) -> Result<Vec<f32>, EngineError> {
+        let normalized = rms_norm(
+            hidden,
+            &self.weights.final_norm,
+            self.config.rms_norm_epsilon,
+        )?;
+        let output = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.token_embeddings);
+        let logits = multiply_one(multiply, output, &normalized)?;
+        if !logits.iter().all(|value| value.is_finite()) {
+            return Err(EngineError::InvalidValue("next-token scores"));
+        }
+        Ok(logits)
+    }
+}
+
+fn execute_layers(
+    config: &ModelConfig,
+    layers: &[LayerWeights],
+    caches: &[LayerCache],
+    position: usize,
+    mut hidden: Vec<f32>,
+    multiply: &mut impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
+) -> Result<LayerRun, EngineError> {
+    if hidden.len() != config.hidden_size {
+        return Err(EngineError::InvalidShape {
+            name: "decoder hidden state",
+            expected: vec![config.hidden_size],
+            actual: vec![hidden.len()],
+        });
+    }
+    if !hidden.iter().all(|value| value.is_finite()) {
+        return Err(EngineError::InvalidValue("decoder hidden state"));
+    }
+    if layers.len() != caches.len() {
+        return Err(EngineError::InvalidConfig("decoder cache layer count"));
+    }
+    let hidden_size = config.hidden_size;
+    let head_count = config.num_attention_heads;
+    let kv_head_count = config.num_key_value_heads;
+    let head_size = hidden_size / head_count;
+    let kv_size = kv_head_count * head_size;
+    let heads_per_kv_head = head_count / kv_head_count;
+    let mut keys = Vec::with_capacity(layers.len());
+    let mut values = Vec::with_capacity(layers.len());
+
+    for (layer, layer_cache) in layers.iter().zip(caches) {
+        if layer_cache.keys.len() != position || layer_cache.values.len() != position {
+            return Err(EngineError::Backend(
+                "decoder cache position mismatch".into(),
+            ));
+        }
+        let normalized = rms_norm(&hidden, &layer.attention_norm, config.rms_norm_epsilon)?;
+        let [mut query, mut key, value]: [Vec<f32>; 3] =
+            multiply(&[&layer.query, &layer.key, &layer.value], &normalized)?
+                .try_into()
+                .map_err(|_| EngineError::Backend("attention projection count".into()))?;
+        debug_assert_eq!(query.len(), hidden_size);
+        debug_assert_eq!(key.len(), kv_size);
+
+        for head in query.chunks_exact_mut(head_size) {
+            if config.rope_interleaved {
+                apply_rope_interleaved(head, position, config.rope_theta);
+            } else {
+                apply_rope(head, position, config.rope_theta);
+            }
+        }
+        for head in key.chunks_exact_mut(head_size) {
+            if config.rope_interleaved {
+                apply_rope_interleaved(head, position, config.rope_theta);
+            } else {
+                apply_rope(head, position, config.rope_theta);
+            }
+        }
+
+        let mut attended = vec![0.0; hidden_size];
+        for query_head in 0..head_count {
+            let kv_head = query_head / heads_per_kv_head;
+            let query_start = query_head * head_size;
+            let kv_start = kv_head * head_size;
+            let query_slice = &query[query_start..query_start + head_size];
+            let scale = (head_size as f32).sqrt().recip();
+            let mut scores = Vec::with_capacity(position + 1);
+            for previous_key in &layer_cache.keys {
+                scores
+                    .push(dot(query_slice, &previous_key[kv_start..kv_start + head_size]) * scale);
+            }
+            scores.push(dot(query_slice, &key[kv_start..kv_start + head_size]) * scale);
+            let probabilities = softmax(&scores);
+            for (step, probability) in probabilities.into_iter().enumerate() {
+                let values = if step == position {
+                    &value
+                } else {
+                    &layer_cache.values[step]
+                };
+                for offset in 0..head_size {
+                    attended[query_start + offset] += probability * values[kv_start + offset];
+                }
+            }
+        }
+        add_in_place(
+            &mut hidden,
+            &multiply_one(multiply, &layer.attention_output, &attended)?,
+        );
+
+        let normalized = rms_norm(&hidden, &layer.feed_forward_norm, config.rms_norm_epsilon)?;
+        let [gate, up]: [Vec<f32>; 2] = multiply(&[&layer.gate, &layer.up], &normalized)?
+            .try_into()
+            .map_err(|_| EngineError::Backend("feed-forward projection count".into()))?;
+        let activated: Vec<f32> = gate
+            .into_iter()
+            .zip(up)
+            .map(|(gate_value, up_value)| silu(gate_value) * up_value)
+            .collect();
+        add_in_place(
+            &mut hidden,
+            &multiply_one(multiply, &layer.down, &activated)?,
+        );
+        keys.push(key);
+        values.push(value);
+    }
+    Ok(LayerRun {
+        hidden,
+        keys,
+        values,
+    })
 }
 
 fn multiply_one(
@@ -419,5 +501,124 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
 fn add_in_place(target: &mut [f32], source: &[f32]) {
     for (target_value, source_value) in target.iter_mut().zip(source) {
         *target_value += source_value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_multiply(matrices: &[&Matrix], input: &[f32]) -> Result<Vec<Vec<f32>>, EngineError> {
+        matrices
+            .iter()
+            .map(|matrix| matrix.mul_vec(input))
+            .collect()
+    }
+
+    fn tiny_model() -> Model {
+        fn matrix(seed: usize, rows: usize, columns: usize) -> Matrix {
+            Matrix::new(
+                rows,
+                columns,
+                (0..rows * columns)
+                    .map(|index| ((index * 17 + seed * 13) % 23) as f32 / 20.0 - 0.55)
+                    .collect(),
+            )
+            .unwrap()
+        }
+        let config = ModelConfig {
+            vocab_size: 8,
+            hidden_size: 4,
+            intermediate_size: 6,
+            num_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            max_positions: 8,
+            rms_norm_epsilon: 1e-5,
+            rope_theta: 10000.0,
+            rope_interleaved: false,
+        };
+        let layers = (0..2)
+            .map(|index| {
+                let base = 2 + index * 7;
+                LayerWeights {
+                    attention_norm: vec![1.0; 4],
+                    query: matrix(base, 4, 4),
+                    key: matrix(base + 1, 2, 4),
+                    value: matrix(base + 2, 2, 4),
+                    attention_output: matrix(base + 3, 4, 4),
+                    feed_forward_norm: vec![1.0; 4],
+                    gate: matrix(base + 4, 6, 4),
+                    up: matrix(base + 5, 6, 4),
+                    down: matrix(base + 6, 4, 6),
+                }
+            })
+            .collect();
+        Model::new(
+            config,
+            ModelWeights {
+                token_embeddings: matrix(1, 8, 4),
+                layers,
+                final_norm: vec![1.0; 4],
+                output: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn two_layer_ranges_match_full_step_and_do_not_commit_a_failed_step() {
+        let model = tiny_model();
+        let mut full = KvCache::new(2);
+        let mut split = KvCache::new(2);
+        for token in [1, 2, 3, 4] {
+            let expected = model.forward_token(token, &mut full, cpu_multiply).unwrap();
+            let actual = model
+                .forward_token_ranges(token, &mut split, &[0..1, 1..2], cpu_multiply)
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(split.position(), full.position());
+            assert_eq!(split.layers[0].keys.len(), split.position());
+            assert_eq!(split.layers[1].keys.len(), split.position());
+        }
+
+        let position = split.position();
+        let error = model.forward_token_ranges(5, &mut split, &[0..1, 1..2], |matrices, input| {
+            if input.len() == model.config.hidden_size && matrices.len() == 1 {
+                return Err(EngineError::Backend("injected failure".into()));
+            }
+            cpu_multiply(matrices, input)
+        });
+        assert_eq!(error, Err(EngineError::Backend("injected failure".into())));
+        assert_eq!(split.position(), position);
+        assert!(split
+            .layers
+            .iter()
+            .all(|layer| layer.keys.len() == position && layer.values.len() == position));
+    }
+
+    #[test]
+    #[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+    fn real_q4_k_model_matches_at_layer_boundary() {
+        let directory = std::env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR");
+        let model =
+            crate::load_gguf(std::path::Path::new(&directory).join("SmolLM2-135M-Q4_K_M.gguf"))
+                .unwrap();
+        let split_at = model.config.num_layers / 2;
+        let mut full = KvCache::new(model.config.num_layers);
+        let mut split = KvCache::new(model.config.num_layers);
+        for token in [1, 2, 3, 30] {
+            let expected = model.forward_token(token, &mut full, cpu_multiply).unwrap();
+            let actual = model
+                .forward_token_ranges(
+                    token,
+                    &mut split,
+                    &[0..split_at, split_at..model.config.num_layers],
+                    cpu_multiply,
+                )
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(split.position(), full.position());
+        }
     }
 }
