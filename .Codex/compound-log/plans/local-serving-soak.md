@@ -19,3 +19,5 @@ Start the release server on an unused loopback port with a fresh random Bearer k
 ## Result
 
 The repeated load found steady memory growth in the Metal child process. A per-token Objective-C autorelease pool removed that growth in a matched eight-wave run. CPU and Metal checks completed every ordinary and streaming request with one stable worker. The numerical real-model tests still pass. Physical two-device and longer varied-prompt runs remain open.
+
+A separate short varied-prompt run used six prompts, four repetitions per prompt, and both ordinary and streaming responses on each backend. CPU and Metal each completed 48 requests. Every repeated prompt and response mode produced the same text, and neither worker restarted. Process-tree resident memory after the ordinary and streaming waves changed by +640 KiB on CPU and +304 KiB on Metal. This two-wave check adds prompt diversity but does not establish long-term memory stability.
