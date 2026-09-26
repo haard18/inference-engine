@@ -38,9 +38,9 @@ Build the model execution core before device pooling. The core must produce corr
 - [x] Run the SmolLM2 Q4_K_M GGUF checkpoint with Q5_0, Q8_0, and Q4_K matrices.
 - [x] Run f32, f16, bf16, Q8_0, Q5_0, and Q4_K matrix operations on Metal and check real-model parity.
 - [x] Make uploaded Metal weights reusable across generation sessions.
-- [ ] Keep attention and KV state on the GPU and remove per-operation CPU/GPU synchronization.
+- [x] Keep attention and KV state on the GPU and remove per-operation CPU/GPU synchronization.
 
-Metal attention and per-session key/value buffers now run through GPU commands. Normalization, attention, residual additions, and feed-forward work share one command per decoder layer. This removes intermediate CPU/GPU waits within each layer. The hidden vector still returns to the CPU between layers, and final normalization and output projection still cross the boundary. The remaining checkbox tracks GPU residency across those boundaries.
+Metal attention and per-session key/value buffers now run through GPU commands. The hidden vector stays on the GPU through every decoder layer, final normalization, and output projection. One command completion per token replaces per-operation waits. The CPU still supplies the initial embedding row and rotary table, and receives scores for token selection; CPU matrix weights also remain loaded beside uploaded GPU weights.
 
 ## Risks
 

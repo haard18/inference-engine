@@ -12,6 +12,7 @@
 - [Capacity probes during split inference](plans/split-capacity-readiness.md)
 - [Metal feed-forward command](plans/metal-feed-forward.md)
 - [One Metal command per decoder layer](plans/metal-decoder-layer.md)
+- [One Metal command per token](plans/metal-token-command.md)
 
 ## Learnings
 
@@ -47,6 +48,7 @@
 - [Capacity probes during split inference](learnings/2026-09-26-split-capacity-readiness.md)
 - [Metal feed-forward command](learnings/2026-09-26-metal-feed-forward.md)
 - [One Metal command per decoder layer](learnings/2026-09-26-metal-decoder-layer.md)
+- [One Metal command per token](learnings/2026-09-26-metal-token-command.md)
 
 ## Reviews
 
@@ -81,3 +83,4 @@
 - [Split capacity readiness review](reviews/2026-09-26-split-capacity-readiness.md)
 - [Metal feed-forward review](reviews/2026-09-26-metal-feed-forward.md)
 - [Metal decoder-layer review](reviews/2026-09-26-metal-decoder-layer.md)
+- [Metal token-command review](reviews/2026-09-26-metal-token-command.md)

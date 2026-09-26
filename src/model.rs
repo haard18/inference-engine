@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use crate::metal_backend::{LayerStep, MetalBackend, MetalKvCache};
+use crate::metal_backend::{DecoderStep, MetalBackend, MetalKvCache};
 use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
@@ -418,6 +418,11 @@ impl Model {
             .collect()
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn final_norm_weights(&self) -> &[f32] {
+        &self.weights.final_norm
+    }
+
     /// Bytes held by weight values, excluding allocation and model metadata.
     pub fn stored_weight_bytes(&self) -> usize {
         let mut total = self.weights.token_embeddings.storage_bytes()
@@ -441,8 +446,8 @@ impl Model {
         self.forward_token_ranges(token_id, cache, std::slice::from_ref(&all_layers), multiply)
     }
 
-    /// Each decoder layer runs in one Metal command. The generation session owns
-    /// its key/value buffers and commits a position only after logits succeed.
+    /// One Metal command runs the decoder and output projection for a token. The
+    /// session commits a position only after the complete command succeeds.
     #[cfg(target_os = "macos")]
     pub(crate) fn forward_token_metal(
         &self,
@@ -461,7 +466,7 @@ impl Model {
             return Err(EngineError::InvalidConfig("Metal cache has CPU layers"));
         }
         let position = cache.position;
-        let mut hidden = self.embed_token(token_id)?;
+        let hidden = self.embed_token(token_id)?;
         let head_count = self.config.num_attention_heads;
         let kv_head_count = self.config.num_key_value_heads;
         let head_size = self.config.hidden_size / head_count;
@@ -474,25 +479,29 @@ impl Model {
             let (sine, cosine) = (position as f32 * frequency).sin_cos();
             rotations.extend([sine, cosine]);
         }
-        for (layer_index, layer) in self.weights.layers.iter().enumerate() {
-            hidden = backend.run_layer(
-                metal_cache,
-                layer_index,
-                LayerStep {
-                    position,
-                    head_count,
-                    kv_head_count,
-                    layer,
-                    hidden: &hidden,
-                    epsilon: self.config.rms_norm_epsilon,
-                    rotations: &rotations,
-                    interleaved: self.config.rope_interleaved,
-                },
-            )?;
+        let output = self
+            .weights
+            .output
+            .as_ref()
+            .unwrap_or(&self.weights.token_embeddings);
+        let logits = backend.run_decoder(
+            metal_cache,
+            DecoderStep {
+                position,
+                head_count,
+                kv_head_count,
+                layers: &self.weights.layers,
+                hidden: &hidden,
+                final_norm: &self.weights.final_norm,
+                output,
+                epsilon: self.config.rms_norm_epsilon,
+                rotations: &rotations,
+                interleaved: self.config.rope_interleaved,
+            },
+        )?;
+        if !logits.iter().all(|value| value.is_finite()) {
+            return Err(EngineError::InvalidValue("next-token scores"));
         }
-        let logits = self.project_logits(&hidden, &mut |matrices, input| {
-            backend.mul_vec_many(matrices, input)
-        })?;
         cache.commit(Vec::new(), Vec::new());
         Ok(logits)
     }

@@ -1,0 +1,7 @@
+# 2026-09-26 - One Metal command per token
+
+The prior Metal decoder waited for one command after each layer, copied that layer's hidden vector to the CPU, and uploaded it for the next layer. It then normalized the final vector on the CPU and launched a separate score projection. The decoder now encodes all layers and final normalization and projection into one command. Each layer passes its GPU output buffer to the next. Final normalization weights are uploaded once when the runtime starts. Each token still uploads its initial embedding vector and rotary table, then reads the final scores.
+
+All temporary buffers remain retained until the command finishes. Per-session key/value buffers are still owned by the session, and its token position is committed only after the command completes and finite scores return. If the command fails, a later attempt can overwrite the uncommitted slot. The full 59-test release suite passed, including a 20-position cache-growth check, Metal conversation reuse, and real bf16/Q8_0/Q4_K_M score comparisons.
+
+In one short sequential `Hello` eight-token probe, CPU runs took 1.14, 0.58, and 0.58 seconds; Metal runs took 0.29, 0.28, and 0.29 seconds. Both generated the same text. Separate maximum resident-memory samples were 122.0 MB on CPU and 233.4 MB with Metal. The first CPU run was cold. These measurements do not establish a stable serving speed ratio. The Metal process still retains CPU matrix weights beside uploaded GPU weights, and all command intermediates stay live until each token completes.

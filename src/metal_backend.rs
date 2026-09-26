@@ -42,15 +42,23 @@ struct NormParams {
     epsilon: f32,
 }
 
-pub(crate) struct LayerStep<'a> {
+pub(crate) struct DecoderStep<'a> {
     pub(crate) position: usize,
     pub(crate) head_count: usize,
     pub(crate) kv_head_count: usize,
-    pub(crate) layer: &'a LayerWeights,
+    pub(crate) layers: &'a [LayerWeights],
     pub(crate) hidden: &'a [f32],
+    pub(crate) final_norm: &'a [f32],
+    pub(crate) output: &'a Matrix,
     pub(crate) epsilon: f32,
     pub(crate) rotations: &'a [f32],
     pub(crate) interleaved: bool,
+}
+
+struct LayerBuffers<'a> {
+    hidden: &'a Buffer,
+    rotations: &'a Buffer,
+    retained: &'a mut Vec<Buffer>,
 }
 
 #[derive(Default)]
@@ -154,6 +162,7 @@ pub(crate) struct MetalBackend<'a> {
     add_vectors: ComputePipelineState,
     weights: HashMap<usize, (Buffer, u32)>,
     norms: Vec<(Buffer, Buffer)>,
+    final_norm: Buffer,
 }
 
 /// A prepared Mac GPU runtime. Multiple generation sessions reuse its uploaded weights.
@@ -239,21 +248,22 @@ impl<'a> MetalBackend<'a> {
             );
             weights.insert(matrix as *const Matrix as usize, (buffer, kind));
         }
+        let upload = |values: &[f32]| -> Result<Buffer, EngineError> {
+            let bytes = size_of_val(values) as u64;
+            if bytes > device.max_buffer_length() {
+                return Err(EngineError::Backend("Metal norm buffer limit".into()));
+            }
+            Ok(device.new_buffer_with_data(
+                values.as_ptr().cast(),
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+            ))
+        };
         let mut norms = Vec::with_capacity(model.config().num_layers);
         for (attention, feed_forward) in model.layer_norms() {
-            let upload = |values: &[f32]| -> Result<Buffer, EngineError> {
-                let bytes = size_of_val(values) as u64;
-                if bytes > device.max_buffer_length() {
-                    return Err(EngineError::Backend("Metal norm buffer limit".into()));
-                }
-                Ok(device.new_buffer_with_data(
-                    values.as_ptr().cast(),
-                    bytes,
-                    MTLResourceOptions::StorageModeShared,
-                ))
-            };
             norms.push((upload(attention)?, upload(feed_forward)?));
         }
+        let final_norm = upload(model.final_norm_weights())?;
         Ok(Self {
             _model: model,
             device,
@@ -268,6 +278,7 @@ impl<'a> MetalBackend<'a> {
             add_vectors,
             weights,
             norms,
+            final_norm,
         })
     }
 
@@ -366,13 +377,108 @@ impl<'a> MetalBackend<'a> {
         encoder.end_encoding();
     }
 
-    pub(crate) fn run_layer(
+    pub(crate) fn run_decoder(
         &mut self,
         cache: &mut MetalKvCache,
-        layer_index: usize,
-        step: LayerStep<'_>,
+        step: DecoderStep<'_>,
     ) -> Result<Vec<f32>, EngineError> {
-        let layer_weights = step.layer;
+        if step.layers.is_empty()
+            || step.layers.len() != cache.layers.len()
+            || step.layers.len() != self.norms.len()
+            || step.hidden.is_empty()
+            || step.final_norm.len() != step.hidden.len()
+            || step.output.cols() != step.hidden.len()
+            || !step.hidden.iter().all(|value| value.is_finite())
+        {
+            return Err(EngineError::InvalidConfig("Metal decoder dimensions"));
+        }
+        let bytes = |count: usize| {
+            count
+                .checked_mul(size_of::<f32>())
+                .filter(|&size| size as u64 <= self.device.max_buffer_length())
+                .map(|size| size as u64)
+                .ok_or_else(|| EngineError::Backend("Metal decoder buffer limit".into()))
+        };
+        let hidden_bytes = bytes(step.hidden.len())?;
+        let output_bytes = bytes(step.output.rows())?;
+        let rotation_bytes = bytes(step.rotations.len())?;
+        bytes(1)?;
+        let hidden_input = self.device.new_buffer_with_data(
+            step.hidden.as_ptr().cast(),
+            hidden_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let rotations = self.device.new_buffer_with_data(
+            step.rotations.as_ptr().cast(),
+            rotation_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let command = self.queue.new_command_buffer();
+        let mut retained = Vec::with_capacity(step.layers.len() * 16);
+        let mut hidden = hidden_input;
+        for layer_index in 0..step.layers.len() {
+            let mut buffers = LayerBuffers {
+                hidden: &hidden,
+                rotations: &rotations,
+                retained: &mut retained,
+            };
+            let next = self.encode_layer(command, cache, layer_index, &step, &mut buffers)?;
+            retained.push(hidden);
+            hidden = next;
+        }
+
+        let norm_params = NormParams {
+            count: u32::try_from(step.hidden.len())
+                .map_err(|_| EngineError::Backend("Metal hidden size too large".into()))?,
+            epsilon: step.epsilon,
+        };
+        let scale = self.device.new_buffer(
+            size_of::<f32>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let normalized = self
+            .device
+            .new_buffer(hidden_bytes, MTLResourceOptions::StorageModeShared);
+        let scores = self
+            .device
+            .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+        self.encode_norm(
+            command,
+            &hidden,
+            &self.final_norm,
+            &scale,
+            &normalized,
+            &norm_params,
+        );
+        let projection = command.new_compute_command_encoder();
+        self.encode_matrix(projection, step.output, &normalized, &scores)?;
+        projection.end_encoding();
+
+        command.commit();
+        command.wait_until_completed();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            return Err(EngineError::Backend(format!(
+                "Metal decoder command ended with {:?}",
+                command.status()
+            )));
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(scores.contents().cast::<f32>(), step.output.rows()).to_vec()
+        })
+    }
+
+    fn encode_layer(
+        &self,
+        command: &CommandBufferRef,
+        cache: &mut MetalKvCache,
+        layer_index: usize,
+        step: &DecoderStep<'_>,
+        buffers: &mut LayerBuffers<'_>,
+    ) -> Result<Buffer, EngineError> {
+        let layer_weights = step
+            .layers
+            .get(layer_index)
+            .ok_or(EngineError::InvalidConfig("Metal decoder layer index"))?;
         let (query_matrix, key_matrix, value_matrix) = (
             &layer_weights.query,
             &layer_weights.key,
@@ -409,7 +515,6 @@ impl<'a> MetalBackend<'a> {
             || step.rotations.len() != head_size
             || !step.epsilon.is_finite()
             || step.epsilon <= 0.0
-            || !step.hidden.iter().all(|value| value.is_finite())
         {
             return Err(EngineError::InvalidConfig("Metal layer dimensions"));
         }
@@ -481,19 +586,10 @@ impl<'a> MetalBackend<'a> {
         let layer = cache.layer_at(&self.device, layer_index, step.position)?;
         let keys = layer.keys.as_ref().expect("cache keys allocated");
         let values = layer.values.as_ref().expect("cache values allocated");
-        let upload = |data: &[f32]| {
-            self.device.new_buffer_with_data(
-                data.as_ptr().cast(),
-                size_of_val(data) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
-        };
         let allocate = |bytes| {
             self.device
                 .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
         };
-        let hidden = upload(step.hidden);
-        let rotations = upload(step.rotations);
         let attention_scale = allocate(size_of::<f32>() as u64);
         let feed_forward_scale = allocate(size_of::<f32>() as u64);
         let normalized_attention = allocate(hidden_bytes);
@@ -511,10 +607,9 @@ impl<'a> MetalBackend<'a> {
         let down = allocate(hidden_bytes);
         let output = allocate(hidden_bytes);
 
-        let command = self.queue.new_command_buffer();
         self.encode_norm(
             command,
-            &hidden,
+            buffers.hidden,
             attention_norm,
             &attention_scale,
             &normalized_attention,
@@ -536,7 +631,7 @@ impl<'a> MetalBackend<'a> {
         rotary.set_buffer(2, Some(&value), 0);
         rotary.set_buffer(3, Some(keys), 0);
         rotary.set_buffer(4, Some(values), 0);
-        rotary.set_buffer(5, Some(&rotations), 0);
+        rotary.set_buffer(5, Some(buffers.rotations), 0);
         rotary.set_bytes(
             6,
             size_of::<RopeParams>() as u64,
@@ -590,7 +685,7 @@ impl<'a> MetalBackend<'a> {
         attention_output_encoder.end_encoding();
         self.encode_add(
             command,
-            &hidden,
+            buffers.hidden,
             &attention_projection,
             &after_attention,
             hidden_count,
@@ -640,114 +735,23 @@ impl<'a> MetalBackend<'a> {
         down_encoder.end_encoding();
         self.encode_add(command, &after_attention, &down, &output, hidden_count);
 
-        command.commit();
-        command.wait_until_completed();
-        if command.status() != MTLCommandBufferStatus::Completed {
-            return Err(EngineError::Backend(format!(
-                "Metal layer command ended with {:?}",
-                command.status()
-            )));
-        }
-        Ok(unsafe {
-            std::slice::from_raw_parts(output.contents().cast::<f32>(), hidden_size).to_vec()
-        })
-    }
-
-    pub(crate) fn mul_vec_many(
-        &mut self,
-        matrices: &[&Matrix],
-        input: &[f32],
-    ) -> Result<Vec<Vec<f32>>, EngineError> {
-        if matrices.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut dispatches = Vec::with_capacity(matrices.len());
-        for &matrix in matrices {
-            if input.len() != matrix.cols() {
-                return Err(EngineError::InvalidShape {
-                    name: "matrix input",
-                    expected: vec![matrix.cols()],
-                    actual: vec![input.len()],
-                });
-            }
-            let (weight, kind) = self
-                .weights
-                .get(&(matrix as *const Matrix as usize))
-                .ok_or_else(|| EngineError::Backend("matrix was not uploaded to Metal".into()))?;
-            let rows = u32::try_from(matrix.rows())
-                .map_err(|_| EngineError::Backend("matrix has too many rows for Metal".into()))?;
-            let cols = u32::try_from(matrix.cols()).map_err(|_| {
-                EngineError::Backend("matrix has too many columns for Metal".into())
-            })?;
-            let output_bytes =
-                matrix.rows().checked_mul(size_of::<f32>()).ok_or_else(|| {
-                    EngineError::Backend("Metal output buffer size overflow".into())
-                })? as u64;
-            if output_bytes > self.device.max_buffer_length() {
-                return Err(EngineError::Backend("Metal output buffer limit".into()));
-            }
-            dispatches.push((
-                weight,
-                Params {
-                    rows,
-                    cols,
-                    kind: *kind,
-                    reserved: 0,
-                },
-                output_bytes,
-            ));
-        }
-        if size_of_val(input) as u64 > self.device.max_buffer_length() {
-            return Err(EngineError::Backend("Metal input buffer limit".into()));
-        }
-        let input_buffer = self.device.new_buffer_with_data(
-            input.as_ptr().cast(),
-            size_of_val(input) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let command = self.queue.new_command_buffer();
-        let encoder = command.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&self.pipeline);
-        encoder.set_buffer(1, Some(&input_buffer), 0);
-        let threads = self.pipeline.thread_execution_width();
-        let mut outputs = Vec::with_capacity(matrices.len());
-        for (weight, params, output_bytes) in dispatches {
-            let output_buffer = self
-                .device
-                .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
-            encoder.set_buffer(0, Some(weight), 0);
-            encoder.set_buffer(2, Some(&output_buffer), 0);
-            encoder.set_bytes(
-                3,
-                size_of::<Params>() as u64,
-                (&params as *const Params).cast(),
-            );
-            encoder.dispatch_threads(
-                MTLSize::new(u64::from(params.rows), 1, 1),
-                MTLSize::new(threads, 1, 1),
-            );
-            outputs.push(output_buffer);
-        }
-        encoder.end_encoding();
-        command.commit();
-        command.wait_until_completed();
-        if command.status() != MTLCommandBufferStatus::Completed {
-            return Err(EngineError::Backend(format!(
-                "Metal command ended with {:?}",
-                command.status()
-            )));
-        }
-        // Shared output buffers are readable after the command completes.
-        Ok(outputs
-            .iter()
-            .zip(matrices)
-            .map(|(buffer, matrix)| unsafe {
-                std::slice::from_raw_parts(
-                    buffer.contents().cast::<f32>() as *const f32,
-                    matrix.rows(),
-                )
-                .to_vec()
-            })
-            .collect())
+        buffers.retained.extend([
+            attention_scale,
+            feed_forward_scale,
+            normalized_attention,
+            normalized_feed_forward,
+            query,
+            key,
+            value,
+            scores,
+            attended,
+            attention_projection,
+            after_attention,
+            gate,
+            up,
+            activated,
+            down,
+        ]);
+        Ok(output)
     }
 }
