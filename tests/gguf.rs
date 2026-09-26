@@ -247,3 +247,47 @@ fn real_q4_metal_stages_match_full_metal_scores() {
     assert_eq!(first.position(), 3);
     assert_eq!(second.position(), 3);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+fn real_q4_mixed_cpu_metal_stages_match_full_scores() {
+    use inference_engine::MetalStageRuntime;
+
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let path = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let model = load_gguf(&path).unwrap();
+    let prefix = load_gguf_stage(&path, 0..15).unwrap();
+    let suffix = load_gguf_stage(&path, 15..30).unwrap();
+    let prefix_metal = MetalStageRuntime::new(&prefix).unwrap();
+    let suffix_metal = MetalStageRuntime::new(&suffix).unwrap();
+    let mut full = GenerationSession::new(&model);
+    let mut cpu_prefix = StageSession::new(&prefix);
+    let mut metal_suffix = suffix_metal.session();
+    let mut metal_prefix = prefix_metal.session();
+    let mut cpu_suffix = StageSession::new(&suffix);
+
+    for (position, token) in [1, 2, 3, 30].into_iter().enumerate() {
+        full.prefill(&[token]).unwrap();
+        let cpu_then_metal = metal_suffix
+            .forward_hidden(cpu_prefix.forward_token(token).unwrap())
+            .unwrap();
+        let metal_then_cpu = cpu_suffix
+            .forward_hidden(metal_prefix.forward_token(token).unwrap())
+            .unwrap();
+        for (name, scores) in [
+            ("CPU prefix, Metal suffix", cpu_then_metal),
+            ("Metal prefix, CPU suffix", metal_then_cpu),
+        ] {
+            let difference = scores
+                .iter()
+                .zip(full.next_token_scores().unwrap())
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                difference < 1e-3,
+                "{name}, position {position}: {difference}"
+            );
+        }
+    }
+}

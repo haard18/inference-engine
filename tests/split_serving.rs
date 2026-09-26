@@ -382,9 +382,7 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
 }
 
 #[cfg(target_os = "macos")]
-#[tokio::test]
-#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
-async fn metal_split_chat_matches_whole_metal_worker() {
+async fn split_backend_case(prefix_backend: ServingBackend, suffix_backend: ServingBackend) {
     let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
     let model = directory.join("SmolLM2-135M-Q4_K_M.gguf");
     let executable = env!("CARGO_BIN_EXE_serve");
@@ -419,7 +417,7 @@ async fn metal_split_chat_matches_whole_metal_worker() {
         30,
         StagePeerOptions {
             queue_capacity: 4,
-            backend: ServingBackend::Metal,
+            backend: suffix_backend,
         },
         &suffix_identity,
         &suffix_peers,
@@ -430,14 +428,14 @@ async fn metal_split_chat_matches_whole_metal_worker() {
     let handle = suffix_handle.clone();
     let suffix_task = tokio::spawn(async move { suffix.serve(listener, handle).await });
     let client = PeerClient::new(&prefix_identity, prefix_peers.peers()[0].clone()).unwrap();
-    let metal_config = || ServingConfig {
-        backend: ServingBackend::Metal,
+    let split_config = || ServingConfig {
+        backend: prefix_backend,
         ..config()
     };
     let (split, split_worker) = start_split_prefix(
         &model,
         load_gguf_tokenizer(&model).unwrap(),
-        metal_config(),
+        split_config(),
         executable,
         15,
         &prefix_identity,
@@ -448,7 +446,10 @@ async fn metal_split_chat_matches_whole_metal_worker() {
     let (whole, whole_worker) = start_isolated(
         &model,
         load_gguf_tokenizer(&model).unwrap(),
-        metal_config(),
+        ServingConfig {
+            backend: ServingBackend::Metal,
+            ..config()
+        },
         executable,
     )
     .await
@@ -485,4 +486,19 @@ async fn metal_split_chat_matches_whole_metal_worker() {
     suffix_task.await.unwrap().unwrap();
     split_worker.abort();
     whole_worker.abort();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+async fn metal_split_chat_matches_whole_metal_worker() {
+    split_backend_case(ServingBackend::Metal, ServingBackend::Metal).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+async fn mixed_backend_split_chat_matches_whole_metal_worker() {
+    split_backend_case(ServingBackend::Cpu, ServingBackend::Metal).await;
+    split_backend_case(ServingBackend::Metal, ServingBackend::Cpu).await;
 }

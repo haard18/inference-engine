@@ -848,7 +848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_a_stage_step_discards_the_child_before_the_next_request() {
+    async fn cancelling_a_stage_step_preserves_backend_on_restart() {
         let directory = tempfile::tempdir().unwrap();
         let model = directory.path().join("model.gguf");
         fs::write(&model, []).unwrap();
@@ -857,6 +857,8 @@ mod tests {
             &script,
             r#"#!/usr/bin/env python3
 import json, os, struct, sys, time
+if sys.argv[-1] != '--metal':
+    sys.exit(4)
 marker = sys.argv[2] + '.started'
 first = not os.path.exists(marker)
 print(json.dumps({'kind':'ready','model_digest':'07'*32,'layer_start':1,'layer_end':2,'hidden_size':2,'vocab_size':2,'max_positions':4,'stored_weight_bytes':1}), flush=True)
@@ -888,9 +890,20 @@ else:
                 &peer.fingerprint,
             )
             .unwrap();
-        let server = start_stage_peer(&model, &script, 1, 2, 1, &own, &peers)
-            .await
-            .unwrap();
+        let server = start_stage_peer_with_backend(
+            &model,
+            &script,
+            1,
+            2,
+            StagePeerOptions {
+                queue_capacity: 1,
+                backend: ServingBackend::Metal,
+            },
+            &own,
+            &peers,
+        )
+        .await
+        .unwrap();
         let app = server.routes.clone();
         let first = tokio::spawn({
             let app = app.clone();
