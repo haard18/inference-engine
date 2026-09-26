@@ -4,6 +4,8 @@ use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax}
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
 use std::ops::Range;
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -70,6 +72,8 @@ pub(crate) struct StageWeights {
 pub struct StageSession<'a> {
     stage: &'a ModelStage,
     cache: KvCache,
+    #[cfg(target_os = "macos")]
+    metal: Option<(Arc<Mutex<MetalBackend>>, MetalKvCache)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -140,6 +144,91 @@ impl KvCache {
 }
 
 impl ModelStage {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn matrices(&self) -> Vec<&Matrix> {
+        let mut matrices = Vec::with_capacity(1 + self.weights.layers.len() * 7);
+        if let Some(output) = &self.weights.output {
+            matrices.push(output);
+        }
+        for layer in &self.weights.layers {
+            matrices.extend([
+                &layer.query,
+                &layer.key,
+                &layer.value,
+                &layer.attention_output,
+                &layer.gate,
+                &layer.up,
+                &layer.down,
+            ]);
+        }
+        matrices
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn layer_norms(&self) -> Vec<(&[f32], &[f32])> {
+        self.weights
+            .layers
+            .iter()
+            .map(|layer| {
+                (
+                    layer.attention_norm.as_slice(),
+                    layer.feed_forward_norm.as_slice(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn final_norm_weights(&self) -> Option<&[f32]> {
+        self.weights.final_norm.as_deref()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn forward_metal(
+        &self,
+        hidden: Vec<f32>,
+        cache: &mut KvCache,
+        metal_cache: &mut MetalKvCache,
+        backend: &mut MetalBackend,
+    ) -> Result<Vec<f32>, EngineError> {
+        if hidden.len() != self.config.hidden_size || !hidden.iter().all(|value| value.is_finite())
+        {
+            return Err(EngineError::InvalidConfig("stage hidden dimensions"));
+        }
+        let position = cache.position;
+        let head_count = self.config.num_attention_heads;
+        let head_size = self.config.hidden_size / head_count;
+        let mut rotations = Vec::with_capacity(head_size);
+        for index in 0..head_size / 2 {
+            let frequency = self
+                .config
+                .rope_theta
+                .powf(-((2 * index) as f32) / head_size as f32);
+            let (sine, cosine) = (position as f32 * frequency).sin_cos();
+            rotations.extend([sine, cosine]);
+        }
+        let result = backend.run_decoder(
+            metal_cache,
+            DecoderStep {
+                position,
+                head_count,
+                kv_head_count: self.config.num_key_value_heads,
+                layers: &self.weights.layers,
+                hidden: &hidden,
+                final_norm: self.weights.final_norm.as_deref(),
+                output: self.weights.output.as_ref(),
+                epsilon: self.config.rms_norm_epsilon,
+                rotations: &rotations,
+                interleaved: self.config.rope_interleaved,
+            },
+        )?;
+        if !result.iter().all(|value| value.is_finite()) {
+            return Err(EngineError::InvalidValue("stage output"));
+        }
+        cache.commit(Vec::new(), Vec::new());
+        Ok(result)
+    }
+
     pub(crate) fn new(
         config: ModelConfig,
         range: Range<usize>,
@@ -262,6 +351,29 @@ impl<'a> StageSession<'a> {
         Self {
             stage,
             cache: KvCache::new(stage.weights.layers.len()),
+            #[cfg(target_os = "macos")]
+            metal: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_metal_backend(
+        stage: &'a ModelStage,
+        backend: Arc<Mutex<MetalBackend>>,
+    ) -> Self {
+        let kv_size = stage.config.num_key_value_heads
+            * (stage.config.hidden_size / stage.config.num_attention_heads);
+        Self {
+            stage,
+            cache: KvCache::new(0),
+            metal: Some((
+                backend,
+                MetalKvCache::new(
+                    stage.weights.layers.len(),
+                    kv_size,
+                    stage.config.max_positions,
+                ),
+            )),
         }
     }
 
@@ -270,7 +382,18 @@ impl<'a> StageSession<'a> {
     }
 
     pub fn allocated_cache_bytes(&self) -> usize {
-        self.cache.allocated_bytes()
+        self.cache.allocated_bytes() + {
+            #[cfg(target_os = "macos")]
+            {
+                self.metal
+                    .as_ref()
+                    .map_or(0, |(_, cache)| cache.allocated_bytes())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                0
+            }
+        }
     }
 
     /// Restore a completed prompt checkpoint after speculative generation.
@@ -304,6 +427,16 @@ impl<'a> StageSession<'a> {
             .as_ref()
             .expect("validated prefix embedding")
             .row(token_id)?;
+        #[cfg(target_os = "macos")]
+        if let Some((backend, metal_cache)) = &mut self.metal {
+            let mut backend = backend
+                .lock()
+                .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?;
+            return objc::rc::autoreleasepool(|| {
+                self.stage
+                    .forward_metal(hidden, &mut self.cache, metal_cache, &mut backend)
+            });
+        }
         let run = execute_layers(
             &self.stage.config,
             &self.stage.weights.layers,
@@ -325,6 +458,16 @@ impl<'a> StageSession<'a> {
         }
         if self.cache.position >= self.stage.config.max_positions {
             return Err(EngineError::ContextFull);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some((backend, metal_cache)) = &mut self.metal {
+            let mut backend = backend
+                .lock()
+                .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?;
+            return objc::rc::autoreleasepool(|| {
+                self.stage
+                    .forward_metal(hidden, &mut self.cache, metal_cache, &mut backend)
+            });
         }
         let run = execute_layers(
             &self.stage.config,
@@ -454,7 +597,7 @@ impl Model {
         token_id: usize,
         cache: &mut KvCache,
         metal_cache: &mut MetalKvCache,
-        backend: &mut MetalBackend<'_>,
+        backend: &mut MetalBackend,
     ) -> Result<Vec<f32>, EngineError> {
         if token_id >= self.config.vocab_size {
             return Err(EngineError::InvalidToken(token_id));
@@ -492,8 +635,8 @@ impl Model {
                 kv_head_count,
                 layers: &self.weights.layers,
                 hidden: &hidden,
-                final_norm: &self.weights.final_norm,
-                output,
+                final_norm: Some(&self.weights.final_norm),
+                output: Some(output),
                 epsilon: self.config.rms_norm_epsilon,
                 rotations: &rotations,
                 interleaved: self.config.rope_interleaved,

@@ -10,7 +10,7 @@ enum Backend<'a> {
     Cpu(std::marker::PhantomData<&'a Model>),
     #[cfg(target_os = "macos")]
     Metal {
-        backend: Arc<Mutex<MetalBackend<'a>>>,
+        backend: Arc<Mutex<MetalBackend>>,
         cache: MetalKvCache,
     },
 }
@@ -48,10 +48,7 @@ impl<'a> GenerationSession<'a> {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn with_metal_backend(
-        model: &'a Model,
-        backend: Arc<Mutex<MetalBackend<'a>>>,
-    ) -> Self {
+    pub(crate) fn with_metal_backend(model: &'a Model, backend: Arc<Mutex<MetalBackend>>) -> Self {
         Self {
             cache: KvCache::new(0),
             next_logits: None,

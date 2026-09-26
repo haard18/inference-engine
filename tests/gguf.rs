@@ -195,3 +195,55 @@ fn real_gguf_metal_matches_cpu() {
         assert_eq!(cpu.next_token().unwrap(), metal.next_token().unwrap());
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+fn real_q4_metal_stages_match_full_metal_scores() {
+    use inference_engine::{MetalRuntime, MetalStageRuntime};
+
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let path = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let model = load_gguf(&path).unwrap();
+    let prefix = load_gguf_stage(&path, 0..15).unwrap();
+    let suffix = load_gguf_stage(&path, 15..30).unwrap();
+    ModelStage::validate_pair(&prefix, &suffix).unwrap();
+    let full_runtime = MetalRuntime::new(&model).unwrap();
+    let prefix_runtime = MetalStageRuntime::new(&prefix).unwrap();
+    let suffix_runtime = MetalStageRuntime::new(&suffix).unwrap();
+    let mut full = full_runtime.session();
+    let mut first = prefix_runtime.session();
+    let mut second = suffix_runtime.session();
+    let mut checkpoint_scores = None;
+    for (position, token) in [1, 2, 3, 30].into_iter().enumerate() {
+        full.prefill(&[token]).unwrap();
+        let hidden = first.forward_token(token).unwrap();
+        let scores = second.forward_hidden(hidden).unwrap();
+        let largest_difference = scores
+            .iter()
+            .zip(full.next_token_scores().unwrap())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            largest_difference < 1e-3,
+            "position {position}: score difference {largest_difference}"
+        );
+        assert_eq!(first.position(), full.position());
+        assert_eq!(second.position(), full.position());
+        if position == 2 {
+            checkpoint_scores = Some(scores);
+        }
+    }
+    first.rewind(2).unwrap();
+    second.rewind(2).unwrap();
+    let hidden = first.forward_token(3).unwrap();
+    let replay_scores = second.forward_hidden(hidden).unwrap();
+    let largest_replay_difference = replay_scores
+        .iter()
+        .zip(checkpoint_scores.unwrap())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(largest_replay_difference < 1e-3);
+    assert_eq!(first.position(), 3);
+    assert_eq!(second.position(), 3);
+}

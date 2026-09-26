@@ -62,6 +62,7 @@
 - [Exact model identity in a pool](learnings/2026-09-26-model-identity.md)
 - [Short varied serving load](learnings/2026-09-26-varied-serving-load.md)
 - [Bounded split prompt batches](learnings/2026-09-26-split-prefill-batches.md)
+- [Metal execution for partial stages](learnings/2026-09-26-metal-stages.md)
 
 ## Reviews
 

@@ -7,7 +7,9 @@ use metal::{
     ComputePipelineState, Device, MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 
-use crate::{EngineError, GenerationSession, LayerWeights, Matrix, Model};
+use crate::{
+    EngineError, GenerationSession, LayerWeights, Matrix, Model, ModelStage, StageSession,
+};
 
 #[repr(C)]
 struct Params {
@@ -48,8 +50,8 @@ pub(crate) struct DecoderStep<'a> {
     pub(crate) kv_head_count: usize,
     pub(crate) layers: &'a [LayerWeights],
     pub(crate) hidden: &'a [f32],
-    pub(crate) final_norm: &'a [f32],
-    pub(crate) output: &'a Matrix,
+    pub(crate) final_norm: Option<&'a [f32]>,
+    pub(crate) output: Option<&'a Matrix>,
     pub(crate) epsilon: f32,
     pub(crate) rotations: &'a [f32],
     pub(crate) interleaved: bool,
@@ -148,8 +150,7 @@ impl MetalKvCache {
     }
 }
 
-pub(crate) struct MetalBackend<'a> {
-    _model: &'a Model,
+pub(crate) struct MetalBackend {
     device: Device,
     queue: CommandQueue,
     pipeline: ComputePipelineState,
@@ -162,13 +163,19 @@ pub(crate) struct MetalBackend<'a> {
     add_vectors: ComputePipelineState,
     weights: HashMap<usize, (Buffer, u32)>,
     norms: Vec<(Buffer, Buffer)>,
-    final_norm: Buffer,
+    final_norm: Option<Buffer>,
 }
 
 /// A prepared Mac GPU runtime. Multiple generation sessions reuse its uploaded weights.
 pub struct MetalRuntime<'a> {
     model: &'a Model,
-    backend: Arc<Mutex<MetalBackend<'a>>>,
+    backend: Arc<Mutex<MetalBackend>>,
+}
+
+/// A prepared GPU runtime for one owned range of decoder layers.
+pub struct MetalStageRuntime<'a> {
+    stage: &'a ModelStage,
+    backend: Arc<Mutex<MetalBackend>>,
 }
 
 impl<'a> MetalRuntime<'a> {
@@ -184,8 +191,41 @@ impl<'a> MetalRuntime<'a> {
     }
 }
 
-impl<'a> MetalBackend<'a> {
-    pub(crate) fn new(model: &'a Model) -> Result<Self, EngineError> {
+impl<'a> MetalStageRuntime<'a> {
+    pub fn new(stage: &'a ModelStage) -> Result<Self, EngineError> {
+        Ok(Self {
+            stage,
+            backend: Arc::new(Mutex::new(MetalBackend::new_stage(stage)?)),
+        })
+    }
+
+    pub fn session(&self) -> StageSession<'a> {
+        StageSession::with_metal_backend(self.stage, Arc::clone(&self.backend))
+    }
+}
+
+impl MetalBackend {
+    pub(crate) fn new(model: &Model) -> Result<Self, EngineError> {
+        Self::with_weights(
+            model.matrices(),
+            model.layer_norms(),
+            Some(model.final_norm_weights()),
+        )
+    }
+
+    pub(crate) fn new_stage(stage: &ModelStage) -> Result<Self, EngineError> {
+        Self::with_weights(
+            stage.matrices(),
+            stage.layer_norms(),
+            stage.final_norm_weights(),
+        )
+    }
+
+    fn with_weights(
+        matrices: Vec<&Matrix>,
+        layer_norms: Vec<(&[f32], &[f32])>,
+        final_norm_weights: Option<&[f32]>,
+    ) -> Result<Self, EngineError> {
         let device = Device::system_default()
             .ok_or_else(|| EngineError::Backend("no Metal device is available".into()))?;
         let library = device
@@ -234,7 +274,7 @@ impl<'a> MetalBackend<'a> {
         let add_vectors = pipeline_named("add_vectors")?;
         let queue = device.new_command_queue();
         let mut weights = HashMap::new();
-        for matrix in model.matrices() {
+        for matrix in matrices {
             let (pointer, length, kind) = matrix.metal_storage();
             if length as u64 > device.max_buffer_length() {
                 return Err(EngineError::Backend(
@@ -259,13 +299,12 @@ impl<'a> MetalBackend<'a> {
                 MTLResourceOptions::StorageModeShared,
             ))
         };
-        let mut norms = Vec::with_capacity(model.config().num_layers);
-        for (attention, feed_forward) in model.layer_norms() {
+        let mut norms = Vec::with_capacity(layer_norms.len());
+        for (attention, feed_forward) in layer_norms {
             norms.push((upload(attention)?, upload(feed_forward)?));
         }
-        let final_norm = upload(model.final_norm_weights())?;
+        let final_norm = final_norm_weights.map(upload).transpose()?;
         Ok(Self {
-            _model: model,
             device,
             queue,
             pipeline,
@@ -386,8 +425,14 @@ impl<'a> MetalBackend<'a> {
             || step.layers.len() != cache.layers.len()
             || step.layers.len() != self.norms.len()
             || step.hidden.is_empty()
-            || step.final_norm.len() != step.hidden.len()
-            || step.output.cols() != step.hidden.len()
+            || step.final_norm.is_some() != step.output.is_some()
+            || step.final_norm.is_some() != self.final_norm.is_some()
+            || step
+                .final_norm
+                .is_some_and(|norm| norm.len() != step.hidden.len())
+            || step
+                .output
+                .is_some_and(|output| output.cols() != step.hidden.len())
             || !step.hidden.iter().all(|value| value.is_finite())
         {
             return Err(EngineError::InvalidConfig("Metal decoder dimensions"));
@@ -400,7 +445,6 @@ impl<'a> MetalBackend<'a> {
                 .ok_or_else(|| EngineError::Backend("Metal decoder buffer limit".into()))
         };
         let hidden_bytes = bytes(step.hidden.len())?;
-        let output_bytes = bytes(step.output.rows())?;
         let rotation_bytes = bytes(step.rotations.len())?;
         bytes(1)?;
         let hidden_input = self.device.new_buffer_with_data(
@@ -427,32 +471,32 @@ impl<'a> MetalBackend<'a> {
             hidden = next;
         }
 
-        let norm_params = NormParams {
-            count: u32::try_from(step.hidden.len())
-                .map_err(|_| EngineError::Backend("Metal hidden size too large".into()))?,
-            epsilon: step.epsilon,
-        };
-        let scale = self.device.new_buffer(
-            size_of::<f32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let normalized = self
-            .device
-            .new_buffer(hidden_bytes, MTLResourceOptions::StorageModeShared);
-        let scores = self
-            .device
-            .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
-        self.encode_norm(
-            command,
-            &hidden,
-            &self.final_norm,
-            &scale,
-            &normalized,
-            &norm_params,
-        );
-        let projection = command.new_compute_command_encoder();
-        self.encode_matrix(projection, step.output, &normalized, &scores)?;
-        projection.end_encoding();
+        let (result, result_len) =
+            if let (Some(output), Some(norm)) = (step.output, self.final_norm.as_ref()) {
+                let norm_params = NormParams {
+                    count: u32::try_from(step.hidden.len())
+                        .map_err(|_| EngineError::Backend("Metal hidden size too large".into()))?,
+                    epsilon: step.epsilon,
+                };
+                let scale = self.device.new_buffer(
+                    size_of::<f32>() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let normalized = self
+                    .device
+                    .new_buffer(hidden_bytes, MTLResourceOptions::StorageModeShared);
+                let scores = self
+                    .device
+                    .new_buffer(bytes(output.rows())?, MTLResourceOptions::StorageModeShared);
+                self.encode_norm(command, &hidden, norm, &scale, &normalized, &norm_params);
+                let projection = command.new_compute_command_encoder();
+                self.encode_matrix(projection, output, &normalized, &scores)?;
+                projection.end_encoding();
+                retained.extend([scale, normalized, hidden]);
+                (scores, output.rows())
+            } else {
+                (hidden, step.hidden.len())
+            };
 
         command.commit();
         command.wait_until_completed();
@@ -463,7 +507,7 @@ impl<'a> MetalBackend<'a> {
             )));
         }
         Ok(unsafe {
-            std::slice::from_raw_parts(scores.contents().cast::<f32>(), step.output.rows()).to_vec()
+            std::slice::from_raw_parts(result.contents().cast::<f32>(), result_len).to_vec()
         })
     }
 

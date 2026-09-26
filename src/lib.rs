@@ -5,7 +5,7 @@ mod loader;
 #[cfg(target_os = "macos")]
 mod metal_backend;
 #[cfg(target_os = "macos")]
-pub use metal_backend::MetalRuntime;
+pub use metal_backend::{MetalRuntime, MetalStageRuntime};
 mod model;
 pub mod pool;
 pub mod serving;
