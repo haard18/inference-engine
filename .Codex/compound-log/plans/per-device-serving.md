@@ -13,11 +13,14 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 - [x] Bound the waiting queue and per-response channel; report a full queue with HTTP 429.
 - [x] Stop producing output when a client disconnects and limit time spent waiting for a slow client.
 - [x] Test the service against a real Q4_K_M model and smoke-test the CLI over HTTP.
+- [x] Apply a deadline to queued and running requests, report HTTP 504 or a streaming timeout, and abandon expired queue entries.
+- [x] Continue serving after an ordinary model execution error; catch per-request panics and rebuild Metal state if needed.
+- [x] Report an overdue active worker as unavailable through health and new chat requests.
 
 ## Next layers
 
 - [ ] Measure throughput, latency, memory, and behavior under concurrent and disconnected clients.
-- [ ] Add request deadlines and worker recovery so a hung or failed calculation does not stall the serving process.
+- [ ] Isolate model calculations in a restartable worker process so a calculation that never returns cannot occupy the only worker indefinitely.
 - [ ] Add explicit owner-controlled pairing and encrypted transport before listening beyond loopback.
 - [ ] Route whole requests across paired devices with health and loss handling.
 - [ ] Reuse conversation state safely across requests and devices.

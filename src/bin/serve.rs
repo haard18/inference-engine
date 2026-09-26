@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::process;
+use std::time::Duration;
 
 use inference_engine::serving::{self, ServingBackend, ServingConfig};
 use inference_engine::{load_gguf, load_gguf_tokenizer};
@@ -39,6 +40,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             api_key,
             queue_capacity: 4,
             max_completion_tokens: 256,
+            request_timeout: Duration::from_secs(120),
             backend: if metal {
                 ServingBackend::Metal
             } else {

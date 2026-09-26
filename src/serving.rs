@@ -3,9 +3,9 @@
 use std::convert::Infallible;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, WWW_AUTHENTICATE};
@@ -30,6 +30,8 @@ use crate::{ByteBpeDecoder, ByteBpeTokenizer, GenerationSession, Model};
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 8;
 const SLOW_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
+const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServingBackend {
@@ -42,6 +44,7 @@ pub struct ServingConfig {
     pub api_key: String,
     pub queue_capacity: usize,
     pub max_completion_tokens: usize,
+    pub request_timeout: Duration,
     pub backend: ServingBackend,
 }
 
@@ -68,12 +71,55 @@ struct AppState {
     tokenizer: Arc<ByteBpeTokenizer>,
     max_positions: usize,
     max_completion_tokens: usize,
+    request_timeout: Duration,
+    worker_status: Arc<WorkerStatus>,
     requests: mpsc::Sender<Job>,
+}
+
+#[derive(Default)]
+struct WorkerStatus {
+    active_deadline: Mutex<Option<Instant>>,
+}
+
+impl WorkerStatus {
+    fn start(&self, deadline: Instant) {
+        if let Ok(mut active) = self.active_deadline.lock() {
+            *active = Some(deadline);
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut active) = self.active_deadline.lock() {
+            *active = None;
+        }
+    }
+
+    fn overdue(&self) -> bool {
+        self.active_deadline.lock().map_or(true, |active| {
+            active.is_some_and(|deadline| Instant::now() >= deadline)
+        })
+    }
+}
+
+struct ActiveJob(Arc<WorkerStatus>);
+
+impl ActiveJob {
+    fn new(status: Arc<WorkerStatus>, deadline: Instant) -> Self {
+        status.start(deadline);
+        Self(status)
+    }
+}
+
+impl Drop for ActiveJob {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
 }
 
 struct Job {
     prompt: Vec<usize>,
     max_tokens: usize,
+    deadline: Instant,
     output: mpsc::Sender<WorkerEvent>,
 }
 
@@ -85,11 +131,13 @@ enum WorkerEvent {
         completion_tokens: usize,
     },
     Failed(String),
+    TimedOut,
     End,
 }
 
 enum JobFailure {
     Execution(String),
+    Deadline,
     ClientGone,
 }
 
@@ -120,6 +168,15 @@ pub fn start(
     tokenizer: ByteBpeTokenizer,
     config: ServingConfig,
 ) -> Result<(Router, JoinHandle<()>), ServingError> {
+    let (state, worker) = start_state(model, tokenizer, config)?;
+    Ok((router(state), worker))
+}
+
+fn start_state(
+    model: Model,
+    tokenizer: ByteBpeTokenizer,
+    config: ServingConfig,
+) -> Result<(Arc<AppState>, JoinHandle<()>), ServingError> {
     if config.model_id.is_empty() {
         return Err(ServingError::Configuration("model ID is empty"));
     }
@@ -138,6 +195,12 @@ pub fn start(
             "maximum completion length must be between 1 and 4096",
         ));
     }
+    if config.request_timeout < MIN_REQUEST_TIMEOUT || config.request_timeout > MAX_REQUEST_TIMEOUT
+    {
+        return Err(ServingError::Configuration(
+            "request timeout must be between 10 milliseconds and 10 minutes",
+        ));
+    }
     #[cfg(not(target_os = "macos"))]
     if config.backend == ServingBackend::Metal {
         return Err(ServingError::Configuration("Metal requires macOS"));
@@ -147,15 +210,17 @@ pub fn start(
     let model = Arc::new(model);
     let tokenizer = Arc::new(tokenizer);
     let (sender, mut receiver) = mpsc::channel::<Job>(config.queue_capacity);
+    let worker_status = Arc::new(WorkerStatus::default());
     let (ready_sender, ready_receiver) = std_mpsc::sync_channel(1);
     let worker_model = Arc::clone(&model);
     let worker_tokenizer = Arc::clone(&tokenizer);
+    let worker_status_for_thread = Arc::clone(&worker_status);
     let mode = config.backend;
     let worker = thread::Builder::new()
         .name("inference-engine-worker".into())
         .spawn(move || {
             #[cfg(target_os = "macos")]
-            let metal = if mode == ServingBackend::Metal {
+            let mut metal = if mode == ServingBackend::Metal {
                 match MetalRuntime::new(&worker_model) {
                     Ok(runtime) => Some(runtime),
                     Err(error) => {
@@ -175,14 +240,15 @@ pub fn start(
                 if job.output.is_closed() {
                     continue;
                 }
-                #[cfg(target_os = "macos")]
-                let mut session = match metal.as_ref() {
-                    Some(runtime) => runtime.session(),
-                    None => GenerationSession::new(&worker_model),
-                };
-                #[cfg(not(target_os = "macos"))]
-                let mut session = GenerationSession::new(&worker_model);
+                let _active = ActiveJob::new(Arc::clone(&worker_status_for_thread), job.deadline);
                 let result = catch_unwind(AssertUnwindSafe(|| {
+                    #[cfg(target_os = "macos")]
+                    let mut session = match metal.as_ref() {
+                        Some(runtime) => runtime.session(),
+                        None => GenerationSession::new(&worker_model),
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let mut session = GenerationSession::new(&worker_model);
                     process_job(&job, &mut session, &worker_tokenizer, &handle)
                 }));
                 match result {
@@ -203,6 +269,11 @@ pub fn start(
                             let _ = send_event(&handle, &job.output, WorkerEvent::End);
                         }
                     }
+                    Ok(Err(JobFailure::Deadline)) => {
+                        if send_event(&handle, &job.output, WorkerEvent::TimedOut) {
+                            let _ = send_event(&handle, &job.output, WorkerEvent::End);
+                        }
+                    }
                     Ok(Err(JobFailure::ClientGone)) => {}
                     Err(_) => {
                         if send_event(
@@ -211,6 +282,15 @@ pub fn start(
                             WorkerEvent::Failed("inference worker panicked".into()),
                         ) {
                             let _ = send_event(&handle, &job.output, WorkerEvent::End);
+                        }
+                        #[cfg(target_os = "macos")]
+                        if mode == ServingBackend::Metal {
+                            match catch_unwind(AssertUnwindSafe(|| {
+                                MetalRuntime::new(&worker_model)
+                            })) {
+                                Ok(Ok(runtime)) => metal = Some(runtime),
+                                _ => break,
+                            }
                         }
                     }
                 }
@@ -227,9 +307,11 @@ pub fn start(
         tokenizer,
         max_positions: model.config().max_positions,
         max_completion_tokens: config.max_completion_tokens,
+        request_timeout: config.request_timeout,
+        worker_status,
         requests: sender,
     });
-    Ok((router(state), worker))
+    Ok((state, worker))
 }
 
 fn router(state: Arc<AppState>) -> Router {
@@ -254,15 +336,15 @@ fn process_job(
     tokenizer: &ByteBpeTokenizer,
     handle: &Handle,
 ) -> Result<(&'static str, usize), JobFailure> {
+    check_job(job)?;
     session
         .prefill(&job.prompt)
         .map_err(|error| JobFailure::Execution(error.to_string()))?;
+    check_job(job)?;
     let stop = ["<|im_end|>", "<|endoftext|>"].map(|token| tokenizer.special_token_id(token));
     let mut decoder = ByteBpeDecoder::new();
     for step in 0..job.max_tokens {
-        if job.output.is_closed() {
-            return Err(JobFailure::ClientGone);
-        }
+        check_job(job)?;
         let token = session
             .selected_token()
             .map_err(|error| JobFailure::Execution(error.to_string()))?;
@@ -290,6 +372,16 @@ fn process_job(
             .map_err(|error| JobFailure::Execution(error.to_string()))?;
     }
     Err(JobFailure::Execution("empty generation request".into()))
+}
+
+fn check_job(job: &Job) -> Result<(), JobFailure> {
+    if job.output.is_closed() {
+        Err(JobFailure::ClientGone)
+    } else if Instant::now() >= job.deadline {
+        Err(JobFailure::Deadline)
+    } else {
+        Ok(())
+    }
 }
 
 fn send_event(handle: &Handle, sender: &mpsc::Sender<WorkerEvent>, event: WorkerEvent) -> bool {
@@ -333,7 +425,7 @@ async fn authenticate(
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Response {
-    if state.requests.is_closed() {
+    if state.requests.is_closed() || state.worker_status.overdue() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "unavailable"})),
@@ -393,8 +485,17 @@ async fn chat_completions(
     let job = Job {
         prompt,
         max_tokens,
+        deadline: Instant::now() + state.request_timeout,
         output,
     };
+    let deadline = job.deadline;
+    if state.worker_status.overdue() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker_unavailable",
+            "the inference worker exceeded its deadline",
+        );
+    }
     match state.requests.try_send(job) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -414,7 +515,7 @@ async fn chat_completions(
     }
     if request.stream {
         let model_id = state.model_id.clone();
-        let stream = ReceiverStream::new(receiver).map(move |event| {
+        let stream = ReceiverStream::new(deadline_stream(receiver, deadline)).map(move |event| {
             Ok::<Event, Infallible>(
                 Event::default().data(stream_data(event, &id, created, &model_id)),
             )
@@ -427,8 +528,97 @@ async fn chat_completions(
             )
             .into_response()
     } else {
-        collect_response(receiver, &id, created, &state.model_id, prompt_tokens).await
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            collect_response(
+                receiver,
+                &id,
+                created,
+                &state.model_id,
+                prompt_tokens,
+                deadline,
+            ),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => timeout_response(),
+        }
     }
+}
+
+fn deadline_stream(
+    mut receiver: mpsc::Receiver<WorkerEvent>,
+    deadline: Instant,
+) -> mpsc::Receiver<WorkerEvent> {
+    let (sender, output) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        loop {
+            if Instant::now() >= deadline {
+                if send_stream_event(&sender, WorkerEvent::TimedOut, deadline).await {
+                    let _ = send_stream_event(&sender, WorkerEvent::End, deadline).await;
+                }
+                break;
+            }
+            let next = tokio::select! {
+                biased;
+                _ = sender.closed() => break,
+                result = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline), receiver.recv()
+                ) => result,
+            };
+            match next {
+                Ok(Some(event)) => {
+                    let terminal = matches!(
+                        event,
+                        WorkerEvent::Finished { .. }
+                            | WorkerEvent::Failed(_)
+                            | WorkerEvent::TimedOut
+                            | WorkerEvent::End
+                    );
+                    let end = matches!(event, WorkerEvent::End);
+                    if !send_stream_event(&sender, event, deadline).await {
+                        break;
+                    }
+                    if terminal {
+                        if !end {
+                            let _ = send_stream_event(&sender, WorkerEvent::End, deadline).await;
+                        }
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    if send_stream_event(
+                        &sender,
+                        WorkerEvent::Failed("inference worker closed the response".into()),
+                        deadline,
+                    )
+                    .await
+                    {
+                        let _ = send_stream_event(&sender, WorkerEvent::End, deadline).await;
+                    }
+                    break;
+                }
+                Err(_) => {
+                    if send_stream_event(&sender, WorkerEvent::TimedOut, deadline).await {
+                        let _ = send_stream_event(&sender, WorkerEvent::End, deadline).await;
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    output
+}
+
+async fn send_stream_event(
+    sender: &mpsc::Sender<WorkerEvent>,
+    event: WorkerEvent,
+    deadline: Instant,
+) -> bool {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), sender.send(event))
+        .await
+        .is_ok_and(|result| result.is_ok())
 }
 
 fn validate_request(
@@ -527,9 +717,13 @@ async fn collect_response(
     created: u64,
     model_id: &str,
     prompt_tokens: usize,
+    deadline: Instant,
 ) -> Response {
     let mut content = String::new();
     while let Some(event) = receiver.recv().await {
+        if Instant::now() >= deadline {
+            return timeout_response();
+        }
         match event {
             WorkerEvent::Started | WorkerEvent::End => {}
             WorkerEvent::Delta(text) => content.push_str(&text),
@@ -562,6 +756,7 @@ async fn collect_response(
                     &message,
                 )
             }
+            WorkerEvent::TimedOut => return timeout_response(),
         }
     }
     error_response(
@@ -590,8 +785,24 @@ fn stream_data(event: WorkerEvent, id: &str, created: u64, model_id: &str) -> St
             "error": {"message": message, "type": "server_error", "code": "inference_failed"}
         })
         .to_string(),
+        WorkerEvent::TimedOut => json!({
+            "error": {
+                "message": "request deadline exceeded",
+                "type": "server_error",
+                "code": "request_timeout"
+            }
+        })
+        .to_string(),
         WorkerEvent::End => "[DONE]".into(),
     }
+}
+
+fn timeout_response() -> Response {
+    error_response(
+        StatusCode::GATEWAY_TIMEOUT,
+        "request_timeout",
+        "request deadline exceeded",
+    )
 }
 
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
@@ -627,6 +838,43 @@ mod tests {
 
     const KEY: &str = "test-only-key-with-at-least-32-characters";
 
+    fn test_tokenizer() -> ByteBpeTokenizer {
+        let mut pieces = vec![
+            "<|im_start|>".to_owned(),
+            "<|im_end|>".to_owned(),
+            "<|endoftext|>".to_owned(),
+        ];
+        let mut types = vec![3, 3, 3];
+        for piece in [
+            "a", "s", "i", "t", "n", "u", "e", "r", "y", "h", "S", "Ċ", "Ġ",
+        ] {
+            pieces.push(piece.to_owned());
+            types.push(1);
+        }
+        ByteBpeTokenizer::from_gguf_parts(pieces, Vec::new(), types).unwrap()
+    }
+
+    fn stalled_app(timeout: Duration) -> (Router, mpsc::Receiver<Job>, Arc<WorkerStatus>) {
+        let tokenizer = test_tokenizer();
+        assert!(!tokenizer
+            .encode_plain_text("assistant\nSay hi")
+            .unwrap()
+            .is_empty());
+        let (sender, receiver) = mpsc::channel(1);
+        let worker_status = Arc::new(WorkerStatus::default());
+        let app = router(Arc::new(AppState {
+            model_id: "local-smollm2".into(),
+            api_key: KEY.as_bytes().to_vec(),
+            tokenizer: Arc::new(tokenizer),
+            max_positions: 2048,
+            max_completion_tokens: 4,
+            request_timeout: timeout,
+            worker_status: Arc::clone(&worker_status),
+            requests: sender,
+        }));
+        (app, receiver, worker_status)
+    }
+
     fn request(path: &str, body: Option<Value>, authorized: bool) -> Request<Body> {
         let mut builder = Request::builder().uri(path);
         if let Some(value) = body.as_ref() {
@@ -660,13 +908,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_requests_expire_for_json_and_streaming() {
+        let (app, mut jobs, _) = stalled_app(Duration::from_millis(25));
+        let response = app
+            .clone()
+            .oneshot(request("/v1/chat/completions", Some(chat(false)), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "request_timeout"
+        );
+        let expired = jobs.recv().await.unwrap();
+        assert!(expired.output.is_closed());
+        assert!(matches!(check_job(&expired), Err(JobFailure::ClientGone)));
+
+        let responder = tokio::spawn(async move {
+            let job = jobs.recv().await.unwrap();
+            job.output
+                .send(WorkerEvent::Delta("recovered".into()))
+                .await
+                .unwrap();
+            job.output
+                .send(WorkerEvent::Finished {
+                    reason: "length",
+                    completion_tokens: 1,
+                })
+                .await
+                .unwrap();
+        });
+        let response = app
+            .oneshot(request("/v1/chat/completions", Some(chat(false)), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["choices"][0]["message"]["content"],
+            "recovered"
+        );
+        responder.await.unwrap();
+
+        let (app, mut jobs, _) = stalled_app(Duration::from_millis(25));
+        let response = app
+            .oneshot(request("/v1/chat/completions", Some(chat(true)), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("\"code\":\"request_timeout\""));
+        assert!(text.contains("data: [DONE]"));
+        assert!(jobs.recv().await.unwrap().output.is_closed());
+    }
+
+    #[tokio::test]
+    async fn overdue_worker_fails_readiness_and_new_requests() {
+        let (app, _jobs, status) = stalled_app(Duration::from_secs(1));
+        status.start(Instant::now() - Duration::from_secs(1));
+        let response = app
+            .clone()
+            .oneshot(request("/health", None, false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = app
+            .clone()
+            .oneshot(request("/v1/chat/completions", Some(chat(false)), true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "worker_unavailable"
+        );
+        status.clear();
+        let response = app.oneshot(request("/health", None, false)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     #[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
     async fn authenticated_chat_streams_and_reports_overload() {
         let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
         let path = directory.join("SmolLM2-135M-Q4_K_M.gguf");
         let tokenizer = load_gguf_tokenizer(&path).unwrap();
         let model = load_gguf(&path).unwrap();
-        let (app, worker) = start(
+        let (state, worker) = start_state(
             model,
             tokenizer,
             ServingConfig {
@@ -674,10 +1007,25 @@ mod tests {
                 api_key: KEY.into(),
                 queue_capacity: 1,
                 max_completion_tokens: 4,
+                request_timeout: Duration::from_secs(30),
                 backend: ServingBackend::Cpu,
             },
         )
         .unwrap();
+
+        let (output, mut failed) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
+        state
+            .requests
+            .try_send(Job {
+                prompt: vec![usize::MAX],
+                max_tokens: 1,
+                deadline: Instant::now() + Duration::from_secs(30),
+                output,
+            })
+            .unwrap();
+        assert!(matches!(failed.recv().await, Some(WorkerEvent::Failed(_))));
+        assert!(matches!(failed.recv().await, Some(WorkerEvent::End)));
+        let app = router(state);
 
         let response = app
             .clone()
@@ -746,6 +1094,7 @@ mod tests {
             .try_send(Job {
                 prompt: vec![1],
                 max_tokens: 1,
+                deadline: Instant::now() + Duration::from_secs(30),
                 output,
             })
             .unwrap();
@@ -755,6 +1104,8 @@ mod tests {
             tokenizer: Arc::new(tokenizer),
             max_positions: 2048,
             max_completion_tokens: 4,
+            request_timeout: Duration::from_secs(30),
+            worker_status: Arc::new(WorkerStatus::default()),
             requests: sender,
         }));
         let response = saturated

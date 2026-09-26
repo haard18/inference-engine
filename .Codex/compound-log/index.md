@@ -17,6 +17,7 @@
 - [Mixed Q4_K_M checkpoint](learnings/2026-09-26-q4-k-m.md)
 - [Metal matrix execution](learnings/2026-09-26-metal-parity.md)
 - [Local serving](learnings/2026-09-26-local-serving.md)
+- [Request deadlines](learnings/2026-09-26-request-deadlines.md)
 
 ## Reviews
 
@@ -29,3 +30,4 @@
 - [Q4_K_M review](reviews/2026-09-26-q4-k-m.md)
 - [Metal review](reviews/2026-09-26-metal.md)
 - [Local serving review](reviews/2026-09-26-local-serving.md)
+- [Request deadline review](reviews/2026-09-26-request-deadlines.md)
