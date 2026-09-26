@@ -34,6 +34,19 @@ With llama.cpp commit `81bc6b83f827df746eb129235488d325c49cae52` and the local Q
 
 The CPU path runs independent output rows of large matrix operations across available CPU workers. In two alternating five-run Q4_K_M checks of the same eight-token prompt, median fresh-process time changed from 0.569 s to 0.311 s in the first check and from 0.579 s to 0.326 s in the second. Both versions produced the same output digest. A separate 12-request loopback API run with the updated worker completed every request at 1.72 requests/s, with 578 ms median response time. That server run had no paired old-server measurement. A post-run process-tree snapshot was 161,424 KiB; it is not a peak-memory measurement. These results are from one Mac and one small model.
 
+## Repeated local serving check
+
+Build the release server and benchmark, then run ordinary and streaming waves against a temporary loopback server:
+
+```sh
+cargo build --release --bin serve --bin pool-bench
+python3 scripts/local-soak.py /path/to/SmolLM2-135M-Q4_K_M.gguf \
+  --requests 30 --waves 4 --concurrency 2 --max-tokens 16
+# Add --metal to check the Mac GPU worker.
+```
+
+The tool creates a fresh local API key, checks every response and text digest, watches health and the worker process, samples memory for the server and worker, and stops both processes when done. It prints one JSON report. On one Mac, four CPU waves completed all 120 requests with one stable worker and a sampled process-tree maximum of 160,192 KiB. An eight-wave Metal run completed all 240 requests after an autorelease pool was added around each model step. The Metal worker's post-wave resident memory was 248,576 KiB after wave one and 248,384 KiB after wave eight. Before that fix, an eight-wave run's combined server and worker memory rose by 15,472 KiB from wave one to wave eight. The generated text digest stayed the same. Memory values are sampled process resident memory; short spikes between samples can be missed. These runs use one model, one prompt, and one physical Mac.
+
 ## Current milestone
 
 The Rust library runs a Llama-style decoder on the CPU, with an optional Metal path for matrix operations and attention on Macs. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, greedy token selection, and a byte-level BPE tokenizer for the supported SmolLM2 layout. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. It also loads the supported Llama-style GGUF layout with Q8_0 or mixed Q4_K_M matrices, interleaved rotary positions, and tokenizer metadata. Matrix weights retain their source precision in CPU memory, while activations and accumulations use f32. The command-line probes accept token IDs or text. A local server now offers an authenticated subset of the OpenAI chat completion API with ordinary and streaming responses.

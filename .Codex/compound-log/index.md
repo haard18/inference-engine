@@ -15,6 +15,7 @@
 - [One Metal command per token](plans/metal-token-command.md)
 - [Reviewable two-Mac comparison](plans/lan-comparison.md)
 - [CPU matrix-row execution](plans/cpu-matrix-rows.md)
+- [Repeated local serving check](plans/local-serving-soak.md)
 
 ## Learnings
 
@@ -54,6 +55,7 @@
 - [Reviewable LAN comparison](learnings/2026-09-26-lan-comparison.md)
 - [Measured llama.cpp reference](learnings/2026-09-26-llama-reference.md)
 - [Parallel CPU output rows](learnings/2026-09-26-cpu-matrix-rows.md)
+- [Metal worker memory under load](learnings/2026-09-26-metal-worker-memory.md)
 
 ## Reviews
 
@@ -91,3 +93,4 @@
 - [Metal token-command review](reviews/2026-09-26-metal-token-command.md)
 - [LAN comparison review](reviews/2026-09-26-lan-comparison.md)
 - [CPU output-row review](reviews/2026-09-26-cpu-matrix-rows.md)
+- [Local serving load review](reviews/2026-09-26-local-serving-soak.md)

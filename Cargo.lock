@@ -823,6 +823,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "metal",
+ "objc",
  "rayon",
  "rcgen",
  "rustls",

@@ -172,8 +172,12 @@ impl<'a> GenerationSession<'a> {
                 let mut backend = backend
                     .lock()
                     .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?;
-                self.model
-                    .forward_token_metal(token, &mut self.cache, cache, &mut backend)
+                // Long-lived workers need to drain Metal's temporary Objective-C objects
+                // after each token while retained cache and model buffers stay alive.
+                objc::rc::autoreleasepool(|| {
+                    self.model
+                        .forward_token_metal(token, &mut self.cache, cache, &mut backend)
+                })
             }
         }
     }
