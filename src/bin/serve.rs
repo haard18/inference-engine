@@ -35,6 +35,15 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             },
         );
     }
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--internal-stage-worker")
+    {
+        if args.len() != 5 {
+            return Err("invalid stage worker invocation".into());
+        }
+        return serving::run_stage_worker_stdio(&args[2], args[3].parse()?, args[4].parse()?);
+    }
     let mut index = 1;
     let metal = args
         .get(index)

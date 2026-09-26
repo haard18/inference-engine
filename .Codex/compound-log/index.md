@@ -29,6 +29,7 @@
 - [Decoder layer-range boundary](learnings/2026-09-26-layer-range-boundary.md)
 - [Selective model-stage loading](learnings/2026-09-26-selective-stage-loading.md)
 - [Activation frame boundary](learnings/2026-09-26-activation-frame.md)
+- [Separate model-stage processes](learnings/2026-09-26-stage-processes.md)
 
 ## Reviews
 
@@ -51,3 +52,4 @@
 - [Layer-range boundary review](reviews/2026-09-26-layer-range-boundary.md)
 - [Selective stage loading review](reviews/2026-09-26-selective-stage-loading.md)
 - [Activation frame review](reviews/2026-09-26-activation-frame.md)
+- [Stage process review](reviews/2026-09-26-stage-processes.md)

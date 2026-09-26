@@ -32,11 +32,13 @@ mod conversation;
 mod coordinator;
 mod isolated;
 mod peer;
+mod stage;
 use conversation::ConversationId;
 use coordinator::Coordinator;
 pub const CONVERSATION_HEADER: &str = conversation::HEADER;
 pub use isolated::{run_worker_stdio, start_isolated, start_isolated_paired};
 pub use peer::PeerServer;
+pub use stage::run_stage_worker_stdio;
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 8;

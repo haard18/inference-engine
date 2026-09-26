@@ -224,6 +224,14 @@ impl ModelStage {
         self.config.hidden_size
     }
 
+    pub fn max_positions(&self) -> usize {
+        self.config.max_positions
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
     pub fn stored_weight_bytes(&self) -> usize {
         let mut total = self
             .weights
