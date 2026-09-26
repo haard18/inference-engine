@@ -314,7 +314,7 @@ async fn serve_cli_binds_loopback_and_approved_peer_listener() {
 
 #[tokio::test]
 #[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
-async fn coordinator_uses_peer_after_local_worker_loss_and_reports_peer_loss() {
+async fn coordinator_routes_around_local_and_peer_loss_then_recovers() {
     let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
     let model = directory.join("SmolLM2-135M-Q4_K_M.gguf");
     let a_dir = tempfile::tempdir().unwrap();
@@ -422,6 +422,55 @@ async fn coordinator_uses_peer_after_local_worker_loss_and_reports_peer_loss() {
         .unwrap();
     let lost = local_a.clone().oneshot(request()).await.unwrap();
     assert_eq!(lost.status(), StatusCode::SERVICE_UNAVAILABLE);
+    tokio::time::timeout(Duration::from_secs(5), worker_b)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let restarted_listener = TcpListener::bind(b_address).unwrap();
+    let (local_b, peer_b, worker_b) = start_isolated_paired(
+        &model,
+        load_gguf_tokenizer(&model).unwrap(),
+        config(),
+        env!("CARGO_BIN_EXE_serve"),
+        &b,
+        &b_peers,
+    )
+    .await
+    .unwrap();
+    let restarted_handle = axum_server::Handle::new();
+    let restarted = tokio::spawn(peer_b.serve(restarted_listener, restarted_handle.clone()));
+    drop(local_b);
+    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = local_a.clone().oneshot(request()).await.unwrap();
+            if response.status() == StatusCode::OK {
+                break response;
+            }
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("pool did not route to the peer after it returned");
+    assert!(recovered
+        .headers()
+        .get(CONVERSATION_HEADER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with(&b.device_id));
+    let content = axum::body::to_bytes(recovered.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&content).contains("Say hi"));
+
+    restarted_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+    tokio::time::timeout(Duration::from_secs(5), restarted)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     drop(local_a);
     tokio::time::timeout(Duration::from_secs(5), worker_b)
         .await

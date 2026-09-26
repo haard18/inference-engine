@@ -20,4 +20,5 @@ Record a digest of completed text in both ordinary and streaming benchmark modes
 - [x] Add completed-text digests and successful-request latency to the benchmark.
 - [x] Add a comparison tool with repeated-trial and parity checks.
 - [x] Run a six-request ordinary and streaming real-model loopback smoke test; all requests completed and both modes produced the same digest.
+- [x] Verify peer loss and return in a real-model paired serving test while the local worker is down. The test checks unavailable responses during loss and confirms the restarted peer owns the recovered response.
 - [ ] Run repeated sustained trials and loss/recovery checks on two physical Macs. The second Mac's reachable SSH address and model path are not available yet.
