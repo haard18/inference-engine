@@ -15,7 +15,7 @@ use super::stage_peer::{StageChild, StageReady, StageStepError};
 use super::{
     check_job, router, validate_config, ActiveJob, AppState, Job, JobFailure, ServingBackend,
     ServingConfig, ServingError, StageCapacitySnapshot, WorkerEvent, WorkerStatus,
-    SLOW_CLIENT_TIMEOUT,
+    MAX_STAGE_BATCH_FRAMES, SLOW_CLIENT_TIMEOUT,
 };
 use crate::pool::client::PeerClient;
 use crate::pool::DeviceIdentity;
@@ -407,10 +407,27 @@ async fn run_job(
         (0, Vec::new())
     };
     let reused_prompt_tokens = position;
-    for &token in &job.prompt[position..] {
-        *prefix_touched = true;
-        scores = step(job, prefix, client, ready, *request_id, position, token).await?;
-        position += 1;
+    let frame_bytes = ready
+        .hidden_size
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(|| JobFailure::Execution("activation size overflows".into()))?;
+    let frames_per_batch = (MAX_FRAME_BYTES / frame_bytes).min(MAX_STAGE_BATCH_FRAMES);
+    if frames_per_batch == 0 {
+        return Err(JobFailure::Execution("activation exceeds limit".into()));
+    }
+    for tokens in job.prompt[position..].chunks(frames_per_batch) {
+        let batch_bytes = frame_bytes
+            .checked_mul(tokens.len())
+            .filter(|bytes| *bytes <= MAX_FRAME_BYTES)
+            .ok_or_else(|| JobFailure::Execution("activation batch exceeds limit".into()))?;
+        let mut frames = Vec::with_capacity(batch_bytes);
+        for &token in tokens {
+            *prefix_touched = true;
+            frames.extend(prefix_frame(job, prefix, ready, *request_id, position, token).await?);
+            position += 1;
+        }
+        scores = forward_suffix(job, client, frames, tokens.len(), *request_id, ready).await?;
     }
     let prompt_scores = scores.clone();
     let stop = ["<|im_end|>", "<|endoftext|>"].map(|token| tokenizer.special_token_id(token));
@@ -469,6 +486,18 @@ async fn step(
     position: usize,
     token: usize,
 ) -> Result<Vec<f32>, JobFailure> {
+    let frame = prefix_frame(job, prefix, ready, request_id, position, token).await?;
+    forward_suffix(job, client, frame, 1, request_id, ready).await
+}
+
+async fn prefix_frame(
+    job: &Job,
+    prefix: &mut StageChild,
+    ready: &StageReady,
+    request_id: Uuid,
+    position: usize,
+    token: usize,
+) -> Result<Vec<u8>, JobFailure> {
     check_job(job)?;
     let deadline = tokio::time::Instant::from_std(job.deadline);
     let frame = tokio::select! {
@@ -480,9 +509,22 @@ async fn step(
     };
     validate_frame(&frame, ready, request_id, position).map_err(JobFailure::Execution)?;
     check_job(job)?;
+    Ok(frame)
+}
+
+async fn forward_suffix(
+    job: &Job,
+    client: &PeerClient,
+    frames: Vec<u8>,
+    frame_count: usize,
+    request_id: Uuid,
+    ready: &StageReady,
+) -> Result<Vec<f32>, JobFailure> {
+    check_job(job)?;
+    let deadline = tokio::time::Instant::from_std(job.deadline);
     tokio::select! {
         _ = job.output.closed() => Err(JobFailure::ClientGone),
-        result = client.forward_stage(frame, request_id, ready.vocab_size, deadline) => {
+        result = client.forward_stage_batch(frames, frame_count, request_id, ready.vocab_size, deadline) => {
             result.map_err(|error| {
                 if Instant::now() >= job.deadline {
                     JobFailure::Deadline

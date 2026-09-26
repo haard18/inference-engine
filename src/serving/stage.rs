@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::serving::MAX_STAGE_BATCH_FRAMES;
 use crate::{load_gguf_stage, ActivationFrame, StageSession};
 
 const MAX_SESSIONS: usize = 8;
@@ -28,6 +29,8 @@ enum StageCommand {
     Activation {
         request_id: String,
         payload_bytes: usize,
+        #[serde(default = "one_frame")]
+        frame_count: usize,
     },
     Close {
         request_id: String,
@@ -69,6 +72,10 @@ enum StageEvent<'a> {
     Failed {
         message: &'a str,
     },
+}
+
+fn one_frame() -> usize {
+    1
 }
 
 struct SessionEntry<'a> {
@@ -158,8 +165,17 @@ pub fn run_stage_worker_stdio(
             StageCommand::Activation {
                 request_id,
                 payload_bytes,
+                frame_count,
             } => {
-                if !(64..=MAX_ACTIVATION_BYTES).contains(&payload_bytes) {
+                let frame_bytes = stage
+                    .hidden_size()
+                    .checked_mul(4)
+                    .and_then(|bytes| bytes.checked_add(64))
+                    .ok_or("stage activation size overflows")?;
+                if !(1..=MAX_STAGE_BATCH_FRAMES).contains(&frame_count)
+                    || frame_count.checked_mul(frame_bytes) != Some(payload_bytes)
+                    || payload_bytes > MAX_ACTIVATION_BYTES
+                {
                     return Err("invalid activation payload length".into());
                 }
                 let mut payload = vec![0; payload_bytes];
@@ -186,24 +202,27 @@ pub fn run_stage_worker_stdio(
                     checkpointed: false,
                 });
                 entry.checkpointed = false;
-                let result = entry
-                    .session
-                    .forward_frame(&payload, request_id)
-                    .map_err(|error| error.to_string())
-                    .and_then(|scores| {
-                        let size = scores
-                            .len()
-                            .checked_mul(4)
-                            .ok_or_else(|| "stage score size overflow".to_owned())?;
-                        if size > MAX_SCORE_BYTES {
-                            return Err("stage scores exceed response limit".into());
-                        }
-                        let mut bytes = Vec::with_capacity(scores.len() * 4);
-                        for score in scores {
-                            bytes.extend_from_slice(&score.to_le_bytes());
-                        }
-                        Ok(bytes)
-                    });
+                let result = (|| -> Result<Vec<u8>, String> {
+                    let mut scores = Vec::new();
+                    for frame in payload.chunks_exact(frame_bytes) {
+                        scores = entry
+                            .session
+                            .forward_frame(frame, request_id)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    let size = scores
+                        .len()
+                        .checked_mul(4)
+                        .ok_or_else(|| "stage score size overflow".to_owned())?;
+                    if size > MAX_SCORE_BYTES {
+                        return Err("stage scores exceed response limit".into());
+                    }
+                    let mut bytes = Vec::with_capacity(scores.len() * 4);
+                    for score in scores {
+                        bytes.extend_from_slice(&score.to_le_bytes());
+                    }
+                    Ok(bytes)
+                })();
                 finish_step(&mut sessions, request_id, result, &mut output, false)?;
             }
             StageCommand::Close { request_id } => {

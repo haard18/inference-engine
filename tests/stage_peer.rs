@@ -120,6 +120,76 @@ async fn approved_peer_runs_the_suffix_stage_with_real_model_parity() {
         .close_stage(id, tokio::time::Instant::now() + Duration::from_secs(5))
         .await
         .unwrap();
+    let batch_id = Uuid::new_v4();
+    let mut batch_prefix = StageSession::new(&prefix);
+    let mut batch_whole = GenerationSession::new(&model);
+    let mut batch = Vec::new();
+    for token in [1, 2, 3, 30] {
+        batch_whole.prefill(&[token]).unwrap();
+        let position = batch_prefix.position();
+        let hidden = batch_prefix.forward_token(token).unwrap();
+        batch.extend(
+            ActivationFrame::new(&prefix, batch_id, position, hidden)
+                .unwrap()
+                .encode(),
+        );
+    }
+    let scores = client
+        .forward_stage_batch(
+            batch,
+            4,
+            batch_id,
+            model.config().vocab_size,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scores, batch_whole.next_token_scores().unwrap());
+    assert_eq!(
+        client
+            .probe_stage(
+                batch_id,
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .unwrap(),
+        Some(4)
+    );
+    client
+        .close_stage(
+            batch_id,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let invalid_id = Uuid::new_v4();
+    let mut invalid_prefix = StageSession::new(&prefix);
+    let hidden = invalid_prefix.forward_token(1).unwrap();
+    let frame = ActivationFrame::new(&prefix, invalid_id, 0, hidden)
+        .unwrap()
+        .encode();
+    let mut invalid_batch = frame.clone();
+    invalid_batch.extend(frame);
+    assert!(client
+        .forward_stage_batch(
+            invalid_batch,
+            2,
+            invalid_id,
+            model.config().vocab_size,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        client
+            .probe_stage(
+                invalid_id,
+                tokio::time::Instant::now() + Duration::from_secs(5)
+            )
+            .await
+            .unwrap(),
+        None
+    );
     let mut active = Vec::new();
     for _ in 0..8 {
         let stage_id = Uuid::new_v4();

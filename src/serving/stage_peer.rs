@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 
-use super::ServingError;
+use super::{ServingError, MAX_STAGE_BATCH_FRAMES};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -33,6 +33,7 @@ const MAX_DEADLINE_MS: u64 = 120_000;
 const MAX_QUEUE: usize = 16;
 const REQUEST_ID_HEADER: &str = "x-inference-request-id";
 const DEADLINE_HEADER: &str = "x-inference-deadline-ms";
+const FRAME_COUNT_HEADER: &str = "x-inference-frame-count";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StageCapacitySnapshot {
@@ -248,7 +249,24 @@ async fn activation(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<([(&'static str, &'static str); 1], Vec<u8>), (StatusCode, String)> {
-    if !(64..=MAX_FRAME_BYTES).contains(&body.len()) {
+    let frame_count = match headers.get(FRAME_COUNT_HEADER) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or((StatusCode::BAD_REQUEST, "invalid frame count".into()))?,
+        None => 1,
+    };
+    let expected_frame_bytes = state
+        .expected
+        .hidden_size
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or((StatusCode::BAD_REQUEST, "invalid activation size".into()))?;
+    if !(1..=MAX_STAGE_BATCH_FRAMES).contains(&frame_count)
+        || frame_count.checked_mul(expected_frame_bytes) != Some(body.len())
+        || body.len() > MAX_FRAME_BYTES
+    {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid activation size".into(),
@@ -273,7 +291,8 @@ async fn activation(
     // Cancellation drops this child and discards any incomplete pipe response.
     let mut child =
         StageChildLease::new(worker.take().expect("worker started"), &state.worker_ready);
-    let result = tokio::time::timeout_at(deadline, child.child().step(request_id, &body)).await;
+    let result =
+        tokio::time::timeout_at(deadline, child.child().step(request_id, &body, frame_count)).await;
     match result {
         Ok(Ok(scores)) => {
             child.restore(&mut worker);
@@ -601,11 +620,17 @@ impl StageChild {
         }
     }
 
-    async fn step(&mut self, request_id: Uuid, body: &[u8]) -> Result<Vec<u8>, StageStepError> {
+    async fn step(
+        &mut self,
+        request_id: Uuid,
+        body: &[u8],
+        frame_count: usize,
+    ) -> Result<Vec<u8>, StageStepError> {
         let command = json!({
             "kind":"activation",
             "request_id":request_id.to_string(),
-            "payload_bytes":body.len()
+            "payload_bytes":body.len(),
+            "frame_count":frame_count
         });
         let mut line = serde_json::to_vec(&command)
             .map_err(|error| StageStepError::Broken(error.to_string()))?;
@@ -774,7 +799,7 @@ mod tests {
             .uri("/internal/stage/activation")
             .header(REQUEST_ID_HEADER, Uuid::new_v4().to_string())
             .header(DEADLINE_HEADER, "3000")
-            .body(Body::from(vec![0_u8; 64]))
+            .body(Body::from(vec![0_u8; 72]))
             .unwrap()
     }
 

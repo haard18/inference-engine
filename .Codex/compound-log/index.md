@@ -61,6 +61,7 @@
 - [Peer return after loss](learnings/2026-09-26-peer-return.md)
 - [Exact model identity in a pool](learnings/2026-09-26-model-identity.md)
 - [Short varied serving load](learnings/2026-09-26-varied-serving-load.md)
+- [Bounded split prompt batches](learnings/2026-09-26-split-prefill-batches.md)
 
 ## Reviews
 

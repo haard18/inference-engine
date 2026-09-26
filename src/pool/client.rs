@@ -21,7 +21,7 @@ use uuid::Uuid;
 use super::tls::{client_config, server_name};
 use super::{DeviceIdentity, PoolError, TrustedPeer};
 use crate::serving::CONVERSATION_HEADER;
-use crate::serving::{CapacitySnapshot, StageCapacitySnapshot};
+use crate::serving::{CapacitySnapshot, StageCapacitySnapshot, MAX_STAGE_BATCH_FRAMES};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -167,11 +167,27 @@ impl PeerClient {
         expected_vocab_size: usize,
         deadline: tokio::time::Instant,
     ) -> Result<Vec<f32>, PoolError> {
+        self.forward_stage_batch(frame, 1, request_id, expected_vocab_size, deadline)
+            .await
+    }
+
+    /// Send consecutive activations in one bounded request and return the final scores.
+    pub async fn forward_stage_batch(
+        &self,
+        frames: Vec<u8>,
+        frame_count: usize,
+        request_id: Uuid,
+        expected_vocab_size: usize,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<f32>, PoolError> {
         let expected_bytes = expected_vocab_size
             .checked_mul(4)
             .filter(|bytes| *bytes > 0 && *bytes <= MAX_STAGE_BYTES)
             .ok_or(PoolError::Invalid("stage vocabulary size is invalid"))?;
-        if !(64..=MAX_STAGE_BYTES).contains(&frame.len()) {
+        if !(1..=MAX_STAGE_BATCH_FRAMES).contains(&frame_count)
+            || frames.len() < frame_count * 64
+            || frames.len() > MAX_STAGE_BYTES
+        {
             return Err(PoolError::Invalid("stage activation size is invalid"));
         }
         let remaining = deadline
@@ -185,7 +201,8 @@ impl PeerClient {
             .header(CONTENT_TYPE, "application/octet-stream")
             .header("x-inference-request-id", request_id.to_string())
             .header("x-inference-deadline-ms", remaining_ms.to_string())
-            .body(Full::new(Bytes::from(frame)))
+            .header("x-inference-frame-count", frame_count.to_string())
+            .body(Full::new(Bytes::from(frames)))
             .map_err(|error| PoolError::Transport(error.to_string()))?;
         let response = match self.send(request, deadline).await {
             Ok(response) => response,

@@ -214,7 +214,7 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     )
     .await
     .unwrap();
-    let (whole_status, whole_body, _) = chat(whole, false).await;
+    let (whole_status, whole_body, _) = chat(whole.clone(), false).await;
     let (split_status, split_body, _) = chat(split.clone(), false).await;
     assert_eq!(whole_status, StatusCode::OK, "{whole_body}");
     assert_eq!(split_status, StatusCode::OK, "{split_body}");
@@ -222,6 +222,22 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     let split_json: Value = serde_json::from_str(&split_body).unwrap();
     assert_eq!(split_json["choices"], whole_json["choices"]);
     assert_eq!(split_json["usage"], whole_json["usage"]);
+    let long_prompt = "Moonlight reflects sunlight. ".repeat(12);
+    assert!(
+        load_gguf_tokenizer(&model)
+            .unwrap()
+            .encode_plain_text(&long_prompt)
+            .unwrap()
+            .len()
+            > 16
+    );
+    let long_messages = json!([{"role": "user", "content": long_prompt}]);
+    let (whole_status, _, whole_long) = conversation_chat(whole, long_messages.clone(), None).await;
+    let (split_status, _, split_long) = conversation_chat(split.clone(), long_messages, None).await;
+    assert_eq!(whole_status, StatusCode::OK);
+    assert_eq!(split_status, StatusCode::OK);
+    assert_eq!(split_long["choices"], whole_long["choices"]);
+    assert_eq!(split_long["usage"], whole_long["usage"]);
     let (stream_status, stream_body, stream_id) = chat(split.clone(), true).await;
     assert_eq!(stream_status, StatusCode::OK, "{stream_body}");
     assert!(stream_body.contains("data: [DONE]"));
