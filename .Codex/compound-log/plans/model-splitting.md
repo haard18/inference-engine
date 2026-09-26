@@ -25,4 +25,5 @@ Run one model across two approved owner-owned devices when it does not fit on on
 ## Progress
 
 - [x] Extract a layer-slice executor and isolate embedding and output projection. A local 15/15 layer boundary produced exactly the same next-token scores as the full path on the real Q4_K_M model. A two-layer fixture also checked multiple token positions and confirmed that a failed step does not commit any key/value state.
-- [ ] Load and own only each stage's weights and cache. The current parity test still uses one complete in-memory model, so it does not prove memory reduction or cross-device operation.
+- [x] Load and own only each stage's GGUF weights and key/value cache. A local real-model test checks score parity and stored-weight reduction for each stage. Cross-device operation and process resident-memory measurements remain open.
+- [ ] Define and carry a validated activation message between independently running stages.

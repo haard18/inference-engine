@@ -45,6 +45,31 @@ pub struct Model {
     weights: ModelWeights,
 }
 
+/// One end of a decoder divided at a layer boundary.
+#[derive(Clone, Debug)]
+pub struct ModelStage {
+    config: ModelConfig,
+    range: Range<usize>,
+    weights: StageWeights,
+    model_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StageWeights {
+    pub(crate) token_embeddings: Option<Matrix>,
+    pub(crate) layers: Vec<LayerWeights>,
+    pub(crate) final_norm: Option<Vec<f32>>,
+    pub(crate) output: Option<Matrix>,
+}
+
+/// Key/value state for the layers owned by one model stage.
+/// A caller must validate the stage pair before exchanging activations and discard
+/// both sessions if either stage fails during a split request.
+pub struct StageSession<'a> {
+    stage: &'a ModelStage,
+    cache: KvCache,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LayerCache {
     keys: Vec<Vec<f32>>,
@@ -100,6 +125,204 @@ impl KvCache {
             })
             .sum()
     }
+
+    fn commit(&mut self, keys: Vec<Vec<f32>>, values: Vec<Vec<f32>>) {
+        debug_assert_eq!(keys.len(), self.layers.len());
+        debug_assert_eq!(values.len(), self.layers.len());
+        for (layer, (key, value)) in self.layers.iter_mut().zip(keys.into_iter().zip(values)) {
+            layer.keys.push(key);
+            layer.values.push(value);
+        }
+        self.position += 1;
+    }
+}
+
+impl ModelStage {
+    pub(crate) fn new(
+        config: ModelConfig,
+        range: Range<usize>,
+        weights: StageWeights,
+        model_digest: [u8; 32],
+    ) -> Result<Self, EngineError> {
+        validate_config(&config)?;
+        if range.start >= range.end
+            || range.end > config.num_layers
+            || (range.start > 0 && range.end < config.num_layers)
+            || (range.start == 0 && range.end == config.num_layers)
+        {
+            return Err(EngineError::InvalidConfig(
+                "stage must be a proper prefix or suffix layer range",
+            ));
+        }
+        let prefix = range.start == 0;
+        let suffix = range.end == config.num_layers;
+        if weights.layers.len() != range.end - range.start
+            || weights.token_embeddings.is_some() != prefix
+            || weights.final_norm.is_some() != suffix
+            || weights.output.is_some() != suffix
+        {
+            return Err(EngineError::InvalidConfig("stage endpoint weights"));
+        }
+        if let Some(embeddings) = &weights.token_embeddings {
+            check_matrix(
+                "token embeddings",
+                embeddings,
+                config.vocab_size,
+                config.hidden_size,
+            )?;
+        }
+        if let Some(norm) = &weights.final_norm {
+            check_vector("final normalization", norm, config.hidden_size)?;
+        }
+        if let Some(output) = &weights.output {
+            check_matrix(
+                "output projection",
+                output,
+                config.vocab_size,
+                config.hidden_size,
+            )?;
+        }
+        validate_layer_weights(&config, &weights.layers)?;
+        Ok(Self {
+            config,
+            range,
+            weights,
+            model_digest,
+        })
+    }
+
+    pub fn layer_range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    pub fn model_digest(&self) -> [u8; 32] {
+        self.model_digest
+    }
+
+    pub fn validate_pair(prefix: &Self, suffix: &Self) -> Result<(), EngineError> {
+        if prefix.range.start != 0
+            || suffix.range.end != prefix.config.num_layers
+            || prefix.range.end != suffix.range.start
+            || prefix.model_digest != suffix.model_digest
+        {
+            return Err(EngineError::InvalidConfig(
+                "model stages must have the same model and adjacent layer ranges",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    pub fn stored_weight_bytes(&self) -> usize {
+        let mut total = self
+            .weights
+            .token_embeddings
+            .as_ref()
+            .map_or(0, Matrix::storage_bytes)
+            + self
+                .weights
+                .output
+                .as_ref()
+                .map_or(0, Matrix::storage_bytes)
+            + self
+                .weights
+                .final_norm
+                .as_ref()
+                .map_or(0, |norm| norm.len() * size_of::<f32>());
+        for layer in &self.weights.layers {
+            total += layer_weight_bytes(layer);
+        }
+        total
+    }
+}
+
+impl<'a> StageSession<'a> {
+    pub fn new(stage: &'a ModelStage) -> Self {
+        Self {
+            stage,
+            cache: KvCache::new(stage.weights.layers.len()),
+        }
+    }
+
+    pub fn position(&self) -> usize {
+        self.cache.position()
+    }
+
+    pub fn allocated_cache_bytes(&self) -> usize {
+        self.cache.allocated_bytes()
+    }
+
+    /// Run an input token through a prefix stage and return its hidden activation.
+    pub fn forward_token(&mut self, token_id: usize) -> Result<Vec<f32>, EngineError> {
+        if self.stage.range.start != 0 {
+            return Err(EngineError::InvalidConfig(
+                "token input requires a prefix stage",
+            ));
+        }
+        if token_id >= self.stage.config.vocab_size {
+            return Err(EngineError::InvalidToken(token_id));
+        }
+        if self.cache.position >= self.stage.config.max_positions {
+            return Err(EngineError::ContextFull);
+        }
+        let hidden = self
+            .stage
+            .weights
+            .token_embeddings
+            .as_ref()
+            .expect("validated prefix embedding")
+            .row(token_id)?;
+        let run = execute_layers(
+            &self.stage.config,
+            &self.stage.weights.layers,
+            &self.cache.layers,
+            self.cache.position,
+            hidden,
+            &mut cpu_multiply,
+        )?;
+        self.cache.commit(run.keys, run.values);
+        Ok(run.hidden)
+    }
+
+    /// Run a received activation through a suffix stage and return next-token scores.
+    pub fn forward_hidden(&mut self, hidden: Vec<f32>) -> Result<Vec<f32>, EngineError> {
+        if self.stage.range.end != self.stage.config.num_layers {
+            return Err(EngineError::InvalidConfig(
+                "score output requires a suffix stage",
+            ));
+        }
+        if self.cache.position >= self.stage.config.max_positions {
+            return Err(EngineError::ContextFull);
+        }
+        let run = execute_layers(
+            &self.stage.config,
+            &self.stage.weights.layers,
+            &self.cache.layers,
+            self.cache.position,
+            hidden,
+            &mut cpu_multiply,
+        )?;
+        let scores = project_logits(
+            &self.stage.config,
+            self.stage
+                .weights
+                .final_norm
+                .as_ref()
+                .expect("validated suffix final norm"),
+            self.stage
+                .weights
+                .output
+                .as_ref()
+                .expect("validated suffix output"),
+            &run.hidden,
+            &mut cpu_multiply,
+        )?;
+        self.cache.commit(run.keys, run.values);
+        Ok(scores)
+    }
 }
 
 impl Model {
@@ -144,15 +367,7 @@ impl Model {
             total += output.storage_bytes();
         }
         for layer in &self.weights.layers {
-            total += layer.attention_norm.len() * size_of::<f32>();
-            total += layer.feed_forward_norm.len() * size_of::<f32>();
-            total += layer.query.storage_bytes();
-            total += layer.key.storage_bytes();
-            total += layer.value.storage_bytes();
-            total += layer.attention_output.storage_bytes();
-            total += layer.gate.storage_bytes();
-            total += layer.up.storage_bytes();
-            total += layer.down.storage_bytes();
+            total += layer_weight_bytes(layer);
         }
         total
     }
@@ -210,15 +425,7 @@ impl Model {
 
         let logits = self.project_logits(&hidden, &mut multiply)?;
 
-        for (layer, (key, value)) in cache
-            .layers
-            .iter_mut()
-            .zip(new_keys.into_iter().zip(new_values))
-        {
-            layer.keys.push(key);
-            layer.values.push(value);
-        }
-        cache.position += 1;
+        cache.commit(new_keys, new_values);
         Ok(logits)
     }
 
@@ -231,22 +438,52 @@ impl Model {
         hidden: &[f32],
         multiply: &mut impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
     ) -> Result<Vec<f32>, EngineError> {
-        let normalized = rms_norm(
-            hidden,
-            &self.weights.final_norm,
-            self.config.rms_norm_epsilon,
-        )?;
         let output = self
             .weights
             .output
             .as_ref()
             .unwrap_or(&self.weights.token_embeddings);
-        let logits = multiply_one(multiply, output, &normalized)?;
-        if !logits.iter().all(|value| value.is_finite()) {
-            return Err(EngineError::InvalidValue("next-token scores"));
-        }
-        Ok(logits)
+        project_logits(
+            &self.config,
+            &self.weights.final_norm,
+            output,
+            hidden,
+            multiply,
+        )
     }
+}
+
+fn layer_weight_bytes(layer: &LayerWeights) -> usize {
+    (layer.attention_norm.len() + layer.feed_forward_norm.len()) * size_of::<f32>()
+        + layer.query.storage_bytes()
+        + layer.key.storage_bytes()
+        + layer.value.storage_bytes()
+        + layer.attention_output.storage_bytes()
+        + layer.gate.storage_bytes()
+        + layer.up.storage_bytes()
+        + layer.down.storage_bytes()
+}
+
+fn cpu_multiply(matrices: &[&Matrix], input: &[f32]) -> Result<Vec<Vec<f32>>, EngineError> {
+    matrices
+        .iter()
+        .map(|matrix| matrix.mul_vec(input))
+        .collect()
+}
+
+fn project_logits(
+    config: &ModelConfig,
+    final_norm: &[f32],
+    output: &Matrix,
+    hidden: &[f32],
+    multiply: &mut impl FnMut(&[&Matrix], &[f32]) -> Result<Vec<Vec<f32>>, EngineError>,
+) -> Result<Vec<f32>, EngineError> {
+    let normalized = rms_norm(hidden, final_norm, config.rms_norm_epsilon)?;
+    let scores = multiply_one(multiply, output, &normalized)?;
+    if !scores.iter().all(|value| value.is_finite()) {
+        return Err(EngineError::InvalidValue("next-token scores"));
+    }
+    Ok(scores)
 }
 
 fn execute_layers(
@@ -421,9 +658,6 @@ fn validate_config(config: &ModelConfig) -> Result<(), EngineError> {
 
 fn validate_weights(config: &ModelConfig, weights: &ModelWeights) -> Result<(), EngineError> {
     let hidden = config.hidden_size;
-    let intermediate = config.intermediate_size;
-    let head_size = hidden / config.num_attention_heads;
-    let kv_size = config.num_key_value_heads * head_size;
     check_matrix(
         "token embeddings",
         &weights.token_embeddings,
@@ -441,7 +675,18 @@ fn validate_weights(config: &ModelConfig, weights: &ModelWeights) -> Result<(), 
     if let Some(output) = &weights.output {
         check_matrix("output projection", output, config.vocab_size, hidden)?;
     }
-    for layer in &weights.layers {
+    validate_layer_weights(config, &weights.layers)
+}
+
+fn validate_layer_weights(
+    config: &ModelConfig,
+    layers: &[LayerWeights],
+) -> Result<(), EngineError> {
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let head_size = hidden / config.num_attention_heads;
+    let kv_size = config.num_key_value_heads * head_size;
+    for layer in layers {
         check_vector("attention normalization", &layer.attention_norm, hidden)?;
         check_matrix("query projection", &layer.query, hidden, hidden)?;
         check_matrix("key projection", &layer.key, kv_size, hidden)?;

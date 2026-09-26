@@ -1,7 +1,61 @@
 use std::env;
 use std::path::PathBuf;
 
-use inference_engine::{load_gguf, load_safetensors, ByteBpeTokenizer, GenerationSession};
+use inference_engine::{
+    load_gguf, load_gguf_stage, load_safetensors, ByteBpeTokenizer, GenerationSession, ModelStage,
+    StageSession,
+};
+
+#[test]
+#[ignore = "requires Q4_K_M and Q8_0 SmolLM2 GGUF files in SMOLLM2_DIR"]
+fn q4_k_model_stages_own_partial_weights_and_match_full_scores() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let path = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let model = load_gguf(&path).expect("load complete model");
+    let full_bytes = model.stored_weight_bytes();
+    let prefix = load_gguf_stage(&path, 0..15).expect("load prefix stage");
+    let suffix = load_gguf_stage(&path, 15..30).expect("load suffix stage");
+    ModelStage::validate_pair(&prefix, &suffix).expect("matching stages");
+    assert_eq!(prefix.layer_range(), 0..15);
+    assert_eq!(suffix.layer_range(), 15..30);
+    assert_eq!(prefix.hidden_size(), 576);
+    assert!(prefix.stored_weight_bytes() < full_bytes);
+    assert!(suffix.stored_weight_bytes() < full_bytes);
+    println!(
+        "stored weight bytes: full={full_bytes}, prefix={}, suffix={}",
+        prefix.stored_weight_bytes(),
+        suffix.stored_weight_bytes()
+    );
+
+    let mut whole = GenerationSession::new(&model);
+    let mut first = StageSession::new(&prefix);
+    let mut second = StageSession::new(&suffix);
+    assert!(first.forward_hidden(vec![0.0; 576]).is_err());
+    assert!(second.forward_token(1).is_err());
+    assert_eq!(first.position(), 0);
+    assert_eq!(second.position(), 0);
+    for token in [1, 2, 3, 30] {
+        whole.prefill(&[token]).unwrap();
+        let hidden = first.forward_token(token).unwrap();
+        assert_eq!(hidden.len(), 576);
+        let actual = second.forward_hidden(hidden).unwrap();
+        assert_eq!(actual, whole.next_token_scores().unwrap());
+        assert_eq!(first.position(), whole.position());
+        assert_eq!(second.position(), whole.position());
+    }
+    assert!(second.forward_hidden(vec![0.0; 575]).is_err());
+    assert!(second.forward_hidden(vec![f32::NAN; 576]).is_err());
+    assert_eq!(second.position(), 4);
+    assert!(first.allocated_cache_bytes() > 0);
+    assert!(second.allocated_cache_bytes() > 0);
+    assert!(load_gguf_stage(&path, 0..30).is_err());
+    assert!(load_gguf_stage(&path, 10..20).is_err());
+    let wrong_boundary = load_gguf_stage(&path, 14..30).unwrap();
+    assert!(ModelStage::validate_pair(&prefix, &wrong_boundary).is_err());
+    let wrong_model = load_gguf_stage(directory.join("SmolLM2-135M-Q8_0.gguf"), 15..30)
+        .expect("load a different model variant");
+    assert!(ModelStage::validate_pair(&prefix, &wrong_model).is_err());
+}
 
 #[test]
 #[ignore = "requires SmolLM2-135M-Q8_0.gguf in SMOLLM2_DIR"]

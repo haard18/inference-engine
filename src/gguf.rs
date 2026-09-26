@@ -2,13 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::Path;
 
 use half::{bf16, f16};
+use sha2::{Digest, Sha256};
 
+use crate::model::StageWeights;
 use crate::{
-    ByteBpeTokenizer, EngineError, LayerWeights, Matrix, Model, ModelConfig, ModelWeights,
-    TokenizerError,
+    ByteBpeTokenizer, EngineError, LayerWeights, Matrix, Model, ModelConfig, ModelStage,
+    ModelWeights, TokenizerError,
 };
 
 const MAX_STRING_BYTES: u64 = 16_000_000;
@@ -82,6 +85,92 @@ struct GgufReader {
 /// Load the supported Llama-style GGUF layout, retaining Q8_0 matrices in block form.
 pub fn load_gguf(path: impl AsRef<Path>) -> Result<Model, GgufError> {
     let mut source = GgufReader::open(path, false)?;
+    let config = read_model_config(&source)?;
+    let mut layers = Vec::with_capacity(config.num_layers);
+    for index in 0..config.num_layers {
+        layers.push(read_layer(&mut source, index)?);
+    }
+    let output = if source.tensors.contains_key("output.weight") {
+        Some(source.matrix("output.weight")?)
+    } else {
+        None
+    };
+    let weights = ModelWeights {
+        token_embeddings: source.matrix("token_embd.weight")?,
+        layers,
+        final_norm: source.vector("output_norm.weight")?,
+        output,
+    };
+    Model::new(config, weights).map_err(GgufError::from)
+}
+
+/// Load only one proper prefix or suffix range of a supported GGUF model.
+pub fn load_gguf_stage(
+    path: impl AsRef<Path>,
+    range: Range<usize>,
+) -> Result<ModelStage, GgufError> {
+    let path = path.as_ref();
+    let mut source = GgufReader::open(path, false)?;
+    let config = read_model_config(&source)?;
+    if range.start >= range.end
+        || range.end > config.num_layers
+        || (range.start > 0 && range.end < config.num_layers)
+        || (range.start == 0 && range.end == config.num_layers)
+    {
+        return Err(GgufError::Invalid(
+            "stage must be a proper prefix or suffix layer range".into(),
+        ));
+    }
+    let mut layers = Vec::with_capacity(range.end - range.start);
+    for index in range.clone() {
+        layers.push(read_layer(&mut source, index)?);
+    }
+    let prefix = range.start == 0;
+    let suffix = range.end == config.num_layers;
+    let token_embeddings = if prefix {
+        Some(source.matrix("token_embd.weight")?)
+    } else {
+        None
+    };
+    let final_norm = if suffix {
+        Some(source.vector("output_norm.weight")?)
+    } else {
+        None
+    };
+    let output = if suffix {
+        Some(if source.tensors.contains_key("output.weight") {
+            source.matrix("output.weight")?
+        } else {
+            source.matrix("token_embd.weight")?
+        })
+    } else {
+        None
+    };
+    let weights = StageWeights {
+        token_embeddings,
+        layers,
+        final_norm,
+        output,
+    };
+    let digest = file_digest(&mut source.file)?;
+    ModelStage::new(config, range, weights, digest).map_err(GgufError::from)
+}
+
+fn file_digest(file: &mut File) -> Result<[u8; 32], GgufError> {
+    file.rewind()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn read_model_config(source: &GgufReader) -> Result<ModelConfig, GgufError> {
     if source.string("general.architecture")? != "llama" {
         return Err(GgufError::Unsupported("model architecture".into()));
     }
@@ -124,33 +213,22 @@ pub fn load_gguf(path: impl AsRef<Path>) -> Result<Model, GgufError> {
         rope_theta: source.float("llama.rope.freq_base")?,
         rope_interleaved: true,
     };
-    let mut layers = Vec::with_capacity(config.num_layers);
-    for index in 0..config.num_layers {
-        let prefix = format!("blk.{index}");
-        layers.push(LayerWeights {
-            attention_norm: source.vector(&format!("{prefix}.attn_norm.weight"))?,
-            query: source.matrix(&format!("{prefix}.attn_q.weight"))?,
-            key: source.matrix(&format!("{prefix}.attn_k.weight"))?,
-            value: source.matrix(&format!("{prefix}.attn_v.weight"))?,
-            attention_output: source.matrix(&format!("{prefix}.attn_output.weight"))?,
-            feed_forward_norm: source.vector(&format!("{prefix}.ffn_norm.weight"))?,
-            gate: source.matrix(&format!("{prefix}.ffn_gate.weight"))?,
-            up: source.matrix(&format!("{prefix}.ffn_up.weight"))?,
-            down: source.matrix(&format!("{prefix}.ffn_down.weight"))?,
-        });
-    }
-    let output = if source.tensors.contains_key("output.weight") {
-        Some(source.matrix("output.weight")?)
-    } else {
-        None
-    };
-    let weights = ModelWeights {
-        token_embeddings: source.matrix("token_embd.weight")?,
-        layers,
-        final_norm: source.vector("output_norm.weight")?,
-        output,
-    };
-    Model::new(config, weights).map_err(GgufError::from)
+    Ok(config)
+}
+
+fn read_layer(source: &mut GgufReader, index: usize) -> Result<LayerWeights, GgufError> {
+    let prefix = format!("blk.{index}");
+    Ok(LayerWeights {
+        attention_norm: source.vector(&format!("{prefix}.attn_norm.weight"))?,
+        query: source.matrix(&format!("{prefix}.attn_q.weight"))?,
+        key: source.matrix(&format!("{prefix}.attn_k.weight"))?,
+        value: source.matrix(&format!("{prefix}.attn_v.weight"))?,
+        attention_output: source.matrix(&format!("{prefix}.attn_output.weight"))?,
+        feed_forward_norm: source.vector(&format!("{prefix}.ffn_norm.weight"))?,
+        gate: source.matrix(&format!("{prefix}.ffn_gate.weight"))?,
+        up: source.matrix(&format!("{prefix}.ffn_up.weight"))?,
+        down: source.matrix(&format!("{prefix}.ffn_down.weight"))?,
+    })
 }
 
 /// Load the supported SmolLM byte-level BPE tokenizer from GGUF metadata.
