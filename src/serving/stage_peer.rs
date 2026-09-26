@@ -48,22 +48,22 @@ pub struct StageCapacitySnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-struct StageReady {
+pub(super) struct StageReady {
     kind: String,
-    model_digest: String,
-    layer_start: usize,
-    layer_end: usize,
-    hidden_size: usize,
-    vocab_size: usize,
-    max_positions: usize,
+    pub(super) model_digest: String,
+    pub(super) layer_start: usize,
+    pub(super) layer_end: usize,
+    pub(super) hidden_size: usize,
+    pub(super) vocab_size: usize,
+    pub(super) max_positions: usize,
     stored_weight_bytes: usize,
 }
 
-struct StageChild {
+pub(super) struct StageChild {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
-    ready: StageReady,
+    pub(super) ready: StageReady,
 }
 
 struct StageState {
@@ -341,13 +341,13 @@ fn deadline(headers: &HeaderMap) -> Result<tokio::time::Instant, (StatusCode, St
     Ok(tokio::time::Instant::now() + Duration::from_millis(millis))
 }
 
-enum StageStepError {
+pub(super) enum StageStepError {
     Rejected(String),
     Broken(String),
 }
 
 impl StageChild {
-    async fn spawn(
+    pub(super) async fn spawn(
         executable: &Path,
         model_path: &Path,
         start: usize,
@@ -395,6 +395,70 @@ impl StageChild {
             output,
             ready,
         })
+    }
+
+    pub(super) fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    pub(super) async fn token(
+        &mut self,
+        request_id: Uuid,
+        token_id: usize,
+    ) -> Result<Vec<u8>, StageStepError> {
+        let command = json!({
+            "kind": "token",
+            "request_id": request_id.to_string(),
+            "token_id": token_id,
+        });
+        let mut line = serde_json::to_vec(&command)
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        line.push(b'\n');
+        self.input
+            .write_all(&line)
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        self.input
+            .flush()
+            .await
+            .map_err(|error| StageStepError::Broken(error.to_string()))?;
+        let reply = self.read_reply().await?;
+        match reply["kind"].as_str() {
+            Some("failed") => Err(StageStepError::Rejected(
+                reply["message"]
+                    .as_str()
+                    .unwrap_or("stage rejected token")
+                    .into(),
+            )),
+            Some("activation") => {
+                let size = reply["payload_bytes"]
+                    .as_u64()
+                    .and_then(|size| usize::try_from(size).ok())
+                    .ok_or_else(|| {
+                        StageStepError::Broken("stage omitted activation size".into())
+                    })?;
+                let expected = self
+                    .ready
+                    .hidden_size
+                    .checked_mul(4)
+                    .and_then(|size| size.checked_add(64))
+                    .ok_or_else(|| StageStepError::Broken("activation size overflows".into()))?;
+                if size != expected || size > MAX_FRAME_BYTES {
+                    return Err(StageStepError::Broken(
+                        "stage activation size is invalid".into(),
+                    ));
+                }
+                let mut frame = vec![0; size];
+                self.output
+                    .read_exact(&mut frame)
+                    .await
+                    .map_err(|error| StageStepError::Broken(error.to_string()))?;
+                Ok(frame)
+            }
+            _ => Err(StageStepError::Broken(
+                "stage sent an invalid response".into(),
+            )),
+        }
     }
 
     async fn step(&mut self, request_id: Uuid, body: &[u8]) -> Result<Vec<u8>, StageStepError> {
@@ -452,7 +516,7 @@ impl StageChild {
         }
     }
 
-    async fn close(&mut self, request_id: Uuid) -> Result<(), StageStepError> {
+    pub(super) async fn close(&mut self, request_id: Uuid) -> Result<(), StageStepError> {
         let command = json!({"kind":"close","request_id":request_id.to_string()});
         let mut line = serde_json::to_vec(&command)
             .map_err(|error| StageStepError::Broken(error.to_string()))?;

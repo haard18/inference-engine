@@ -8,7 +8,7 @@ A Rust inference engine for language models on user-owned devices. The engine lo
 - **Model input:** Safetensors with separate configuration and GGUF with Q8_0 or mixed Q4_K_M matrix weights. A project-owned byte-level BPE tokenizer reads the supported SmolLM2 layout from JSON or GGUF metadata.
 - **Device backends:** A 32-bit CPU path checks numerical correctness. CPU execution keeps f16, bf16, Q8_0, Q5_0, and Q4_K matrix weights compact while accumulating in f32. On macOS, a reusable Metal runtime uploads matrix weights once and runs matrix operations on the GPU; attention and the KV cache still run on the CPU.
 - **Serving:** A per-device server exposes an authenticated, streaming chat API. It limits queues and memory use and reports overload clearly. The server keeps inference in a child process that it can replace after a timeout or process failure.
-- **Device pool:** Each device has a stable certificate. An owner approves another device by checking its certificate fingerprint. Mutual TLS allows only approved certificates to use a peer API on the local worker. A coordinator checks each worker's available queue space and routes complete requests to a suitable peer when that peer has less work or the local worker is unavailable. Conversation IDs keep follow-ups on the device that owns their cached prompt. Model splitting is the next layer under development.
+- **Device pool:** Each device has a stable certificate. An owner approves another device by checking its certificate fingerprint. Mutual TLS allows only approved certificates to use a peer API on the local worker. A coordinator checks each worker's available queue space and routes complete requests to a suitable peer when that peer has less work or the local worker is unavailable. Conversation IDs keep follow-ups on the device that owns their cached prompt. A separate split mode serves one chat request through a local prefix and an approved remote suffix.
 
 The first real checkpoint target is SmolLM2-135M. We will carry one model family through the engine and serving layers before adding another family. llama.cpp is a reference and benchmark, not the implementation blueprint. We will measure performance and reliability before making comparative claims.
 
@@ -127,4 +127,15 @@ cargo run --release --bin serve -- \
   /path/to/SmolLM2-135M-Q4_K_M.gguf 15 30
 ```
 
-The endpoint starts a partial-weight child process. It reports stage capacity and accepts bounded activation frames only from approved certificates. A real-model test sent four activations over mutual TLS and got the same scores as the complete model. It also rejected an unapproved certificate and a wrong request ID. Each remote step has a remaining-deadline header; a timed-out or canceled step discards its child process before another request can use it. The local chat API does not yet select this remote suffix automatically.
+The endpoint starts a partial-weight child process. It reports stage capacity and accepts bounded activation frames only from approved certificates. A real-model test sent four activations over mutual TLS and got the same scores as the complete model. It also rejected an unapproved certificate and a wrong request ID. Each remote step has a remaining-deadline header; a timed-out or canceled step discards its child process before another request can use it.
+
+On the prefix device, use the approved suffix device ID and the same GGUF model file. The saved address for that suffix device must point to its stage service port. Set a local API key with at least 32 visible ASCII characters:
+
+```sh
+INFERENCE_API_KEY='replace-with-a-long-random-secret' \
+  cargo run --release --bin serve -- \
+  --split-prefix /path/to/device-state SUFFIX_DEVICE_ID \
+  /path/to/SmolLM2-135M-Q4_K_M.gguf 15 8080
+```
+
+The loopback API then accepts the same `/v1/chat/completions` requests as a complete worker, including streaming. It checks model identity and stage capacity before each request, uses one request deadline for every token step, and ends generation if either stage fails. It sends bounded cache-close calls to both stages after each request; an unreachable suffix may retain cache state until its idle timeout. This mode currently uses CPU stage execution and recomputes each new chat request from its supplied message history; conversation cache reuse across split requests is not implemented yet. A one-host, two-process test confirms ordinary and streaming output parity with the complete model and checks suffix loss. Tests on two physical Macs and sustained performance measurements remain open.

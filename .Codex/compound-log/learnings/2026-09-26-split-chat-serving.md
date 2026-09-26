@@ -1,0 +1,11 @@
+# 2026-09-26 - Split chat serving
+
+The normal local chat API now has a split mode. Its prefix child loads only layers 0 through the chosen boundary. An explicitly approved suffix device runs the remaining layers behind mutual TLS. The prefix server keeps authentication, tokenization, bounded admission, response formatting, and streaming in the existing serving path.
+
+At startup and before each chat request, the prefix checks that the suffix is ready, has queue space, and announces the same GGUF digest, adjacent layer range, hidden width, vocabulary size, and context length. Each token goes through the local prefix process and then the remote suffix. The token step uses the chat request's original deadline. The prefix validates each activation's version, model, request ID, position, width, and finite hidden values before sending it. Greedy token selection and byte decoding follow the complete-model worker's behavior.
+
+The suffix endpoint enforces its own bounded queue. If the suffix disappears during generation, the request ends with an error and no token is replayed on another worker. If the local prefix step fails or is canceled, the supervisor drops and replaces its child before reuse. Both stages receive a bounded session-close call after a request. A failed close does not turn already completed output into a failure.
+
+A real Q4_K_M test ran a 15/15 split on one host through mutually authenticated TLS. Its ordinary chat output and usage matched the complete worker; streaming content matched the ordinary split response. The test also rejected a nonadjacent stage pair and killed the suffix after streamed text, observing an error and stream terminator. The full release test run passed 55 tests, including all real-model tests. Clippy passed with warnings denied.
+
+Limits: this is a one-host integration test, not a two-physical-Mac result. Split mode currently uses CPU stages and recomputes each new request from the full message history. It does not retain cross-request conversation cache state. The capacity snapshot is a point-in-time admission hint; the suffix still makes the final bounded admission decision for each activation. Sustained throughput, first-token latency, peak resident memory, and recovery under repeated link failures still need measurement.

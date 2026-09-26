@@ -31,6 +31,7 @@
 - [Activation frame boundary](learnings/2026-09-26-activation-frame.md)
 - [Separate model-stage processes](learnings/2026-09-26-stage-processes.md)
 - [Approved remote suffix stage](learnings/2026-09-26-remote-stage.md)
+- [Split chat serving](learnings/2026-09-26-split-chat-serving.md)
 
 ## Reviews
 
@@ -55,3 +56,4 @@
 - [Activation frame review](reviews/2026-09-26-activation-frame.md)
 - [Stage process review](reviews/2026-09-26-stage-processes.md)
 - [Remote stage review](reviews/2026-09-26-remote-stage.md)
+- [Split chat serving review](reviews/2026-09-26-split-chat-serving.md)

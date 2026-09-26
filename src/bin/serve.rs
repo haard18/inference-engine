@@ -5,6 +5,7 @@ use std::process;
 use std::time::Duration;
 
 use inference_engine::load_gguf_tokenizer;
+use inference_engine::pool::client::PeerClient;
 use inference_engine::pool::{DeviceIdentity, PeerStore};
 use inference_engine::serving::{self, ServingBackend, ServingConfig};
 use tokio::task::JoinSet;
@@ -85,6 +86,65 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 running.await??;
             }
         }
+        return Ok(());
+    }
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == "--split-prefix")
+    {
+        if args.len() < 6 || args.len() > 7 {
+            return Err(format!(
+                "usage: {} --split-prefix STATE_DIR SUFFIX_DEVICE_ID MODEL_GGUF SPLIT_LAYER [LOCAL_PORT]",
+                args[0]
+            )
+            .into());
+        }
+        let identity = DeviceIdentity::load(&args[2])?;
+        let peers = PeerStore::load(&args[2])?;
+        let peer = peers
+            .peers()
+            .iter()
+            .find(|peer| peer.device_id == args[3])
+            .ok_or("suffix device is not approved")?;
+        let client = PeerClient::new(&identity, peer.clone())?;
+        let port = args
+            .get(6)
+            .map(|value| value.parse::<u16>())
+            .transpose()?
+            .unwrap_or(8080);
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).await?;
+        let api_key = env::var("INFERENCE_API_KEY")
+            .map_err(|_| "set INFERENCE_API_KEY to a secret with at least 32 visible characters")?;
+        let config = ServingConfig {
+            model_id: "local-smollm2".into(),
+            api_key,
+            queue_capacity: 4,
+            max_completion_tokens: 256,
+            request_timeout: Duration::from_secs(120),
+            backend: ServingBackend::Cpu,
+        };
+        let tokenizer = load_gguf_tokenizer(&args[4])?;
+        let (router, worker) = serving::start_split_prefix(
+            &args[4],
+            tokenizer,
+            config,
+            env::current_exe()?,
+            args[5].parse()?,
+            &identity,
+            client,
+        )
+        .await?;
+        println!(
+            "Serving split local-smollm2 at http://{}",
+            listener.local_addr()?
+        );
+        let mut server = tokio::spawn(async move { axum::serve(listener, router).await });
+        tokio::select! {
+            result = &mut server => result??,
+            _ = tokio::signal::ctrl_c() => server.abort(),
+        }
+        worker.abort();
         return Ok(());
     }
     let mut index = 1;
