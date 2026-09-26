@@ -13,6 +13,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
@@ -29,6 +30,7 @@ struct Sample {
     first_content: Option<Duration>,
     completed: bool,
     stream_error: Option<String>,
+    completion_digest: Option<String>,
 }
 
 #[tokio::main]
@@ -111,12 +113,14 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let elapsed = started.elapsed();
     let mut latencies = samples
         .iter()
+        .filter(|sample| sample.completed)
         .map(|sample| sample.latency.as_secs_f64() * 1000.0)
         .collect::<Vec<_>>();
     latencies.sort_by(f64::total_cmp);
     let mut owners = BTreeMap::<String, usize>::new();
     let mut statuses = BTreeMap::<String, usize>::new();
     let mut application_errors = BTreeMap::<String, usize>::new();
+    let mut completion_digests = BTreeMap::<String, usize>::new();
     let mut completion_tokens = 0usize;
     let mut first_content = Vec::new();
     for sample in &samples {
@@ -131,6 +135,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         if sample.completed {
             completion_tokens += sample.completion_tokens;
+            if let Some(digest) = &sample.completion_digest {
+                *completion_digests.entry(digest.clone()).or_default() += 1;
+            }
             if let Some(time) = sample.first_content {
                 first_content.push(time.as_secs_f64() * 1000.0);
             }
@@ -141,14 +148,18 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!(
         "{}",
         json!({
+            "schema_version": 1,
             "endpoint": address.to_string(),
             "model": model_id,
             "mode": if streaming { "stream" } else { "ordinary" },
             "requested": requests,
             "concurrency": concurrency,
+            "max_completion_tokens": max_tokens,
+            "warmup_requests": 2,
             "successful": successful,
             "transport_failures": failures,
             "application_errors": application_errors,
+            "completion_digests": completion_digests,
             "http_statuses": statuses,
             "requests_by_device": owners,
             "elapsed_seconds": elapsed.as_secs_f64(),
@@ -171,6 +182,7 @@ struct StreamState {
     finished: bool,
     done: bool,
     error: Option<String>,
+    digest: Sha256,
 }
 
 impl StreamState {
@@ -203,11 +215,11 @@ impl StreamState {
                     continue;
                 }
                 let choice = &value["choices"][0];
-                if choice["delta"]["content"]
-                    .as_str()
-                    .is_some_and(|content| !content.is_empty())
-                {
-                    self.first_content.get_or_insert(elapsed);
+                if let Some(content) = choice["delta"]["content"].as_str() {
+                    if !content.is_empty() {
+                        self.first_content.get_or_insert(elapsed);
+                        self.digest.update(content.as_bytes());
+                    }
                 }
                 if choice["finish_reason"].as_str().is_some() {
                     self.finished = true;
@@ -217,7 +229,7 @@ impl StreamState {
         Ok(())
     }
 
-    fn outcome(self) -> (bool, Option<String>, Option<Duration>) {
+    fn outcome(self) -> (bool, Option<String>, Option<Duration>, Option<String>) {
         let completed =
             self.finished && self.done && self.error.is_none() && self.pending.is_empty();
         let error = if completed {
@@ -225,7 +237,8 @@ impl StreamState {
         } else {
             Some(self.error.unwrap_or_else(|| "incomplete_stream".into()))
         };
-        (completed, error, self.first_content)
+        let digest = completed.then(|| hex::encode(self.digest.finalize()));
+        (completed, error, self.first_content, digest)
     }
 }
 
@@ -276,41 +289,56 @@ async fn request_once(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split_once('.'))
             .map(|(owner, _)| owner.to_owned());
-        let (completion_tokens, first_content, completed, stream_error) = if streaming
-            && status == StatusCode::OK
-        {
-            let mut stream_body = response.into_body();
-            let mut state = StreamState::default();
-            let mut total_bytes = 0usize;
-            while let Some(frame) = stream_body.frame().await {
-                let frame = frame.map_err(|error| error.to_string())?;
-                if let Ok(data) = frame.into_data() {
-                    total_bytes = total_bytes
-                        .checked_add(data.len())
-                        .filter(|total| *total <= MAX_RESPONSE_BYTES)
-                        .ok_or_else(|| "stream response exceeds size limit".to_owned())?;
-                    state.feed(&data, started.elapsed())?;
+        let (completion_tokens, first_content, completed, stream_error, completion_digest) =
+            if streaming && status == StatusCode::OK {
+                let mut stream_body = response.into_body();
+                let mut state = StreamState::default();
+                let mut total_bytes = 0usize;
+                while let Some(frame) = stream_body.frame().await {
+                    let frame = frame.map_err(|error| error.to_string())?;
+                    if let Ok(data) = frame.into_data() {
+                        total_bytes = total_bytes
+                            .checked_add(data.len())
+                            .filter(|total| *total <= MAX_RESPONSE_BYTES)
+                            .ok_or_else(|| "stream response exceeds size limit".to_owned())?;
+                        state.feed(&data, started.elapsed())?;
+                    }
                 }
-            }
-            let (completed, stream_error, first_content) = state.outcome();
-            (0, first_content, completed, stream_error)
-        } else {
-            let bytes = to_bytes(Body::new(response.into_body()), MAX_RESPONSE_BYTES)
-                .await
-                .map_err(|error| error.to_string())?;
-            let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            let completion_tokens = if status == StatusCode::OK {
-                value
-                    .get("usage")
-                    .and_then(|usage| usage.get("completion_tokens"))
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| "successful response has no completion-token count".to_owned())?
-                    as usize
+                let (completed, stream_error, first_content, digest) = state.outcome();
+                (0, first_content, completed, stream_error, digest)
             } else {
-                0
+                let bytes = to_bytes(Body::new(response.into_body()), MAX_RESPONSE_BYTES)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let value: Value =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                let completion_tokens = if status == StatusCode::OK {
+                    value
+                        .get("usage")
+                        .and_then(|usage| usage.get("completion_tokens"))
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            "successful response has no completion-token count".to_owned()
+                        })? as usize
+                } else {
+                    0
+                };
+                let digest = if status == StatusCode::OK {
+                    let content = value["choices"][0]["message"]["content"]
+                        .as_str()
+                        .ok_or_else(|| "successful response has no completion text".to_owned())?;
+                    Some(hex::encode(Sha256::digest(content.as_bytes())))
+                } else {
+                    None
+                };
+                (
+                    completion_tokens,
+                    None,
+                    status == StatusCode::OK,
+                    None,
+                    digest,
+                )
             };
-            (completion_tokens, None, status == StatusCode::OK, None)
-        };
         Ok(Sample {
             latency: started.elapsed(),
             status,
@@ -319,6 +347,7 @@ async fn request_once(
             first_content,
             completed,
             stream_error,
+            completion_digest,
         })
     })
     .await
@@ -360,7 +389,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             stream.outcome(),
-            (true, None, Some(Duration::from_millis(30)))
+            (
+                true,
+                None,
+                Some(Duration::from_millis(30)),
+                Some(hex::encode(Sha256::digest(b"hello")))
+            )
         );
 
         let mut failed = StreamState::default();
@@ -372,7 +406,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             failed.outcome(),
-            (false, Some("inference_failed".into()), None)
+            (false, Some("inference_failed".into()), None, None)
         );
 
         let mut truncated = StreamState::default();
@@ -384,7 +418,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             truncated.outcome(),
-            (false, Some("incomplete_stream".into()), None)
+            (false, Some("incomplete_stream".into()), None, None)
         );
     }
 }

@@ -13,6 +13,7 @@
 - [Metal feed-forward command](plans/metal-feed-forward.md)
 - [One Metal command per decoder layer](plans/metal-decoder-layer.md)
 - [One Metal command per token](plans/metal-token-command.md)
+- [Reviewable two-Mac comparison](plans/lan-comparison.md)
 
 ## Learnings
 
@@ -49,6 +50,7 @@
 - [Metal feed-forward command](learnings/2026-09-26-metal-feed-forward.md)
 - [One Metal command per decoder layer](learnings/2026-09-26-metal-decoder-layer.md)
 - [One Metal command per token](learnings/2026-09-26-metal-token-command.md)
+- [Reviewable LAN comparison](learnings/2026-09-26-lan-comparison.md)
 
 ## Reviews
 
@@ -84,3 +86,4 @@
 - [Metal feed-forward review](reviews/2026-09-26-metal-feed-forward.md)
 - [Metal decoder-layer review](reviews/2026-09-26-metal-decoder-layer.md)
 - [Metal token-command review](reviews/2026-09-26-metal-token-command.md)
+- [LAN comparison review](reviews/2026-09-26-lan-comparison.md)
