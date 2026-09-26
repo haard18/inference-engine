@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::ServingBackend;
 use crate::serving::MAX_STAGE_BATCH_FRAMES;
+#[cfg(target_os = "macos")]
+use crate::MetalStageRuntime;
 use crate::{load_gguf_stage, ActivationFrame, StageSession};
 
 const MAX_SESSIONS: usize = 8;
@@ -90,7 +93,31 @@ pub fn run_stage_worker_stdio(
     start: usize,
     end: usize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_stage_worker_stdio_with_backend(model_path, start, end, ServingBackend::Cpu)
+}
+
+pub fn run_stage_worker_stdio_with_backend(
+    model_path: impl AsRef<Path>,
+    start: usize,
+    end: usize,
+    backend: ServingBackend,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let stage = load_gguf_stage(model_path, start..end)?;
+    #[cfg(target_os = "macos")]
+    let metal = (backend == ServingBackend::Metal)
+        .then(|| MetalStageRuntime::new(&stage))
+        .transpose()?;
+    #[cfg(not(target_os = "macos"))]
+    if backend == ServingBackend::Metal {
+        return Err("Metal requires macOS".into());
+    }
+    let new_session = || -> StageSession<'_> {
+        #[cfg(target_os = "macos")]
+        if let Some(runtime) = &metal {
+            return runtime.session();
+        }
+        StageSession::new(&stage)
+    };
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = BufReader::new(stdin.lock());
@@ -145,7 +172,7 @@ pub fn run_stage_worker_stdio(
                     continue;
                 }
                 let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
-                    session: StageSession::new(&stage),
+                    session: new_session(),
                     touched: Instant::now(),
                     checkpointed: false,
                 });
@@ -197,7 +224,7 @@ pub fn run_stage_worker_stdio(
                     continue;
                 }
                 let entry = sessions.entry(request_id).or_insert_with(|| SessionEntry {
-                    session: StageSession::new(&stage),
+                    session: new_session(),
                     touched: Instant::now(),
                     checkpointed: false,
                 });

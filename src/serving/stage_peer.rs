@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 
-use super::{ServingError, MAX_STAGE_BATCH_FRAMES};
+use super::{ServingBackend, ServingError, MAX_STAGE_BATCH_FRAMES};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -74,6 +74,7 @@ struct StageState {
     expected: StageReady,
     executable: PathBuf,
     model_path: PathBuf,
+    backend: ServingBackend,
     queue: Arc<Semaphore>,
     queue_capacity: usize,
 }
@@ -116,6 +117,12 @@ pub struct StagePeerServer {
     tls: ServerConfig,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct StagePeerOptions {
+    pub queue_capacity: usize,
+    pub backend: ServingBackend,
+}
+
 /// Start a suffix worker behind the same approved-certificate rules as whole-request peers.
 pub async fn start_stage_peer(
     model_path: impl AsRef<Path>,
@@ -126,6 +133,34 @@ pub async fn start_stage_peer(
     identity: &DeviceIdentity,
     peers: &PeerStore,
 ) -> Result<StagePeerServer, ServingError> {
+    start_stage_peer_with_backend(
+        model_path,
+        executable,
+        layer_start,
+        layer_end,
+        StagePeerOptions {
+            queue_capacity,
+            backend: ServingBackend::Cpu,
+        },
+        identity,
+        peers,
+    )
+    .await
+}
+
+pub async fn start_stage_peer_with_backend(
+    model_path: impl AsRef<Path>,
+    executable: impl AsRef<Path>,
+    layer_start: usize,
+    layer_end: usize,
+    options: StagePeerOptions,
+    identity: &DeviceIdentity,
+    peers: &PeerStore,
+) -> Result<StagePeerServer, ServingError> {
+    let StagePeerOptions {
+        queue_capacity,
+        backend,
+    } = options;
     if queue_capacity == 0 || queue_capacity > MAX_QUEUE {
         return Err(ServingError::Configuration(
             "stage queue capacity must be 1 through 16",
@@ -139,7 +174,7 @@ pub async fn start_stage_peer(
         .map_err(|error| ServingError::Worker(format!("stage executable: {error}")))?;
     let child = tokio::time::timeout(
         STARTUP_TIMEOUT,
-        StageChild::spawn(&executable, &model_path, layer_start, layer_end),
+        StageChild::spawn_with_backend(&executable, &model_path, layer_start, layer_end, backend),
     )
     .await
     .map_err(|_| ServingError::Worker("stage worker startup timed out".into()))?
@@ -155,6 +190,7 @@ pub async fn start_stage_peer(
         worker_ready: AtomicBool::new(true),
         executable,
         model_path,
+        backend,
         queue: Arc::new(Semaphore::new(queue_capacity)),
         queue_capacity,
     });
@@ -185,11 +221,12 @@ async fn supervise_stage(weak: Weak<StageState>) {
             state.worker_ready.store(false, Ordering::Release);
             if let Ok(Ok(child)) = tokio::time::timeout(
                 STARTUP_TIMEOUT,
-                StageChild::spawn(
+                StageChild::spawn_with_backend(
                     &state.executable,
                     &state.model_path,
                     state.expected.layer_start,
                     state.expected.layer_end,
+                    state.backend,
                 ),
             )
             .await
@@ -452,11 +489,12 @@ async fn ensure_worker(
         state.worker_ready.store(false, Ordering::Release);
         let remaining = tokio::time::timeout_at(
             deadline,
-            StageChild::spawn(
+            StageChild::spawn_with_backend(
                 &state.executable,
                 &state.model_path,
                 state.expected.layer_start,
                 state.expected.layer_end,
+                state.backend,
             ),
         )
         .await
@@ -506,17 +544,23 @@ pub(super) enum StageStepError {
 }
 
 impl StageChild {
-    pub(super) async fn spawn(
+    pub(super) async fn spawn_with_backend(
         executable: &Path,
         model_path: &Path,
         start: usize,
         end: usize,
+        backend: ServingBackend,
     ) -> Result<Self, String> {
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("--internal-stage-worker")
             .arg(model_path)
             .arg(start.to_string())
-            .arg(end.to_string())
+            .arg(end.to_string());
+        if backend == ServingBackend::Metal {
+            command.arg("--metal");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

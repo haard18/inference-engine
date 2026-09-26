@@ -63,6 +63,7 @@
 - [Short varied serving load](learnings/2026-09-26-varied-serving-load.md)
 - [Bounded split prompt batches](learnings/2026-09-26-split-prefill-batches.md)
 - [Metal execution for partial stages](learnings/2026-09-26-metal-stages.md)
+- [Metal split serving through child processes](learnings/2026-09-26-metal-split-serving.md)
 
 ## Reviews
 

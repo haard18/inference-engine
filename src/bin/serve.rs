@@ -19,7 +19,14 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let args: Vec<String> = env::args().collect();
+    let mut args: Vec<String> = env::args().collect();
+    let stage_metal = args.get(1).is_some_and(|argument| argument == "--metal")
+        && args
+            .get(2)
+            .is_some_and(|argument| argument == "--stage-suffix" || argument == "--split-prefix");
+    if stage_metal {
+        args.remove(1);
+    }
     if args
         .get(1)
         .is_some_and(|argument| argument == "--internal-worker")
@@ -40,10 +47,19 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .get(1)
         .is_some_and(|argument| argument == "--internal-stage-worker")
     {
-        if args.len() != 5 {
+        if args.len() != 5 && !(args.len() == 6 && args[5] == "--metal") {
             return Err("invalid stage worker invocation".into());
         }
-        return serving::run_stage_worker_stdio(&args[2], args[3].parse()?, args[4].parse()?);
+        return serving::run_stage_worker_stdio_with_backend(
+            &args[2],
+            args[3].parse()?,
+            args[4].parse()?,
+            if args.len() == 6 {
+                ServingBackend::Metal
+            } else {
+                ServingBackend::Cpu
+            },
+        );
     }
     if args
         .get(1)
@@ -51,7 +67,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         if args.len() != 7 {
             return Err(format!(
-                "usage: {} --stage-suffix STATE_DIR IP:PORT MODEL_GGUF LAYER_START LAYER_END",
+                "usage: {} [--metal] --stage-suffix STATE_DIR IP:PORT MODEL_GGUF LAYER_START LAYER_END",
                 args[0]
             )
             .into());
@@ -63,12 +79,19 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let identity = DeviceIdentity::load(&args[2])?;
         let peers = PeerStore::load(&args[2])?;
         let listener = TcpListener::bind(address)?;
-        let server = serving::start_stage_peer(
+        let server = serving::start_stage_peer_with_backend(
             &args[4],
             env::current_exe()?,
             args[5].parse()?,
             args[6].parse()?,
-            4,
+            serving::StagePeerOptions {
+                queue_capacity: 4,
+                backend: if stage_metal {
+                    ServingBackend::Metal
+                } else {
+                    ServingBackend::Cpu
+                },
+            },
             &identity,
             &peers,
         )
@@ -94,7 +117,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         if args.len() < 6 || args.len() > 7 {
             return Err(format!(
-                "usage: {} --split-prefix STATE_DIR SUFFIX_DEVICE_ID MODEL_GGUF SPLIT_LAYER [LOCAL_PORT]",
+                "usage: {} [--metal] --split-prefix STATE_DIR SUFFIX_DEVICE_ID MODEL_GGUF SPLIT_LAYER [LOCAL_PORT]",
                 args[0]
             )
             .into());
@@ -122,7 +145,11 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             queue_capacity: 4,
             max_completion_tokens: 256,
             request_timeout: Duration::from_secs(120),
-            backend: ServingBackend::Cpu,
+            backend: if stage_metal {
+                ServingBackend::Metal
+            } else {
+                ServingBackend::Cpu
+            },
         };
         let tokenizer = load_gguf_tokenizer(&args[4])?;
         let (router, worker) = serving::start_split_prefix(

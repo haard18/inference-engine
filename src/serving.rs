@@ -41,8 +41,11 @@ pub const CONVERSATION_HEADER: &str = conversation::HEADER;
 pub use isolated::{run_worker_stdio, start_isolated, start_isolated_paired};
 pub use peer::PeerServer;
 pub use split::start_split_prefix;
-pub use stage::run_stage_worker_stdio;
-pub use stage_peer::{start_stage_peer, StageCapacitySnapshot, StagePeerServer};
+pub use stage::{run_stage_worker_stdio, run_stage_worker_stdio_with_backend};
+pub use stage_peer::{
+    start_stage_peer, start_stage_peer_with_backend, StageCapacitySnapshot, StagePeerOptions,
+    StagePeerServer,
+};
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_STAGE_BATCH_FRAMES: usize = 16;

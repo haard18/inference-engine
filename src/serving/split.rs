@@ -42,10 +42,9 @@ pub async fn start_split_prefix(
     client: PeerClient,
 ) -> Result<(Router, tokio::task::JoinHandle<()>), ServingError> {
     validate_config(&config)?;
-    if config.backend != ServingBackend::Cpu {
-        return Err(ServingError::Configuration(
-            "split stage execution currently requires the CPU backend",
-        ));
+    #[cfg(not(target_os = "macos"))]
+    if config.backend == ServingBackend::Metal {
+        return Err(ServingError::Configuration("Metal requires macOS"));
     }
     if split_at == 0 {
         return Err(ServingError::Configuration(
@@ -58,7 +57,7 @@ pub async fn start_split_prefix(
         .map_err(|error| ServingError::Worker(format!("worker executable: {error}")))?;
     let child = tokio::time::timeout(
         STARTUP_TIMEOUT,
-        StageChild::spawn(&executable, &model_path, 0, split_at),
+        StageChild::spawn_with_backend(&executable, &model_path, 0, split_at, config.backend),
     )
     .await
     .map_err(|_| ServingError::Worker("prefix startup timed out".into()))?
@@ -101,6 +100,7 @@ pub async fn start_split_prefix(
         client: client.clone(),
         executable,
         model_path,
+        backend: config.backend,
     };
     tokio::spawn(monitor_suffix(
         Arc::downgrade(&runtime.status),
@@ -157,6 +157,7 @@ struct SplitRuntime {
     client: PeerClient,
     executable: PathBuf,
     model_path: PathBuf,
+    backend: ServingBackend,
 }
 
 struct CachedPrompt {
@@ -239,11 +240,12 @@ async fn supervise(
             runtime.status.set_unavailable(true);
             let replacement = tokio::time::timeout(
                 STARTUP_TIMEOUT,
-                StageChild::spawn(
+                StageChild::spawn_with_backend(
                     &runtime.executable,
                     &runtime.model_path,
                     0,
                     runtime.ready.layer_end,
+                    runtime.backend,
                 ),
             )
             .await;

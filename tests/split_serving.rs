@@ -10,8 +10,8 @@ use inference_engine::load_gguf_tokenizer;
 use inference_engine::pool::client::PeerClient;
 use inference_engine::pool::{DeviceIdentity, PeerStore};
 use inference_engine::serving::{
-    start_isolated, start_split_prefix, start_stage_peer, ServingBackend, ServingConfig,
-    CONVERSATION_HEADER,
+    start_isolated, start_split_prefix, start_stage_peer, start_stage_peer_with_backend,
+    ServingBackend, ServingConfig, StagePeerOptions, CONVERSATION_HEADER,
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -377,6 +377,112 @@ async fn split_chat_matches_whole_model_and_reports_peer_loss() {
     let (lost_status, lost_body, _) = chat(split.clone(), false).await;
     assert_eq!(lost_status, StatusCode::SERVICE_UNAVAILABLE, "{lost_body}");
     assert!(lost_body.contains("worker_unavailable"), "{lost_body}");
+    split_worker.abort();
+    whole_worker.abort();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+async fn metal_split_chat_matches_whole_metal_worker() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let model = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let executable = env!("CARGO_BIN_EXE_serve");
+    let suffix_dir = tempfile::tempdir().unwrap();
+    let prefix_dir = tempfile::tempdir().unwrap();
+    let suffix_identity = DeviceIdentity::load_or_create(suffix_dir.path()).unwrap();
+    let prefix_identity = DeviceIdentity::load_or_create(prefix_dir.path()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut suffix_peers = PeerStore::load(suffix_dir.path()).unwrap();
+    suffix_peers
+        .trust(
+            &suffix_identity.device_id,
+            &prefix_identity.offer(),
+            address,
+            &prefix_identity.fingerprint,
+        )
+        .unwrap();
+    let mut prefix_peers = PeerStore::load(prefix_dir.path()).unwrap();
+    prefix_peers
+        .trust(
+            &prefix_identity.device_id,
+            &suffix_identity.offer(),
+            address,
+            &suffix_identity.fingerprint,
+        )
+        .unwrap();
+    let suffix = start_stage_peer_with_backend(
+        &model,
+        executable,
+        15,
+        30,
+        StagePeerOptions {
+            queue_capacity: 4,
+            backend: ServingBackend::Metal,
+        },
+        &suffix_identity,
+        &suffix_peers,
+    )
+    .await
+    .unwrap();
+    let suffix_handle = axum_server::Handle::new();
+    let handle = suffix_handle.clone();
+    let suffix_task = tokio::spawn(async move { suffix.serve(listener, handle).await });
+    let client = PeerClient::new(&prefix_identity, prefix_peers.peers()[0].clone()).unwrap();
+    let metal_config = || ServingConfig {
+        backend: ServingBackend::Metal,
+        ..config()
+    };
+    let (split, split_worker) = start_split_prefix(
+        &model,
+        load_gguf_tokenizer(&model).unwrap(),
+        metal_config(),
+        executable,
+        15,
+        &prefix_identity,
+        client,
+    )
+    .await
+    .unwrap();
+    let (whole, whole_worker) = start_isolated(
+        &model,
+        load_gguf_tokenizer(&model).unwrap(),
+        metal_config(),
+        executable,
+    )
+    .await
+    .unwrap();
+    let (whole_status, whole_body, _) = chat(whole, false).await;
+    let (split_status, split_body, _) = chat(split.clone(), false).await;
+    assert_eq!(whole_status, StatusCode::OK, "{whole_body}");
+    assert_eq!(split_status, StatusCode::OK, "{split_body}");
+    let whole_json: Value = serde_json::from_str(&whole_body).unwrap();
+    let split_json: Value = serde_json::from_str(&split_body).unwrap();
+    assert_eq!(split_json["choices"], whole_json["choices"]);
+    assert_eq!(split_json["usage"], whole_json["usage"]);
+    let (stream_status, stream_body, _) = chat(split.clone(), true).await;
+    assert_eq!(stream_status, StatusCode::OK, "{stream_body}");
+    assert!(stream_body.contains("data: [DONE]"));
+    assert_eq!(
+        stream_content(&stream_body),
+        split_json["choices"][0]["message"]["content"]
+    );
+    let messages = json!([{"role": "user", "content": "Say hello."}]);
+    let (status, conversation_id, initial) =
+        conversation_chat(split.clone(), messages.clone(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, same_id, repeated) =
+        conversation_chat(split.clone(), messages, Some(&conversation_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same_id, conversation_id);
+    assert_eq!(repeated["choices"], initial["choices"]);
+    assert_eq!(
+        repeated["usage"]["prompt_tokens_details"]["cached_tokens"],
+        repeated["usage"]["prompt_tokens"]
+    );
+    suffix_handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    suffix_task.await.unwrap().unwrap();
     split_worker.abort();
     whole_worker.abort();
 }
