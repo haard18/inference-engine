@@ -1,4 +1,4 @@
-use crate::tensor::{apply_rope, rms_norm, silu, softmax};
+use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
 
@@ -13,6 +13,7 @@ pub struct ModelConfig {
     pub max_positions: usize,
     pub rms_norm_epsilon: f32,
     pub rope_theta: f32,
+    pub rope_interleaved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -132,10 +133,18 @@ impl Model {
             debug_assert_eq!(key.len(), kv_size);
 
             for head in query.chunks_exact_mut(head_size) {
-                apply_rope(head, position, self.config.rope_theta);
+                if self.config.rope_interleaved {
+                    apply_rope_interleaved(head, position, self.config.rope_theta);
+                } else {
+                    apply_rope(head, position, self.config.rope_theta);
+                }
             }
             for head in key.chunks_exact_mut(head_size) {
-                apply_rope(head, position, self.config.rope_theta);
+                if self.config.rope_interleaved {
+                    apply_rope_interleaved(head, position, self.config.rope_theta);
+                } else {
+                    apply_rope(head, position, self.config.rope_theta);
+                }
             }
 
             let layer_cache = &cache.layers[layer_index];

@@ -132,6 +132,7 @@ pub fn load_safetensors(
         max_positions: config.max_position_embeddings,
         rms_norm_epsilon: config.rms_norm_eps,
         rope_theta: config.rope_theta,
+        rope_interleaved: false,
     };
     let mut tensors = TensorArchive::new(File::open(weights_path)?)?;
     let mut layers = Vec::with_capacity(engine_config.num_layers);

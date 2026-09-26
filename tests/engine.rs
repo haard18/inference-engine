@@ -21,6 +21,7 @@ fn model(max_positions: usize) -> Model {
         max_positions,
         rms_norm_epsilon: 1e-5,
         rope_theta: 10000.0,
+        rope_interleaved: false,
     };
     let layers = (0..2)
         .map(|layer| {
@@ -102,6 +103,7 @@ fn mismatched_weights_are_rejected() {
         max_positions: 8,
         rms_norm_epsilon: 1e-5,
         rope_theta: 10000.0,
+        rope_interleaved: false,
     };
     let weights = ModelWeights {
         token_embeddings: matrix(1, 8, 3),
@@ -140,5 +142,26 @@ fn half_precision_matrices_keep_compact_weights_and_compute_in_f32() {
     assert_eq!(
         Matrix::from_bf16_bits(1, 1, vec![bf16::NAN.to_bits()]).unwrap_err(),
         EngineError::InvalidValue("matrix")
+    );
+}
+
+#[test]
+fn q8_0_blocks_compute_without_expanding_weights() {
+    let mut data = Vec::new();
+    data.extend_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+    data.extend_from_slice(&[1; 32]);
+    data.extend_from_slice(&f16::from_f32(0.25).to_bits().to_le_bytes());
+    data.extend_from_slice(&[255; 32]);
+    let matrix = Matrix::from_q8_0(2, 32, data).unwrap();
+    assert_eq!(matrix.storage_bytes(), 68);
+    assert_eq!(matrix.row(0).unwrap(), [0.5; 32]);
+    assert_eq!(matrix.row(1).unwrap(), [-0.25; 32]);
+    assert_eq!(matrix.mul_vec(&[1.0; 32]).unwrap(), [16.0, -8.0]);
+    assert!(Matrix::from_q8_0(1, 31, vec![]).is_err());
+    let mut invalid_scale = vec![0; 34];
+    invalid_scale[..2].copy_from_slice(&f16::NAN.to_bits().to_le_bytes());
+    assert_eq!(
+        Matrix::from_q8_0(1, 32, invalid_scale).unwrap_err(),
+        EngineError::InvalidValue("Q8_0 matrix scale")
     );
 }

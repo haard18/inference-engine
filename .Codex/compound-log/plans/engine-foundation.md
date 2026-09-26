@@ -33,7 +33,8 @@ Build the model execution core before device pooling. The core must produce corr
 - [x] Retain f16 and bf16 matrix weights without expanding them to f32 at load time.
 - [x] Preserve real-model numerical parity and measure the memory change.
 - [x] Reduce load-time file buffering while preserving Safetensors validation.
-- [ ] Add quantized execution, GGUF, and Metal.
+- [x] Add Q8_0 block execution and load the supported GGUF model layout.
+- [ ] Add further quantized formats, GGUF-native tokenization, and Metal.
 
 ## Risks
 

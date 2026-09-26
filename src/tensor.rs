@@ -7,6 +7,7 @@ enum MatrixData {
     F32(Vec<f32>),
     F16(Vec<u16>),
     Bf16(Vec<u16>),
+    Q8_0(Vec<u8>),
 }
 
 /// A contiguous row-major tensor with two dimensions.
@@ -54,6 +55,41 @@ impl Matrix {
         })
     }
 
+    /// Q8_0 stores 32 signed weights behind one f16 scale in each 34-byte block.
+    pub fn from_q8_0(rows: usize, cols: usize, data: Vec<u8>) -> Result<Self, EngineError> {
+        if !cols.is_multiple_of(32) {
+            return Err(EngineError::InvalidConfig(
+                "Q8_0 matrix width must be a multiple of 32",
+            ));
+        }
+        let blocks = rows
+            .checked_mul(cols / 32)
+            .ok_or(EngineError::InvalidConfig("matrix dimensions overflow"))?;
+        let expected = blocks
+            .checked_mul(34)
+            .ok_or(EngineError::InvalidConfig("Q8_0 matrix size overflow"))?;
+        if data.len() != expected {
+            return Err(EngineError::InvalidShape {
+                name: "Q8_0 matrix",
+                expected: vec![expected],
+                actual: vec![data.len()],
+            });
+        }
+        if !data
+            .as_chunks::<34>()
+            .0
+            .iter()
+            .all(|block| f16::from_bits(u16::from_le_bytes([block[0], block[1]])).is_finite())
+        {
+            return Err(EngineError::InvalidValue("Q8_0 matrix scale"));
+        }
+        Ok(Self {
+            rows,
+            cols,
+            data: MatrixData::Q8_0(data),
+        })
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -67,6 +103,7 @@ impl Matrix {
         match &self.data {
             MatrixData::F32(values) => values.len() * size_of::<f32>(),
             MatrixData::F16(values) | MatrixData::Bf16(values) => values.len() * size_of::<u16>(),
+            MatrixData::Q8_0(values) => values.len(),
         }
     }
 
@@ -85,6 +122,21 @@ impl Matrix {
                 .iter()
                 .map(|&bits| bf16::from_bits(bits).to_f32())
                 .collect(),
+            MatrixData::Q8_0(values) => {
+                let row_bytes = self.cols / 32 * 34;
+                values[index * row_bytes..(index + 1) * row_bytes]
+                    .as_chunks::<34>()
+                    .0
+                    .iter()
+                    .flat_map(|block| {
+                        let scale =
+                            f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+                        block[2..]
+                            .iter()
+                            .map(move |&quant| scale * (quant as i8 as f32))
+                    })
+                    .collect()
+            }
         })
     }
 
@@ -126,6 +178,26 @@ impl Matrix {
                         .zip(input)
                         .map(|(&bits, value)| bf16::from_bits(bits).to_f32() * value)
                         .sum();
+                }
+            }
+            MatrixData::Q8_0(values) => {
+                let row_bytes = self.cols / 32 * 34;
+                for (output, row) in result.iter_mut().zip(values.chunks_exact(row_bytes)) {
+                    for (block, input_block) in row
+                        .as_chunks::<34>()
+                        .0
+                        .iter()
+                        .zip(input.as_chunks::<32>().0)
+                    {
+                        let scale =
+                            f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+                        let dot: f32 = block[2..]
+                            .iter()
+                            .zip(input_block)
+                            .map(|(&quant, value)| (quant as i8 as f32) * value)
+                            .sum();
+                        *output += scale * dot;
+                    }
                 }
             }
         }
@@ -192,5 +264,17 @@ pub(crate) fn apply_rope(head: &mut [f32], position: usize, theta: f32) {
         let second = head[index + half];
         head[index] = first * cosine - second * sine;
         head[index + half] = second * cosine + first * sine;
+    }
+}
+
+pub(crate) fn apply_rope_interleaved(head: &mut [f32], position: usize, theta: f32) {
+    let width = head.len() as f32;
+    for (index, pair) in head.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let frequency = theta.powf(-((2 * index) as f32) / width);
+        let (sine, cosine) = (position as f32 * frequency).sin_cos();
+        let first = pair[0];
+        let second = pair[1];
+        pair[0] = first * cosine - second * sine;
+        pair[1] = second * cosine + first * sine;
     }
 }
