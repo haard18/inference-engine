@@ -1,3 +1,4 @@
+mod activation;
 mod error;
 mod gguf;
 mod loader;
@@ -12,6 +13,7 @@ mod session;
 mod tensor;
 mod tokenizer;
 
+pub use activation::{ActivationError, ActivationFrame};
 pub use error::EngineError;
 pub use gguf::{load_gguf, load_gguf_stage, load_gguf_tokenizer, GgufError};
 pub use loader::{load_safetensors, LoadError};

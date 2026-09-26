@@ -2,9 +2,10 @@ use std::env;
 use std::path::PathBuf;
 
 use inference_engine::{
-    load_gguf, load_gguf_stage, load_safetensors, ByteBpeTokenizer, GenerationSession, ModelStage,
-    StageSession,
+    load_gguf, load_gguf_stage, load_safetensors, ActivationFrame, ByteBpeTokenizer,
+    GenerationSession, ModelStage, StageSession,
 };
+use uuid::Uuid;
 
 #[test]
 #[ignore = "requires Q4_K_M and Q8_0 SmolLM2 GGUF files in SMOLLM2_DIR"]
@@ -30,6 +31,7 @@ fn q4_k_model_stages_own_partial_weights_and_match_full_scores() {
     let mut whole = GenerationSession::new(&model);
     let mut first = StageSession::new(&prefix);
     let mut second = StageSession::new(&suffix);
+    let request_id = Uuid::new_v4();
     assert!(first.forward_hidden(vec![0.0; 576]).is_err());
     assert!(second.forward_token(1).is_err());
     assert_eq!(first.position(), 0);
@@ -38,7 +40,20 @@ fn q4_k_model_stages_own_partial_weights_and_match_full_scores() {
         whole.prefill(&[token]).unwrap();
         let hidden = first.forward_token(token).unwrap();
         assert_eq!(hidden.len(), 576);
-        let actual = second.forward_hidden(hidden).unwrap();
+        let bytes = ActivationFrame::new(&prefix, request_id, second.position(), hidden)
+            .unwrap()
+            .encode();
+        assert_eq!(bytes.len(), 2_368);
+        assert!(ActivationFrame::decode_for_stage(
+            &bytes,
+            &suffix,
+            Uuid::new_v4(),
+            second.position()
+        )
+        .is_err());
+        assert!(second.forward_frame(&bytes, Uuid::new_v4()).is_err());
+        assert_eq!(second.position() + 1, whole.position());
+        let actual = second.forward_frame(&bytes, request_id).unwrap();
         assert_eq!(actual, whole.next_token_scores().unwrap());
         assert_eq!(first.position(), whole.position());
         assert_eq!(second.position(), whole.position());

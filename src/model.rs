@@ -195,6 +195,14 @@ impl ModelStage {
         self.range.clone()
     }
 
+    pub(crate) fn is_prefix(&self) -> bool {
+        self.range.start == 0
+    }
+
+    pub(crate) fn is_suffix(&self) -> bool {
+        self.range.end == self.config.num_layers
+    }
+
     pub fn model_digest(&self) -> [u8; 32] {
         self.model_digest
     }
@@ -322,6 +330,22 @@ impl<'a> StageSession<'a> {
         )?;
         self.cache.commit(run.keys, run.values);
         Ok(scores)
+    }
+
+    /// Validate one versioned activation and execute this suffix at its current position.
+    pub fn forward_frame(
+        &mut self,
+        frame: &[u8],
+        request_id: uuid::Uuid,
+    ) -> Result<Vec<f32>, crate::ActivationError> {
+        let activation = crate::ActivationFrame::decode_for_stage(
+            frame,
+            self.stage,
+            request_id,
+            self.cache.position,
+        )?;
+        self.forward_hidden(activation.into_hidden())
+            .map_err(crate::ActivationError::from)
     }
 }
 

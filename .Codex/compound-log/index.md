@@ -28,6 +28,7 @@
 - [Co-located pool measurement](learnings/2026-09-26-pool-measurement.md)
 - [Decoder layer-range boundary](learnings/2026-09-26-layer-range-boundary.md)
 - [Selective model-stage loading](learnings/2026-09-26-selective-stage-loading.md)
+- [Activation frame boundary](learnings/2026-09-26-activation-frame.md)
 
 ## Reviews
 
@@ -49,3 +50,4 @@
 - [Pool measurement review](reviews/2026-09-26-pool-measurement.md)
 - [Layer-range boundary review](reviews/2026-09-26-layer-range-boundary.md)
 - [Selective stage loading review](reviews/2026-09-26-selective-stage-loading.md)
+- [Activation frame review](reviews/2026-09-26-activation-frame.md)
