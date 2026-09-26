@@ -4,6 +4,7 @@
 
 - [Engine foundation](plans/engine-foundation.md)
 - [Per-device serving](plans/per-device-serving.md)
+- [Device pooling](plans/device-pooling.md)
 
 ## Learnings
 
@@ -19,6 +20,7 @@
 - [Local serving](learnings/2026-09-26-local-serving.md)
 - [Request deadlines](learnings/2026-09-26-request-deadlines.md)
 - [Worker process isolation](learnings/2026-09-26-worker-isolation.md)
+- [Device identity and pairing](learnings/2026-09-26-device-pairing.md)
 
 ## Reviews
 
@@ -33,3 +35,4 @@
 - [Local serving review](reviews/2026-09-26-local-serving.md)
 - [Request deadline review](reviews/2026-09-26-request-deadlines.md)
 - [Worker isolation review](reviews/2026-09-26-worker-isolation.md)
+- [Device pairing review](reviews/2026-09-26-device-pairing.md)

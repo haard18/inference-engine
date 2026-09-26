@@ -6,6 +6,7 @@ mod metal_backend;
 #[cfg(target_os = "macos")]
 pub use metal_backend::MetalRuntime;
 mod model;
+pub mod pool;
 pub mod serving;
 mod session;
 mod tensor;

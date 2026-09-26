@@ -8,7 +8,7 @@ A Rust inference engine for language models on user-owned devices. The engine lo
 - **Model input:** Safetensors with separate configuration and GGUF with Q8_0 or mixed Q4_K_M matrix weights. A project-owned byte-level BPE tokenizer reads the supported SmolLM2 layout from JSON or GGUF metadata.
 - **Device backends:** A 32-bit CPU path checks numerical correctness. CPU execution keeps f16, bf16, Q8_0, Q5_0, and Q4_K matrix weights compact while accumulating in f32. On macOS, a reusable Metal runtime uploads matrix weights once and runs matrix operations on the GPU; attention and the KV cache still run on the CPU.
 - **Serving:** A per-device server exposes an authenticated, streaming chat API. It limits queues and memory use and reports overload clearly. The server keeps inference in a child process that it can replace after a timeout or process failure.
-- **Device pool:** An owner pairs devices explicitly. A coordinator routes whole requests to capable devices and handles device loss. Reusable conversation state and model splitting are additional layers.
+- **Device pool:** Each device has a stable certificate. An owner approves another device by checking its certificate fingerprint. Mutual TLS allows only approved certificates to exchange data. A coordinator that routes whole requests, handles device loss, reuses conversation state, and eventually splits models is being built on this transport.
 
 The first real checkpoint target is SmolLM2-135M. We will carry one model family through the engine and serving layers before adding another family. llama.cpp is a reference and benchmark, not the implementation blueprint. We will measure performance and reliability before making comparative claims.
 
@@ -66,6 +66,25 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"local-smollm2","messages":[{"role":"user","content":"Say hello"}],"max_completion_tokens":32,"stream":true}'
 ```
 
-The API supports string chat messages, one choice, and greedy decoding. It rejects other settings explicitly. One child process runs model calculations, up to four requests wait in the queue, and a full queue returns HTTP 429. Accepted requests have a 120-second deadline. An ordinary request returns HTTP 504 if it expires; a stream reports the timeout and closes. The server kills and replaces a child process that hangs or exits. While the worker is unavailable, health and new chat requests return HTTP 503. The server limits request bodies to 64 KiB and completion length to 256 tokens. It requires a Bearer token for model and chat routes; the child process does not receive that secret. The health route is public. Paired-device access, transport encryption, recovery after device loss, and model splitting are still planned layers.
+The API supports string chat messages, one choice, and greedy decoding. It rejects other settings explicitly. One child process runs model calculations, up to four requests wait in the queue, and a full queue returns HTTP 429. Accepted requests have a 120-second deadline. An ordinary request returns HTTP 504 if it expires; a stream reports the timeout and closes. The server kills and replaces a child process that hangs or exits. While the worker is unavailable, health and new chat requests return HTTP 503. The server limits request bodies to 64 KiB and completion length to 256 tokens. It requires a Bearer token for model and chat routes; the child process does not receive that secret. The health route is public.
+
+## Pairing devices
+
+On each device, create a private state directory and show its public pairing offer:
+
+```sh
+cargo run --release --bin device -- init /path/to/device-state
+cargo run --release --bin device -- offer /path/to/device-state > device-offer.json
+```
+
+Copy one device's offer to the other. Check the **full certificate fingerprint** with its owner through a separate trusted channel, such as a direct call or an in-person comparison. Then approve that device and its reachable IP address and port:
+
+```sh
+cargo run --release --bin device -- trust /path/to/device-state \
+  /path/to/other-device-offer.json 192.168.1.20:8443 VERIFIED_FULL_FINGERPRINT
+cargo run --release --bin device -- peers /path/to/device-state
+```
+
+Repeat in the other direction so both devices trust each other. `device remove STATE_DIR DEVICE_ID` revokes a stored peer. Private keys stay in the state directory; the offer contains only the public certificate. The state directory is restricted to its owner on Unix systems. A live mutual TLS test verifies approved peers can exchange data and that unapproved peers fail. The serving CLI still listens on loopback only; the encrypted peer listener and cross-device request routing are the next layers.
 
 The current decoder is a correctness baseline. It uses f32 activations, greedy token selection, and one supported model and tokenizer layout. The loader validates the Safetensors header and reads tensor payloads one at a time. On one Apple Silicon Mac, the same one-token text prompt used 120 MB peak resident memory with Q4_K_M GGUF, 162 MB with Q8_0 GGUF, and 358 MB with the bf16 Safetensors checkpoint. The Metal runtime currently keeps CPU weights as well as uploaded GPU weights. One local eight-token Q4_K_M run took 1.20 seconds and 235 MB peak resident memory with Metal, compared with 0.78 seconds and 122 MB on the CPU. These are single local measurements; quantization can change model scores and output quality. GPU-resident attention and lower synchronization cost remain open layers.
