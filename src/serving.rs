@@ -16,7 +16,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::runtime::Handle;
@@ -28,8 +28,10 @@ use uuid::Uuid;
 use crate::MetalRuntime;
 use crate::{ByteBpeDecoder, ByteBpeTokenizer, GenerationSession, Model};
 
+mod coordinator;
 mod isolated;
 mod peer;
+use coordinator::Coordinator;
 pub use isolated::{run_worker_stdio, start_isolated, start_isolated_paired};
 pub use peer::PeerServer;
 
@@ -52,6 +54,25 @@ pub struct ServingConfig {
     pub max_completion_tokens: usize,
     pub request_timeout: Duration,
     pub backend: ServingBackend,
+}
+
+/// A point-in-time description of one device's bounded model worker.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacitySnapshot {
+    pub model_id: String,
+    pub ready: bool,
+    pub active: bool,
+    pub queue_available: usize,
+    pub queue_capacity: usize,
+    pub max_positions: usize,
+    pub max_completion_tokens: usize,
+}
+
+impl CapacitySnapshot {
+    pub fn backlog(&self) -> usize {
+        usize::from(self.active) + self.queue_capacity.saturating_sub(self.queue_available)
+    }
 }
 
 #[derive(Debug)]
@@ -79,9 +100,26 @@ struct AppState {
     tokenizer: Arc<ByteBpeTokenizer>,
     max_positions: usize,
     max_completion_tokens: usize,
+    queue_capacity: usize,
     request_timeout: Duration,
     worker_status: Arc<WorkerStatus>,
     requests: mpsc::Sender<Job>,
+    coordinator: Option<Arc<Coordinator>>,
+}
+
+impl AppState {
+    fn snapshot(&self) -> CapacitySnapshot {
+        let ready = !self.requests.is_closed() && !self.worker_status.unavailable();
+        CapacitySnapshot {
+            model_id: self.model_id.clone(),
+            ready,
+            active: self.worker_status.active(),
+            queue_available: if ready { self.requests.capacity() } else { 0 },
+            queue_capacity: self.queue_capacity,
+            max_positions: self.max_positions,
+            max_completion_tokens: self.max_completion_tokens,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -111,6 +149,12 @@ impl WorkerStatus {
 
     fn unavailable(&self) -> bool {
         self.unavailable.load(Ordering::Acquire) || self.overdue()
+    }
+
+    fn active(&self) -> bool {
+        self.active_deadline
+            .lock()
+            .map_or(true, |active| active.is_some())
     }
 
     fn set_unavailable(&self, unavailable: bool) {
@@ -297,9 +341,11 @@ fn start_state(
         tokenizer,
         max_positions: model.config().max_positions,
         max_completion_tokens: config.max_completion_tokens,
+        queue_capacity: config.queue_capacity,
         request_timeout: config.request_timeout,
         worker_status,
         requests: sender,
+        coordinator: None,
     });
     Ok((state, worker))
 }
@@ -345,9 +391,12 @@ fn peer_router(state: Arc<AppState>) -> Router {
 }
 
 fn routed(state: Arc<AppState>, bearer_auth: bool) -> Router {
-    let requests = Router::new()
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions));
+    let requests = Router::new().route("/v1/models", get(models));
+    let requests = if bearer_auth {
+        requests.route("/v1/chat/completions", post(pooled_chat_completions))
+    } else {
+        requests.route("/v1/chat/completions", post(chat_completions))
+    };
     let requests = if bearer_auth {
         requests.route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -356,9 +405,13 @@ fn routed(state: Arc<AppState>, bearer_auth: bool) -> Router {
     } else {
         requests
     };
-    Router::new()
-        .route("/health", get(health))
-        .merge(requests)
+    let routes = Router::new().route("/health", get(health)).merge(requests);
+    let routes = if bearer_auth {
+        routes
+    } else {
+        routes.route("/internal/capacity", get(capacity))
+    };
+    routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -469,6 +522,10 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn capacity(State(state): State<Arc<AppState>>) -> Json<CapacitySnapshot> {
+    Json(state.snapshot())
+}
+
 async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "object": "list",
@@ -480,13 +537,28 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    chat_completions_impl(state, payload, false).await
+}
+
+async fn pooled_chat_completions(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    chat_completions_impl(state, payload, true).await
+}
+
+async fn chat_completions_impl(
+    state: Arc<AppState>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    route_to_peers: bool,
+) -> Response {
     let Json(value) = match payload {
         Ok(value) => value,
         Err(error) => {
             return error_response(StatusCode::BAD_REQUEST, "invalid_json", &error.body_text())
         }
     };
-    let request: ChatRequest = match serde_json::from_value(value) {
+    let request: ChatRequest = match serde_json::from_value(value.clone()) {
         Ok(request) => request,
         Err(error) => {
             return error_response(
@@ -502,7 +574,43 @@ async fn chat_completions(
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", &message)
         }
     };
+    let deadline = Instant::now() + state.request_timeout;
+    if route_to_peers {
+        if let Some(coordinator) = &state.coordinator {
+            let required_positions = prompt.len().saturating_add(max_tokens);
+            if let Some(peer) = coordinator
+                .choose(
+                    &state.snapshot(),
+                    &request.model,
+                    required_positions,
+                    max_tokens,
+                )
+                .await
+            {
+                if let Ok(body) = serde_json::to_vec(&value) {
+                    if let Ok(response) = peer
+                        .forward_chat(
+                            body,
+                            request.stream,
+                            deadline.saturating_duration_since(Instant::now()),
+                        )
+                        .await
+                    {
+                        if !matches!(
+                            response.status(),
+                            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+                        ) {
+                            return response;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let prompt_tokens = prompt.len();
+    if Instant::now() >= deadline {
+        return timeout_response();
+    }
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -518,10 +626,9 @@ async fn chat_completions(
     let job = Job {
         prompt,
         max_tokens,
-        deadline: Instant::now() + state.request_timeout,
+        deadline,
         output,
     };
-    let deadline = job.deadline;
     if state.worker_status.unavailable() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -901,11 +1008,64 @@ mod tests {
             tokenizer: Arc::new(tokenizer),
             max_positions: 2048,
             max_completion_tokens: 4,
+            queue_capacity: 1,
             request_timeout: timeout,
             worker_status: Arc::clone(&worker_status),
             requests: sender,
+            coordinator: None,
         }));
         (app, receiver, worker_status)
+    }
+
+    #[tokio::test]
+    async fn peer_capacity_reports_available_queue_and_worker_readiness() {
+        let (sender, receiver) = mpsc::channel(1);
+        let state = Arc::new(AppState {
+            model_id: "local-smollm2".into(),
+            api_key: KEY.as_bytes().to_vec(),
+            tokenizer: Arc::new(test_tokenizer()),
+            max_positions: 2048,
+            max_completion_tokens: 4,
+            queue_capacity: 1,
+            request_timeout: Duration::from_secs(30),
+            worker_status: Arc::new(WorkerStatus::default()),
+            requests: sender,
+            coordinator: None,
+        });
+        let app = peer_router(Arc::clone(&state));
+        let first = app
+            .clone()
+            .oneshot(request("/internal/capacity", None, false))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = body_json(first).await;
+        assert_eq!(first["queue_available"], 1);
+        assert_eq!(first["ready"], true);
+        let (output, _receiver) = mpsc::channel(1);
+        state
+            .requests
+            .try_send(Job {
+                prompt: vec![1],
+                max_tokens: 1,
+                deadline: Instant::now() + Duration::from_secs(30),
+                output,
+            })
+            .unwrap();
+        let full = app
+            .clone()
+            .oneshot(request("/internal/capacity", None, false))
+            .await
+            .unwrap();
+        assert_eq!(body_json(full).await["queue_available"], 0);
+        drop(receiver);
+        let unavailable = app
+            .oneshot(request("/internal/capacity", None, false))
+            .await
+            .unwrap();
+        let unavailable = body_json(unavailable).await;
+        assert_eq!(unavailable["ready"], false);
+        assert_eq!(unavailable["queue_available"], 0);
     }
 
     fn request(path: &str, body: Option<Value>, authorized: bool) -> Request<Body> {
@@ -1137,9 +1297,11 @@ mod tests {
             tokenizer: Arc::new(tokenizer),
             max_positions: 2048,
             max_completion_tokens: 4,
+            queue_capacity: 1,
             request_timeout: Duration::from_secs(30),
             worker_status: Arc::new(WorkerStatus::default()),
             requests: sender,
+            coordinator: None,
         }));
         let response = saturated
             .oneshot(request("/v1/chat/completions", Some(chat(false)), true))

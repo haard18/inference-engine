@@ -1,0 +1,114 @@
+//! Capacity-aware whole-request choice among the local worker and approved peers.
+
+use tokio::task::JoinSet;
+
+use crate::pool::client::PeerClient;
+use crate::pool::{DeviceIdentity, PeerStore, PoolError};
+
+use super::CapacitySnapshot;
+
+pub(super) struct Coordinator {
+    peers: Vec<PeerClient>,
+}
+
+impl Coordinator {
+    pub fn new(identity: &DeviceIdentity, peers: &PeerStore) -> Result<Self, PoolError> {
+        let clients = peers
+            .peers()
+            .iter()
+            .cloned()
+            .map(|peer| PeerClient::new(identity, peer))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { peers: clients })
+    }
+
+    pub async fn choose(
+        &self,
+        local: &CapacitySnapshot,
+        model_id: &str,
+        required_positions: usize,
+        max_completion_tokens: usize,
+    ) -> Option<PeerClient> {
+        let local_score = if local.ready && local.queue_available > 0 {
+            local.backlog()
+        } else {
+            usize::MAX
+        };
+        if local_score == 0 {
+            return None;
+        }
+        let mut tasks = JoinSet::new();
+        for peer in &self.peers {
+            if peer.cooling_down() {
+                continue;
+            }
+            let peer = peer.clone();
+            tasks.spawn(async move {
+                let snapshot = peer.snapshot().await.ok()?;
+                Some((peer, snapshot))
+            });
+        }
+        let mut selected = None;
+        let mut best_score = local_score;
+        while let Some(result) = tasks.join_next().await {
+            let Ok(Some((peer, snapshot))) = result else {
+                continue;
+            };
+            if peer_can_take(
+                &snapshot,
+                model_id,
+                required_positions,
+                max_completion_tokens,
+            ) && snapshot.backlog() < best_score
+            {
+                best_score = snapshot.backlog();
+                selected = Some(peer);
+            }
+        }
+        selected
+    }
+}
+
+fn peer_can_take(
+    snapshot: &CapacitySnapshot,
+    model_id: &str,
+    required_positions: usize,
+    max_completion_tokens: usize,
+) -> bool {
+    snapshot.ready
+        && snapshot.queue_available > 0
+        && snapshot.model_id == model_id
+        && required_positions <= snapshot.max_positions
+        && max_completion_tokens <= snapshot.max_completion_tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_compatible_workers_with_queue_space_are_candidates() {
+        let mut peer = CapacitySnapshot {
+            model_id: "model-a".into(),
+            ready: true,
+            active: false,
+            queue_available: 2,
+            queue_capacity: 2,
+            max_positions: 512,
+            max_completion_tokens: 64,
+        };
+        assert!(peer_can_take(&peer, "model-a", 512, 64));
+        assert_eq!(peer.backlog(), 0);
+        assert!(!peer_can_take(&peer, "model-b", 512, 64));
+        assert!(!peer_can_take(&peer, "model-a", 513, 64));
+        assert!(!peer_can_take(&peer, "model-a", 512, 65));
+        peer.queue_available = 0;
+        assert!(!peer_can_take(&peer, "model-a", 512, 64));
+        peer.queue_available = 1;
+        peer.ready = false;
+        assert!(!peer_can_take(&peer, "model-a", 512, 64));
+        peer.ready = true;
+        peer.active = true;
+        assert_eq!(peer.backlog(), 2);
+    }
+}

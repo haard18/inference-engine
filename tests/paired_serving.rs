@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use inference_engine::load_gguf_tokenizer;
+use inference_engine::pool::client::PeerClient;
 use inference_engine::pool::tls::{client_config, server_name};
 use inference_engine::pool::{DeviceIdentity, PeerStore, TrustedPeer};
 use inference_engine::serving::{start_isolated_paired, ServingBackend, ServingConfig};
@@ -128,6 +129,13 @@ async fn paired_peer_serves_real_model_and_rejects_unapproved_device() {
     let peer_address = listener.local_addr().unwrap();
     let handle = axum_server::Handle::new();
     let running = tokio::spawn(peer.serve(listener, handle.clone()));
+    let mut trusted_server = approved_peers.peers()[0].clone();
+    trusted_server.address = peer_address;
+    let client = PeerClient::new(&approved, trusted_server).unwrap();
+    let snapshot = client.snapshot().await.unwrap();
+    assert_eq!(snapshot.model_id, "local-smollm2");
+    assert!(snapshot.ready);
+    assert_eq!(snapshot.queue_capacity, 2);
     let models = peer_request(
         peer_address,
         &approved,
@@ -159,6 +167,35 @@ async fn paired_peer_serves_real_model_and_rejects_unapproved_device() {
     .unwrap();
     assert!(chat.starts_with("HTTP/1.1 200"), "{chat}");
     assert!(chat.contains("Say hi"), "{chat}");
+    let forwarded = client
+        .forward_chat(body.into_bytes(), false, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(forwarded.status(), StatusCode::OK);
+    let forwarded_body = axum::body::to_bytes(forwarded.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&forwarded_body).contains("Say hi"));
+    let streamed = client
+        .forward_chat(
+            json!({
+                "model": "local-smollm2",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_completion_tokens": 2,
+                "stream": true
+            })
+            .to_string()
+            .into_bytes(),
+            true,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let stream = axum::body::to_bytes(streamed.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&stream).contains("data: [DONE]"));
 
     let rejected = peer_request(
         peer_address,
@@ -253,4 +290,240 @@ async fn serve_cli_binds_loopback_and_approved_peer_listener() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     child.kill().await.unwrap();
     child.wait().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+async fn coordinator_uses_peer_after_local_worker_loss_and_reports_peer_loss() {
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let model = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let a = DeviceIdentity::load_or_create(a_dir.path()).unwrap();
+    let b = DeviceIdentity::load_or_create(b_dir.path()).unwrap();
+    let b_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let b_address = b_listener.local_addr().unwrap();
+    let mut a_peers = PeerStore::load(a_dir.path()).unwrap();
+    a_peers
+        .trust(&a.device_id, &b.offer(), b_address, &b.fingerprint)
+        .unwrap();
+    let mut b_peers = PeerStore::load(b_dir.path()).unwrap();
+    b_peers
+        .trust(&b.device_id, &a.offer(), b_address, &a.fingerprint)
+        .unwrap();
+    let config = || ServingConfig {
+        model_id: "local-smollm2".into(),
+        api_key: KEY.into(),
+        queue_capacity: 2,
+        max_completion_tokens: 4,
+        request_timeout: Duration::from_secs(30),
+        backend: ServingBackend::Cpu,
+    };
+    let (local_a, peer_a, worker_a) = start_isolated_paired(
+        &model,
+        load_gguf_tokenizer(&model).unwrap(),
+        config(),
+        env!("CARGO_BIN_EXE_serve"),
+        &a,
+        &a_peers,
+    )
+    .await
+    .unwrap();
+    let (local_b, peer_b, worker_b) = start_isolated_paired(
+        &model,
+        load_gguf_tokenizer(&model).unwrap(),
+        config(),
+        env!("CARGO_BIN_EXE_serve"),
+        &b,
+        &b_peers,
+    )
+    .await
+    .unwrap();
+    let handle_b = axum_server::Handle::new();
+    let running_b = tokio::spawn(peer_b.serve(b_listener, handle_b.clone()));
+    drop(peer_a);
+    drop(local_b);
+    worker_a.abort();
+    assert!(worker_a.await.unwrap_err().is_cancelled());
+
+    let body = json!({
+        "model": "local-smollm2",
+        "messages": [{"role": "user", "content": "Say hi"}],
+        "max_completion_tokens": 2
+    })
+    .to_string();
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+    let forwarded = local_a.clone().oneshot(request()).await.unwrap();
+    assert_eq!(forwarded.status(), StatusCode::OK);
+    let content = axum::body::to_bytes(forwarded.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&content).contains("Say hi"));
+
+    let streaming_body = json!({
+        "model": "local-smollm2",
+        "messages": [{"role": "user", "content": "Say hi"}],
+        "max_completion_tokens": 2,
+        "stream": true
+    })
+    .to_string();
+    let streamed = local_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {KEY}"))
+                .header("content-type", "application/json")
+                .body(Body::from(streaming_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let stream = axum::body::to_bytes(streamed.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&stream).contains("data: [DONE]"));
+
+    handle_b.graceful_shutdown(Some(Duration::from_secs(2)));
+    tokio::time::timeout(Duration::from_secs(5), running_b)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let lost = local_a.clone().oneshot(request()).await.unwrap();
+    assert_eq!(lost.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(local_a);
+    tokio::time::timeout(Duration::from_secs(5), worker_b)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires SmolLM2-135M-Q4_K_M.gguf in SMOLLM2_DIR"]
+async fn coordinator_sends_next_request_to_idle_peer_while_local_worker_is_busy() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = PathBuf::from(env::var("SMOLLM2_DIR").expect("set SMOLLM2_DIR"));
+    let model = directory.join("SmolLM2-135M-Q4_K_M.gguf");
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let a = DeviceIdentity::load_or_create(a_dir.path()).unwrap();
+    let b = DeviceIdentity::load_or_create(b_dir.path()).unwrap();
+    let b_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let b_address = b_listener.local_addr().unwrap();
+    let mut a_peers = PeerStore::load(a_dir.path()).unwrap();
+    a_peers
+        .trust(&a.device_id, &b.offer(), b_address, &b.fingerprint)
+        .unwrap();
+    let mut b_peers = PeerStore::load(b_dir.path()).unwrap();
+    b_peers
+        .trust(&b.device_id, &a.offer(), b_address, &a.fingerprint)
+        .unwrap();
+
+    let fake_dir = tempfile::tempdir().unwrap();
+    let script = fake_dir.path().join("worker");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' '{\"kind\":\"ready\",\"max_positions\":2048}'\nIFS= read -r request\n: > \"$2/active\"\nexec sleep 60\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let config = || ServingConfig {
+        model_id: "local-smollm2".into(),
+        api_key: KEY.into(),
+        queue_capacity: 2,
+        max_completion_tokens: 4,
+        request_timeout: Duration::from_secs(10),
+        backend: ServingBackend::Cpu,
+    };
+    let (local_a, peer_a, worker_a) = start_isolated_paired(
+        fake_dir.path(),
+        load_gguf_tokenizer(&model).unwrap(),
+        config(),
+        &script,
+        &a,
+        &a_peers,
+    )
+    .await
+    .unwrap();
+    let (local_b, peer_b, worker_b) = start_isolated_paired(
+        &model,
+        load_gguf_tokenizer(&model).unwrap(),
+        config(),
+        env!("CARGO_BIN_EXE_serve"),
+        &b,
+        &b_peers,
+    )
+    .await
+    .unwrap();
+    let handle_b = axum_server::Handle::new();
+    let running_b = tokio::spawn(peer_b.serve(b_listener, handle_b.clone()));
+    drop(peer_a);
+    drop(local_b);
+
+    let body = json!({
+        "model": "local-smollm2",
+        "messages": [{"role": "user", "content": "Say hi"}],
+        "max_completion_tokens": 2
+    })
+    .to_string();
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+    let first_app = local_a.clone();
+    let first_request = request();
+    let first = tokio::spawn(async move { first_app.oneshot(first_request).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !fake_dir.path().join("active").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(3), local_a.clone().oneshot(request()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let content = axum::body::to_bytes(second.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&content).contains("Say hi"));
+
+    first.abort();
+    let _ = first.await;
+    handle_b.graceful_shutdown(Some(Duration::from_secs(2)));
+    tokio::time::timeout(Duration::from_secs(5), running_b)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(local_a);
+    tokio::time::timeout(Duration::from_secs(5), worker_a)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker_b)
+        .await
+        .unwrap()
+        .unwrap();
 }

@@ -10,6 +10,9 @@ axum-server = { version = "0.8.0", default-features = false, features = ["tls-ru
 fancy-regex = "0.14.0"
 half = "2.7.1"
 hex = "0.4.3"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 rcgen = "0.14.10"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 safetensors = "0.8.0"

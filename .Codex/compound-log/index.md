@@ -22,6 +22,7 @@
 - [Worker process isolation](learnings/2026-09-26-worker-isolation.md)
 - [Device identity and pairing](learnings/2026-09-26-device-pairing.md)
 - [Encrypted peer listener](learnings/2026-09-26-peer-listener.md)
+- [Capacity-aware request routing](learnings/2026-09-26-capacity-routing.md)
 
 ## Reviews
 
@@ -38,3 +39,4 @@
 - [Worker isolation review](reviews/2026-09-26-worker-isolation.md)
 - [Device pairing review](reviews/2026-09-26-device-pairing.md)
 - [Peer listener review](reviews/2026-09-26-peer-listener.md)
+- [Capacity routing review](reviews/2026-09-26-capacity-routing.md)

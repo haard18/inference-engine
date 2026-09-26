@@ -17,6 +17,7 @@ const IDENTITY_FILE: &str = "identity.json";
 const PEERS_FILE: &str = "peers.json";
 const STORE_VERSION: u8 = 1;
 
+pub mod client;
 pub mod tls;
 
 #[derive(Debug)]
@@ -26,6 +27,7 @@ pub enum PoolError {
     Invalid(&'static str),
     Certificate(String),
     Tls(String),
+    Transport(String),
     FingerprintMismatch,
 }
 
@@ -37,6 +39,7 @@ impl fmt::Display for PoolError {
             Self::Invalid(message) => write!(f, "invalid device state: {message}"),
             Self::Certificate(message) => write!(f, "device certificate failed: {message}"),
             Self::Tls(message) => write!(f, "peer TLS configuration failed: {message}"),
+            Self::Transport(message) => write!(f, "peer request failed: {message}"),
             Self::FingerprintMismatch => write!(f, "peer certificate fingerprint does not match"),
         }
     }

@@ -15,8 +15,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
 use super::{
-    router, validate_config, ActiveJob, AppState, Job, PeerServer, ServingBackend, ServingConfig,
-    ServingError, WorkerEvent, WorkerStatus, SLOW_CLIENT_TIMEOUT,
+    router, validate_config, ActiveJob, AppState, Coordinator, Job, PeerServer, ServingBackend,
+    ServingConfig, ServingError, WorkerEvent, WorkerStatus, SLOW_CLIENT_TIMEOUT,
 };
 use crate::pool::{tls::server_config, DeviceIdentity, PeerStore};
 #[cfg(target_os = "macos")]
@@ -70,7 +70,8 @@ pub async fn start_isolated(
     config: ServingConfig,
     executable: impl AsRef<Path>,
 ) -> Result<(Router, tokio::task::JoinHandle<()>), ServingError> {
-    let (state, task) = start_isolated_state(model_path, tokenizer, config, executable).await?;
+    let (state, task) =
+        start_isolated_state(model_path, tokenizer, config, executable, None).await?;
     Ok((router(state), task))
 }
 
@@ -85,7 +86,16 @@ pub async fn start_isolated_paired(
 ) -> Result<(Router, PeerServer, tokio::task::JoinHandle<()>), ServingError> {
     let tls =
         server_config(identity, peers).map_err(|error| ServingError::Peer(error.to_string()))?;
-    let (state, task) = start_isolated_state(model_path, tokenizer, config, executable).await?;
+    let coordinator =
+        Coordinator::new(identity, peers).map_err(|error| ServingError::Peer(error.to_string()))?;
+    let (state, task) = start_isolated_state(
+        model_path,
+        tokenizer,
+        config,
+        executable,
+        Some(Arc::new(coordinator)),
+    )
+    .await?;
     Ok((
         router(Arc::clone(&state)),
         PeerServer::new(state, tls),
@@ -98,6 +108,7 @@ async fn start_isolated_state(
     tokenizer: ByteBpeTokenizer,
     config: ServingConfig,
     executable: impl AsRef<Path>,
+    coordinator: Option<Arc<Coordinator>>,
 ) -> Result<(Arc<AppState>, tokio::task::JoinHandle<()>), ServingError> {
     validate_config(&config)?;
     let model_path = fs::canonicalize(model_path)
@@ -115,9 +126,11 @@ async fn start_isolated_state(
         tokenizer: Arc::new(tokenizer),
         max_positions,
         max_completion_tokens: config.max_completion_tokens,
+        queue_capacity: config.queue_capacity,
         request_timeout: config.request_timeout,
         worker_status: Arc::clone(&worker_status),
         requests: sender,
+        coordinator,
     });
     let task = tokio::spawn(supervise(
         receiver,
