@@ -426,7 +426,7 @@ impl MetalBackend {
             || step.layers.len() != self.norms.len()
             || step.hidden.is_empty()
             || step.final_norm.is_some() != step.output.is_some()
-            || step.final_norm.is_some() != self.final_norm.is_some()
+            || (step.final_norm.is_some() && self.final_norm.is_none())
             || step
                 .final_norm
                 .is_some_and(|norm| norm.len() != step.hidden.len())

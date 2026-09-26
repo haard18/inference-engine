@@ -19,6 +19,7 @@
 - [Varied conversation parity](plans/varied-conversation-parity.md)
 - [Complete-worker cache admission](plans/whole-worker-cache.md)
 - [Split activation connection reuse](plans/stage-connection-reuse.md)
+- [Batched Metal prompt evaluation](plans/metal-batched-prefill.md)
 
 ## Learnings
 
@@ -73,6 +74,8 @@
 - [Split-stage cache reservations](learnings/2026-09-26-stage-cache-reservations.md)
 - [Complete-worker cache admission](learnings/2026-09-26-whole-worker-cache.md)
 - [Split activation connection reuse](learnings/2026-09-26-stage-connection-reuse.md)
+- [Matching prompts in warm serving checks](learnings/2026-09-26-warm-serving-prompt-parity.md)
+- [Skipping unused prompt-token scores](learnings/2026-09-26-unused-prefill-scores.md)
 
 ## Reviews
 

@@ -14,6 +14,7 @@ from typing import Any
 SCENARIOS = ("whole", "pool", "split")
 MATCH_FIELDS = (
     "model",
+    "system_prompt_sha256",
     "mode",
     "requested",
     "concurrency",
@@ -44,6 +45,13 @@ def read_trial(path: Path, min_requests: int) -> dict[str, Any]:
     for field in ("model", "endpoint"):
         if not isinstance(report.get(field), str) or not report[field]:
             raise ValueError(f"{path}: missing {field}")
+    system_prompt_sha256 = report.get("system_prompt_sha256")
+    if system_prompt_sha256 is not None and (
+        not isinstance(system_prompt_sha256, str)
+        or len(system_prompt_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in system_prompt_sha256)
+    ):
+        raise ValueError(f"{path}: invalid system prompt digest")
     for field in ("requested", "concurrency", "max_completion_tokens", "warmup_requests"):
         positive_number(report.get(field), f"{path}: {field}")
     requested = report["requested"]
@@ -129,11 +137,11 @@ def compare(groups: dict[str, list[Path]], min_trials: int, min_requests: int) -
         summaries[scenario], reports_by_scenario[scenario] = summarize(paths, min_requests)
 
     baseline = reports_by_scenario["whole"][0]
-    expected = tuple(baseline[field] for field in MATCH_FIELDS)
+    expected = tuple(baseline.get(field) for field in MATCH_FIELDS)
     digest = next(iter(baseline["completion_digests"]))
     for scenario, reports in reports_by_scenario.items():
         for report in reports:
-            if tuple(report[field] for field in MATCH_FIELDS) != expected:
+            if tuple(report.get(field) for field in MATCH_FIELDS) != expected:
                 raise ValueError(f"{scenario}: model, mode, or load settings differ")
             if next(iter(report["completion_digests"])) != digest:
                 raise ValueError(f"{scenario}: generated text differs from complete serving")
@@ -145,6 +153,7 @@ def compare(groups: dict[str, list[Path]], min_trials: int, min_requests: int) -
     whole_rate = summaries["whole"]["median_requests_per_second"]
     return {
         "model": baseline["model"],
+        "system_prompt_sha256": baseline.get("system_prompt_sha256"),
         "mode": baseline["mode"],
         "requested_per_trial": baseline["requested"],
         "concurrency": baseline["concurrency"],

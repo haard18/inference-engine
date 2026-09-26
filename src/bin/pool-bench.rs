@@ -70,10 +70,31 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let key = env::var("INFERENCE_API_KEY")
         .map_err(|_| "set INFERENCE_API_KEY to the local server's Bearer key")?;
+    let system_prompt = match env::var("INFERENCE_BENCH_SYSTEM_PROMPT") {
+        Ok(prompt) if !prompt.is_empty() && prompt.len() <= 4096 => Some(prompt),
+        Ok(_) => return Err("benchmark system prompt must contain 1..4096 bytes".into()),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("benchmark system prompt must be text".into())
+        }
+    };
+    let system_prompt_sha256 = system_prompt
+        .as_ref()
+        .map(|prompt| hex::encode(Sha256::digest(prompt.as_bytes())));
+    let mut messages = Vec::with_capacity(2);
+    if let Some(prompt) = &system_prompt {
+        messages.push(json!({"role": "system", "content": prompt}));
+    }
+    messages.push(
+        json!({"role": "user", "content": "Give a short factual answer: what is two plus two?"}),
+    );
     let body = json!({
         "model": model_id,
-        "messages": [{"role": "user", "content": "Give a short factual answer: what is two plus two?"}],
+        "messages": messages,
         "max_completion_tokens": max_tokens,
+        "temperature": 0,
+        "top_p": 1,
+        "n": 1,
         "stream": streaming
     })
     .to_string();
@@ -151,6 +172,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             "schema_version": 1,
             "endpoint": address.to_string(),
             "model": model_id,
+            "system_prompt_sha256": system_prompt_sha256,
             "mode": if streaming { "stream" } else { "ordinary" },
             "requested": requests,
             "concurrency": concurrency,

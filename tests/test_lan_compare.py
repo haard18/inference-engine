@@ -70,6 +70,14 @@ class LanCompareTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "generated text differs"):
             COMPARE(groups, 3, 30)
 
+    def test_comparison_rejects_different_system_prompts(self) -> None:
+        groups = self.groups()
+        changed = report("split", 0.8)
+        changed["system_prompt_sha256"] = "b" * 64
+        groups["split"][0].write_text(json.dumps(changed))
+        with self.assertRaisesRegex(ValueError, "load settings differ"):
+            COMPARE(groups, 3, 30)
+
     def test_comparison_rejects_failed_or_one_device_pool_runs(self) -> None:
         groups = self.groups()
         failed = report("split", 0.8)

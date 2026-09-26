@@ -111,8 +111,13 @@ impl<'a> GenerationSession<'a> {
                 return Err(EngineError::InvalidToken(token));
             }
         }
-        for &token in tokens {
-            self.next_logits = Some(self.forward_token(token)?);
+        self.next_logits = None;
+        for (index, &token) in tokens.iter().enumerate() {
+            let is_last = index + 1 == tokens.len();
+            let result = self.forward_token(token, is_last)?;
+            if is_last {
+                self.next_logits = Some(result);
+            }
         }
         Ok(())
     }
@@ -145,7 +150,7 @@ impl<'a> GenerationSession<'a> {
         if self.cache.position() >= self.model.config().max_positions {
             return Err(EngineError::ContextFull);
         }
-        self.next_logits = Some(self.forward_token(token)?);
+        self.next_logits = Some(self.forward_token(token, true)?);
         Ok(())
     }
 
@@ -153,7 +158,11 @@ impl<'a> GenerationSession<'a> {
         self.next_logits.as_deref()
     }
 
-    fn forward_token(&mut self, token: usize) -> Result<Vec<f32>, EngineError> {
+    fn forward_token(
+        &mut self,
+        token: usize,
+        project_scores: bool,
+    ) -> Result<Vec<f32>, EngineError> {
         match &mut self.backend {
             Backend::Cpu(_) => {
                 self.model
@@ -172,8 +181,13 @@ impl<'a> GenerationSession<'a> {
                 // Long-lived workers need to drain Metal's temporary Objective-C objects
                 // after each token while retained cache and model buffers stay alive.
                 objc::rc::autoreleasepool(|| {
-                    self.model
-                        .forward_token_metal(token, &mut self.cache, cache, &mut backend)
+                    self.model.forward_token_metal(
+                        token,
+                        &mut self.cache,
+                        cache,
+                        &mut backend,
+                        project_scores,
+                    )
                 })
             }
         }

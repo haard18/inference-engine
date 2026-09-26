@@ -616,6 +616,7 @@ impl Model {
         cache: &mut KvCache,
         metal_cache: &mut MetalKvCache,
         backend: &mut MetalBackend,
+        project_scores: bool,
     ) -> Result<Vec<f32>, EngineError> {
         if token_id >= self.config.vocab_size {
             return Err(EngineError::InvalidToken(token_id));
@@ -653,15 +654,19 @@ impl Model {
                 kv_head_count,
                 layers: &self.weights.layers,
                 hidden: &hidden,
-                final_norm: Some(&self.weights.final_norm),
-                output: Some(output),
+                final_norm: project_scores.then_some(self.weights.final_norm.as_slice()),
+                output: project_scores.then_some(output),
                 epsilon: self.config.rms_norm_epsilon,
                 rotations: &rotations,
                 interleaved: self.config.rope_interleaved,
             },
         )?;
         if !logits.iter().all(|value| value.is_finite()) {
-            return Err(EngineError::InvalidValue("next-token scores"));
+            return Err(EngineError::InvalidValue(if project_scores {
+                "next-token scores"
+            } else {
+                "decoder hidden state"
+            }));
         }
         cache.commit(Vec::new(), Vec::new());
         Ok(logits)
