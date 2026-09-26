@@ -16,6 +16,15 @@ struct AttentionParams {
     uint sequence_length;
 };
 
+struct RopeParams {
+    uint head_count;
+    uint kv_head_count;
+    uint head_size;
+    uint kv_size;
+    uint position;
+    uint interleaved;
+};
+
 static float half_at(device const uchar *bytes, uint offset) {
     ushort bits = ushort(bytes[offset]) | (ushort(bytes[offset + 1]) << 8);
     return float(as_type<half>(bits));
@@ -102,6 +111,50 @@ kernel void matvec(
         }
     }
     output[row] = sum;
+}
+
+kernel void rotate_and_store(
+    device float *query [[buffer(0)]],
+    device const float *key [[buffer(1)]],
+    device const float *value [[buffer(2)]],
+    device float *cached_keys [[buffer(3)]],
+    device float *cached_values [[buffer(4)]],
+    device const float *rotations [[buffer(5)]],
+    constant RopeParams &params [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+    uint half_width = params.head_size / 2;
+    uint query_pairs = params.head_count * half_width;
+    uint key_pairs = params.kv_head_count * half_width;
+    uint slot = params.position * params.kv_size;
+    if (index < query_pairs) {
+        uint head = index / half_width;
+        uint pair = index % half_width;
+        uint base = head * params.head_size;
+        uint first_index = base + (params.interleaved != 0 ? pair * 2 : pair);
+        uint second_index = base + (params.interleaved != 0 ? pair * 2 + 1 : pair + half_width);
+        float first = query[first_index];
+        float second = query[second_index];
+        float sine = rotations[pair * 2];
+        float cosine = rotations[pair * 2 + 1];
+        query[first_index] = first * cosine - second * sine;
+        query[second_index] = second * cosine + first * sine;
+    } else if (index < query_pairs + key_pairs) {
+        uint key_pair = index - query_pairs;
+        uint head = key_pair / half_width;
+        uint pair = key_pair % half_width;
+        uint base = head * params.head_size;
+        uint first_index = base + (params.interleaved != 0 ? pair * 2 : pair);
+        uint second_index = base + (params.interleaved != 0 ? pair * 2 + 1 : pair + half_width);
+        float first = key[first_index];
+        float second = key[second_index];
+        float sine = rotations[pair * 2];
+        float cosine = rotations[pair * 2 + 1];
+        cached_keys[slot + first_index] = first * cosine - second * sine;
+        cached_keys[slot + second_index] = second * cosine + first * sine;
+    }
+    if (index < params.kv_size) {
+        cached_values[slot + index] = value[index];
+    }
 }
 
 kernel void attention_scores(

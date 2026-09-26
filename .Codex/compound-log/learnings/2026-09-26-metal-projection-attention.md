@@ -1,0 +1,9 @@
+# 2026-09-26 - Metal projection-to-attention command
+
+The Metal path previously finished its query/key/value matrix command, read three vectors on the CPU, applied rotary positions, wrote key/value vectors into Metal buffers, and ran a second attention command. It now dispatches the three matrix projections, rotary positions, cache write, score calculation, and softmax-weighted value reduction within one Metal command buffer. The CPU reads only the attended vector at the end of that boundary. This removes one command completion wait and the query/key/value round trip for each decoder layer.
+
+The CPU computes rotary sine/cosine pairs once per token position, using the same f32 operations as the reference path, and sends the small table to each layer command. The GPU rotation kernel supports both the half-split and interleaved layouts. The key/value cache still uses a separate committed position: a failed step or a rewound prompt overwrites uncommitted slots. Capacity grows with context and copies only committed data.
+
+Tiny-model and real Q8_0/Q4_K_M CPU comparisons passed at multiple positions. The Q4_K_M `Hello` eight-token probe produced the same text with CPU and Metal. Two warm Metal runs took 0.58 and 0.59 seconds, with 222–223 MiB maximum process RSS. The previous Metal attention layer took 0.66 and 0.67 seconds in two warm runs; a CPU run near the new measurements took 0.58 seconds and 117.1 MiB. These are short sequential runs on one Mac with one prompt. They suggest this boundary has lower overhead for that prompt, but do not establish a throughput or latency gain under serving load.
+
+Normalization, residual addition, feed-forward activation, and the output projection boundary still return to the CPU between Metal commands. CPU weights remain loaded beside GPU buffers. The entire decoder is therefore not GPU-resident yet.

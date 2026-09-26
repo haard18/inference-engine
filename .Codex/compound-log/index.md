@@ -8,6 +8,7 @@
 - [Model splitting](plans/model-splitting.md)
 - [Repeated worker recovery](plans/worker-recovery.md)
 - [Metal attention and key/value state](plans/metal-attention.md)
+- [Metal projection-to-attention boundary](plans/metal-projection-attention.md)
 
 ## Learnings
 
@@ -39,6 +40,7 @@
 - [Split serving readiness](learnings/2026-09-26-split-readiness.md)
 - [Repeated worker recovery](learnings/2026-09-26-worker-recovery.md)
 - [Metal attention and key/value state](learnings/2026-09-26-metal-attention.md)
+- [Metal projection-to-attention boundary](learnings/2026-09-26-metal-projection-attention.md)
 
 ## Reviews
 
@@ -69,3 +71,4 @@
 - [Split readiness review](reviews/2026-09-26-split-readiness.md)
 - [Worker recovery review](reviews/2026-09-26-worker-recovery.md)
 - [Metal attention review](reviews/2026-09-26-metal-attention.md)
+- [Metal projection-to-attention review](reviews/2026-09-26-metal-projection-attention.md)

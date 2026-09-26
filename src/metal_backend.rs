@@ -26,6 +26,26 @@ struct AttentionParams {
     sequence_length: u32,
 }
 
+#[repr(C)]
+struct RopeParams {
+    head_count: u32,
+    kv_head_count: u32,
+    head_size: u32,
+    kv_size: u32,
+    position: u32,
+    interleaved: u32,
+}
+
+pub(crate) struct AttentionStep<'a> {
+    pub(crate) position: usize,
+    pub(crate) head_count: usize,
+    pub(crate) kv_head_count: usize,
+    pub(crate) matrices: (&'a Matrix, &'a Matrix, &'a Matrix),
+    pub(crate) normalized: &'a [f32],
+    pub(crate) rotations: &'a [f32],
+    pub(crate) interleaved: bool,
+}
+
 #[derive(Default)]
 struct MetalLayerCache {
     keys: Option<Buffer>,
@@ -61,6 +81,56 @@ impl MetalKvCache {
             )
         })
     }
+
+    fn layer_at(
+        &mut self,
+        device: &Device,
+        layer_index: usize,
+        position: usize,
+    ) -> Result<&MetalLayerCache, EngineError> {
+        if position >= self.max_positions {
+            return Err(EngineError::ContextFull);
+        }
+        let layer = self
+            .layers
+            .get_mut(layer_index)
+            .ok_or(EngineError::InvalidConfig("Metal attention layer"))?;
+        if layer.capacity <= position {
+            let mut capacity = layer.capacity.max(16).min(self.max_positions);
+            while capacity <= position {
+                capacity = capacity.saturating_mul(2).min(self.max_positions);
+            }
+            let bytes = capacity
+                .checked_mul(self.kv_size)
+                .and_then(|values| values.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| EngineError::Backend("Metal cache size overflow".into()))?;
+            if bytes as u64 > device.max_buffer_length() {
+                return Err(EngineError::Backend("Metal cache buffer limit".into()));
+            }
+            let keys = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            let values = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            let old_bytes = position * self.kv_size * size_of::<f32>();
+            if let (Some(old_keys), Some(old_values)) = (&layer.keys, &layer.values) {
+                // The session has completed all earlier GPU commands before growth.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        old_keys.contents().cast::<u8>(),
+                        keys.contents().cast::<u8>(),
+                        old_bytes,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        old_values.contents().cast::<u8>(),
+                        values.contents().cast::<u8>(),
+                        old_bytes,
+                    );
+                }
+            }
+            layer.keys = Some(keys);
+            layer.values = Some(values);
+            layer.capacity = capacity;
+        }
+        Ok(layer)
+    }
 }
 
 pub(crate) struct MetalBackend<'a> {
@@ -68,6 +138,7 @@ pub(crate) struct MetalBackend<'a> {
     device: Device,
     queue: CommandQueue,
     pipeline: ComputePipelineState,
+    rotate_and_store: ComputePipelineState,
     attention_scores: ComputePipelineState,
     attention_reduce: ComputePipelineState,
     weights: HashMap<usize, (Buffer, u32)>,
@@ -111,6 +182,12 @@ impl<'a> MetalBackend<'a> {
         let attention_scores = device
             .new_compute_pipeline_state_with_function(&scores_function)
             .map_err(|error| EngineError::Backend(format!("Metal attention pipeline: {error}")))?;
+        let rotate_function = library
+            .get_function("rotate_and_store", None)
+            .map_err(|error| EngineError::Backend(format!("Metal function: {error}")))?;
+        let rotate_and_store = device
+            .new_compute_pipeline_state_with_function(&rotate_function)
+            .map_err(|error| EngineError::Backend(format!("Metal rotary pipeline: {error}")))?;
         let reduce_function = library
             .get_function("attention_reduce", None)
             .map_err(|error| EngineError::Backend(format!("Metal function: {error}")))?;
@@ -138,139 +215,181 @@ impl<'a> MetalBackend<'a> {
             device,
             queue,
             pipeline,
+            rotate_and_store,
             attention_scores,
             attention_reduce,
             weights,
         })
     }
 
-    pub(crate) fn attend(
+    pub(crate) fn project_and_attend(
         &mut self,
         cache: &mut MetalKvCache,
         layer_index: usize,
-        position: usize,
-        head_count: usize,
-        kv_head_count: usize,
-        vectors: (&[f32], &[f32], &[f32]),
+        step: AttentionStep<'_>,
     ) -> Result<Vec<f32>, EngineError> {
-        let (query, key, value) = vectors;
-        if head_count == 0 {
+        let (query_matrix, key_matrix, value_matrix) = step.matrices;
+        let kv_size = cache.kv_size;
+        if step.head_count == 0 || step.kv_head_count == 0 {
             return Err(EngineError::InvalidConfig("Metal attention dimensions"));
         }
-        let head_size = query.len() / head_count;
-        if position >= cache.max_positions
-            || kv_head_count == 0
-            || !head_count.is_multiple_of(kv_head_count)
-            || query.len() != head_count * head_size
-            || head_size == 0
-            || key.len() != cache.kv_size
-            || value.len() != cache.kv_size
-            || cache.kv_size != kv_head_count * head_size
+        let head_size = query_matrix.rows() / step.head_count;
+        if head_size == 0
+            || !head_size.is_multiple_of(2)
+            || !step.head_count.is_multiple_of(step.kv_head_count)
+            || query_matrix.rows() != step.head_count * head_size
+            || key_matrix.rows() != kv_size
+            || value_matrix.rows() != kv_size
+            || kv_size != step.kv_head_count * head_size
+            || step.rotations.len() != head_size
+            || [query_matrix, key_matrix, value_matrix]
+                .iter()
+                .any(|matrix| matrix.cols() != step.normalized.len())
         {
             return Err(EngineError::InvalidConfig("Metal attention dimensions"));
         }
-        let layer = cache
-            .layers
-            .get_mut(layer_index)
-            .ok_or(EngineError::InvalidConfig("Metal attention layer"))?;
-        if layer.capacity <= position {
-            let mut capacity = layer.capacity.max(16).min(cache.max_positions);
-            while capacity <= position {
-                capacity = capacity.saturating_mul(2).min(cache.max_positions);
-            }
-            let bytes = capacity
-                .checked_mul(cache.kv_size)
-                .and_then(|values| values.checked_mul(size_of::<f32>()))
-                .ok_or_else(|| EngineError::Backend("Metal cache size overflow".into()))?;
-            if bytes as u64 > self.device.max_buffer_length() {
-                return Err(EngineError::Backend("Metal cache buffer limit".into()));
-            }
-            let keys = self
-                .device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-            let values = self
-                .device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-            let old_bytes = position * cache.kv_size * size_of::<f32>();
-            if let (Some(old_keys), Some(old_values)) = (&layer.keys, &layer.values) {
-                // All prior commands have completed before a cache buffer grows.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        old_keys.contents().cast::<u8>(),
-                        keys.contents().cast::<u8>(),
-                        old_bytes,
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        old_values.contents().cast::<u8>(),
-                        values.contents().cast::<u8>(),
-                        old_bytes,
-                    );
-                }
-            }
-            layer.keys = Some(keys);
-            layer.values = Some(values);
-            layer.capacity = capacity;
-        }
-        let keys = layer.keys.as_ref().expect("cache keys allocated");
-        let values = layer.values.as_ref().expect("cache values allocated");
-        let slot = position * cache.kv_size;
-        // Shared Metal buffers are CPU writable before submitting the command.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                key.as_ptr(),
-                keys.contents().cast::<f32>().add(slot),
-                cache.kv_size,
-            );
-            std::ptr::copy_nonoverlapping(
-                value.as_ptr(),
-                values.contents().cast::<f32>().add(slot),
-                cache.kv_size,
-            );
-        }
-        let sequence_length = position + 1;
         let params = AttentionParams {
-            head_count: u32::try_from(head_count)
+            head_count: u32::try_from(step.head_count)
                 .map_err(|_| EngineError::Backend("too many attention heads".into()))?,
-            kv_head_count: u32::try_from(kv_head_count)
+            kv_head_count: u32::try_from(step.kv_head_count)
                 .map_err(|_| EngineError::Backend("too many key/value heads".into()))?,
             head_size: u32::try_from(head_size)
                 .map_err(|_| EngineError::Backend("attention head too wide".into()))?,
-            kv_size: u32::try_from(cache.kv_size)
+            kv_size: u32::try_from(kv_size)
                 .map_err(|_| EngineError::Backend("key/value state too wide".into()))?,
-            sequence_length: u32::try_from(sequence_length)
+            sequence_length: u32::try_from(step.position + 1)
                 .map_err(|_| EngineError::Backend("context too long for Metal".into()))?,
         };
-        let score_count = head_count
-            .checked_mul(sequence_length)
+        let rope_params = RopeParams {
+            head_count: params.head_count,
+            kv_head_count: params.kv_head_count,
+            head_size: params.head_size,
+            kv_size: params.kv_size,
+            position: u32::try_from(step.position)
+                .map_err(|_| EngineError::Backend("context too long for Metal".into()))?,
+            interleaved: u32::from(step.interleaved),
+        };
+        let score_count = step
+            .head_count
+            .checked_mul(step.position + 1)
             .ok_or_else(|| EngineError::Backend("Metal score size overflow".into()))?;
         u32::try_from(score_count)
             .map_err(|_| EngineError::Backend("too many Metal attention scores".into()))?;
-        u32::try_from(query.len())
-            .map_err(|_| EngineError::Backend("Metal attention output too wide".into()))?;
-        let score_bytes = score_count
-            .checked_mul(size_of::<f32>())
-            .ok_or_else(|| EngineError::Backend("Metal score size overflow".into()))?;
-        let output_bytes = size_of_val(query);
-        if score_bytes as u64 > self.device.max_buffer_length()
-            || output_bytes as u64 > self.device.max_buffer_length()
+        let rotation_threads = step
+            .head_count
+            .checked_add(step.kv_head_count)
+            .ok_or_else(|| EngineError::Backend("Metal rotary size overflow".into()))?
+            .checked_mul(head_size / 2)
+            .ok_or_else(|| EngineError::Backend("Metal rotary size overflow".into()))?
+            .max(kv_size);
+        u32::try_from(rotation_threads)
+            .map_err(|_| EngineError::Backend("Metal rotary grid too large".into()))?;
+        let f32_bytes = |count: usize| {
+            count
+                .checked_mul(size_of::<f32>())
+                .ok_or_else(|| EngineError::Backend("Metal attention size overflow".into()))
+        };
+        let query_bytes = f32_bytes(query_matrix.rows())?;
+        let kv_bytes = f32_bytes(kv_size)?;
+        let score_bytes = f32_bytes(score_count)?;
+        let input_bytes = size_of_val(step.normalized);
+        if [
+            query_bytes,
+            kv_bytes,
+            score_bytes,
+            input_bytes,
+            size_of_val(step.rotations),
+        ]
+        .iter()
+        .any(|&bytes| bytes as u64 > self.device.max_buffer_length())
         {
             return Err(EngineError::Backend("Metal attention buffer limit".into()));
         }
-        let query_buffer = self.device.new_buffer_with_data(
-            query.as_ptr().cast(),
-            output_bytes as u64,
+        let layer = cache.layer_at(&self.device, layer_index, step.position)?;
+        let keys = layer.keys.as_ref().expect("cache keys allocated");
+        let values = layer.values.as_ref().expect("cache values allocated");
+        let input = self.device.new_buffer_with_data(
+            step.normalized.as_ptr().cast(),
+            input_bytes as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        let rotations = self.device.new_buffer_with_data(
+            step.rotations.as_ptr().cast(),
+            size_of_val(step.rotations) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let query = self
+            .device
+            .new_buffer(query_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let key = self
+            .device
+            .new_buffer(kv_bytes as u64, MTLResourceOptions::StorageModeShared);
+        let value = self
+            .device
+            .new_buffer(kv_bytes as u64, MTLResourceOptions::StorageModeShared);
         let scores = self
             .device
             .new_buffer(score_bytes as u64, MTLResourceOptions::StorageModeShared);
         let output = self
             .device
-            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
+            .new_buffer(query_bytes as u64, MTLResourceOptions::StorageModeShared);
+
         let command = self.queue.new_command_buffer();
+        let projection = command.new_compute_command_encoder();
+        projection.set_compute_pipeline_state(&self.pipeline);
+        projection.set_buffer(1, Some(&input), 0);
+        for (matrix, target) in [query_matrix, key_matrix, value_matrix]
+            .into_iter()
+            .zip([&query, &key, &value])
+        {
+            let (weight, kind) = self
+                .weights
+                .get(&(matrix as *const Matrix as usize))
+                .ok_or_else(|| EngineError::Backend("matrix was not uploaded to Metal".into()))?;
+            let matrix_params = Params {
+                rows: u32::try_from(matrix.rows())
+                    .map_err(|_| EngineError::Backend("matrix has too many rows".into()))?,
+                cols: u32::try_from(matrix.cols())
+                    .map_err(|_| EngineError::Backend("matrix has too many columns".into()))?,
+                kind: *kind,
+                reserved: 0,
+            };
+            projection.set_buffer(0, Some(weight), 0);
+            projection.set_buffer(2, Some(target), 0);
+            projection.set_bytes(
+                3,
+                size_of::<Params>() as u64,
+                (&matrix_params as *const Params).cast(),
+            );
+            projection.dispatch_threads(
+                MTLSize::new(u64::from(matrix_params.rows), 1, 1),
+                MTLSize::new(self.pipeline.thread_execution_width(), 1, 1),
+            );
+        }
+        projection.end_encoding();
+
+        let rotary = command.new_compute_command_encoder();
+        rotary.set_compute_pipeline_state(&self.rotate_and_store);
+        rotary.set_buffer(0, Some(&query), 0);
+        rotary.set_buffer(1, Some(&key), 0);
+        rotary.set_buffer(2, Some(&value), 0);
+        rotary.set_buffer(3, Some(keys), 0);
+        rotary.set_buffer(4, Some(values), 0);
+        rotary.set_buffer(5, Some(&rotations), 0);
+        rotary.set_bytes(
+            6,
+            size_of::<RopeParams>() as u64,
+            (&rope_params as *const RopeParams).cast(),
+        );
+        rotary.dispatch_threads(
+            MTLSize::new(rotation_threads as u64, 1, 1),
+            MTLSize::new(self.rotate_and_store.thread_execution_width(), 1, 1),
+        );
+        rotary.end_encoding();
+
         let score_encoder = command.new_compute_command_encoder();
         score_encoder.set_compute_pipeline_state(&self.attention_scores);
-        score_encoder.set_buffer(0, Some(&query_buffer), 0);
+        score_encoder.set_buffer(0, Some(&query), 0);
         score_encoder.set_buffer(1, Some(keys), 0);
         score_encoder.set_buffer(2, Some(&scores), 0);
         score_encoder.set_bytes(
@@ -283,6 +402,7 @@ impl<'a> MetalBackend<'a> {
             MTLSize::new(self.attention_scores.thread_execution_width(), 1, 1),
         );
         score_encoder.end_encoding();
+
         let reduce_encoder = command.new_compute_command_encoder();
         reduce_encoder.set_compute_pipeline_state(&self.attention_reduce);
         reduce_encoder.set_buffer(0, Some(&scores), 0);
@@ -294,10 +414,11 @@ impl<'a> MetalBackend<'a> {
             (&params as *const AttentionParams).cast(),
         );
         reduce_encoder.dispatch_threads(
-            MTLSize::new(query.len() as u64, 1, 1),
+            MTLSize::new(query_matrix.rows() as u64, 1, 1),
             MTLSize::new(self.attention_reduce.thread_execution_width(), 1, 1),
         );
         reduce_encoder.end_encoding();
+
         command.commit();
         command.wait_until_completed();
         if command.status() != MTLCommandBufferStatus::Completed {
@@ -307,7 +428,8 @@ impl<'a> MetalBackend<'a> {
             )));
         }
         Ok(unsafe {
-            std::slice::from_raw_parts(output.contents().cast::<f32>(), query.len()).to_vec()
+            std::slice::from_raw_parts(output.contents().cast::<f32>(), query_matrix.rows())
+                .to_vec()
         })
     }
 

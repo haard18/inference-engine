@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use crate::metal_backend::{MetalBackend, MetalKvCache};
+use crate::metal_backend::{AttentionStep, MetalBackend, MetalKvCache};
 use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
@@ -451,34 +451,30 @@ impl Model {
         let head_count = self.config.num_attention_heads;
         let kv_head_count = self.config.num_key_value_heads;
         let head_size = self.config.hidden_size / head_count;
+        let mut rotations = Vec::with_capacity(head_size);
+        for index in 0..head_size / 2 {
+            let frequency = self
+                .config
+                .rope_theta
+                .powf(-((2 * index) as f32) / head_size as f32);
+            let (sine, cosine) = (position as f32 * frequency).sin_cos();
+            rotations.extend([sine, cosine]);
+        }
         for (layer_index, layer) in self.weights.layers.iter().enumerate() {
             let normalized =
                 rms_norm(&hidden, &layer.attention_norm, self.config.rms_norm_epsilon)?;
-            let [mut query, mut key, value]: [Vec<f32>; 3] = backend
-                .mul_vec_many(&[&layer.query, &layer.key, &layer.value], &normalized)?
-                .try_into()
-                .map_err(|_| EngineError::Backend("attention projection count".into()))?;
-            for head in query.chunks_exact_mut(head_size) {
-                if self.config.rope_interleaved {
-                    apply_rope_interleaved(head, position, self.config.rope_theta);
-                } else {
-                    apply_rope(head, position, self.config.rope_theta);
-                }
-            }
-            for head in key.chunks_exact_mut(head_size) {
-                if self.config.rope_interleaved {
-                    apply_rope_interleaved(head, position, self.config.rope_theta);
-                } else {
-                    apply_rope(head, position, self.config.rope_theta);
-                }
-            }
-            let attended = backend.attend(
+            let attended = backend.project_and_attend(
                 metal_cache,
                 layer_index,
-                position,
-                head_count,
-                kv_head_count,
-                (&query, &key, &value),
+                AttentionStep {
+                    position,
+                    head_count,
+                    kv_head_count,
+                    matrices: (&layer.query, &layer.key, &layer.value),
+                    normalized: &normalized,
+                    rotations: &rotations,
+                    interleaved: self.config.rope_interleaved,
+                },
             )?;
             let attention_output = backend.mul_vec_many(&[&layer.attention_output], &attended)?;
             add_in_place(
