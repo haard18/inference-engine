@@ -12,6 +12,24 @@ A Rust inference engine for language models on user-owned devices. The engine lo
 
 The first real checkpoint target is SmolLM2-135M. We will carry one model family through the engine and serving layers before adding another family. llama.cpp is a reference and benchmark, not the implementation blueprint. We will measure performance and reliability before making comparative claims.
 
+## llama.cpp reference
+
+Build a local `llama-completion` from a pinned llama.cpp checkout, then compare fresh-process generation with the same GGUF file, prompt, token limit, and greedy settings:
+
+```sh
+cargo build --release --bin gguf-probe
+python3 scripts/llama-reference.py \
+  /path/to/SmolLM2-135M-Q4_K_M.gguf \
+  target/release/gguf-probe \
+  /path/to/llama.cpp/build/bin/llama-completion \
+  --trials 5 --metal
+# Omit --metal for the two CPU paths.
+```
+
+The script warms each binary once, alternates their order, and records the median wall time for a new process. Each measured run includes model loading and generation. It also records a model hash and a generated-text hash. Inspect `text_matches` before comparing times. This is a command-line latency check; it does not measure a warm serving process or concurrent throughput.
+
+With llama.cpp commit `81bc6b83f827df746eb129235488d325c49cae52` and the local Q4_K_M file whose SHA-256 starts `e3131339bf4e`, five Metal runs gave median times of 0.268 s for this engine and 0.160 s for llama.cpp. Both produced the same eight-token text for `Hello`. The CPU runs gave 0.571 s and 0.152 s, but their text differed. A direct first-token score comparison against llama.cpp Metal found a mean absolute difference of 0.00084 across 49,152 scores for Q4_K_M and 0.00161 for Q8_0; the highest token matched in both cases. The llama.cpp CPU path gave different scores and highest tokens. Its quantized CPU vector operations use quantized activation inputs, which is a plausible source of this difference; the present measurements do not isolate every numerical cause. These small, fresh-process runs establish a reproducible reference, not a general speed or quality ranking.
+
 ## Current milestone
 
 The Rust library runs a Llama-style decoder on the CPU, with an optional Metal path for matrix operations and attention on Macs. It owns the tensor calculations, grouped-query attention, rotary positions, RMS normalization, feed-forward layers, per-request KV cache, greedy token selection, and a byte-level BPE tokenizer for the supported SmolLM2 layout. It loads Llama-style configuration and Safetensors weights in f32, f16, or bf16 format. It also loads the supported Llama-style GGUF layout with Q8_0 or mixed Q4_K_M matrices, interleaved rotary positions, and tokenizer metadata. Matrix weights retain their source precision in CPU memory, while activations and accumulations use f32. The command-line probes accept token IDs or text. A local server now offers an authenticated subset of the OpenAI chat completion API with ordinary and streaming responses.
