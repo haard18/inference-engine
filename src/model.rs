@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::metal_backend::{MetalBackend, MetalKvCache};
 use crate::tensor::{apply_rope, apply_rope_interleaved, rms_norm, silu, softmax};
 use crate::{EngineError, Matrix};
 use std::mem::size_of;
@@ -423,6 +425,95 @@ impl Model {
     ) -> Result<Vec<f32>, EngineError> {
         let all_layers = 0..self.config.num_layers;
         self.forward_token_ranges(token_id, cache, std::slice::from_ref(&all_layers), multiply)
+    }
+
+    /// Metal matrix operations and attention share one command queue, while each
+    /// generation session owns the key/value buffers used by attention.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn forward_token_metal(
+        &self,
+        token_id: usize,
+        cache: &mut KvCache,
+        metal_cache: &mut MetalKvCache,
+        backend: &mut MetalBackend<'_>,
+    ) -> Result<Vec<f32>, EngineError> {
+        if token_id >= self.config.vocab_size {
+            return Err(EngineError::InvalidToken(token_id));
+        }
+        if cache.position >= self.config.max_positions {
+            return Err(EngineError::ContextFull);
+        }
+        if !cache.layers.is_empty() {
+            return Err(EngineError::InvalidConfig("Metal cache has CPU layers"));
+        }
+        let position = cache.position;
+        let mut hidden = self.embed_token(token_id)?;
+        let head_count = self.config.num_attention_heads;
+        let kv_head_count = self.config.num_key_value_heads;
+        let head_size = self.config.hidden_size / head_count;
+        for (layer_index, layer) in self.weights.layers.iter().enumerate() {
+            let normalized =
+                rms_norm(&hidden, &layer.attention_norm, self.config.rms_norm_epsilon)?;
+            let [mut query, mut key, value]: [Vec<f32>; 3] = backend
+                .mul_vec_many(&[&layer.query, &layer.key, &layer.value], &normalized)?
+                .try_into()
+                .map_err(|_| EngineError::Backend("attention projection count".into()))?;
+            for head in query.chunks_exact_mut(head_size) {
+                if self.config.rope_interleaved {
+                    apply_rope_interleaved(head, position, self.config.rope_theta);
+                } else {
+                    apply_rope(head, position, self.config.rope_theta);
+                }
+            }
+            for head in key.chunks_exact_mut(head_size) {
+                if self.config.rope_interleaved {
+                    apply_rope_interleaved(head, position, self.config.rope_theta);
+                } else {
+                    apply_rope(head, position, self.config.rope_theta);
+                }
+            }
+            let attended = backend.attend(
+                metal_cache,
+                layer_index,
+                position,
+                head_count,
+                kv_head_count,
+                (&query, &key, &value),
+            )?;
+            let attention_output = backend.mul_vec_many(&[&layer.attention_output], &attended)?;
+            add_in_place(
+                &mut hidden,
+                attention_output
+                    .first()
+                    .ok_or_else(|| EngineError::Backend("missing attention output".into()))?,
+            );
+            let normalized = rms_norm(
+                &hidden,
+                &layer.feed_forward_norm,
+                self.config.rms_norm_epsilon,
+            )?;
+            let [gate, up]: [Vec<f32>; 2] = backend
+                .mul_vec_many(&[&layer.gate, &layer.up], &normalized)?
+                .try_into()
+                .map_err(|_| EngineError::Backend("feed-forward projection count".into()))?;
+            let activated: Vec<f32> = gate
+                .into_iter()
+                .zip(up)
+                .map(|(gate_value, up_value)| silu(gate_value) * up_value)
+                .collect();
+            let feed_forward_output = backend.mul_vec_many(&[&layer.down], &activated)?;
+            add_in_place(
+                &mut hidden,
+                feed_forward_output
+                    .first()
+                    .ok_or_else(|| EngineError::Backend("missing feed-forward output".into()))?,
+            );
+        }
+        let logits = self.project_logits(&hidden, &mut |matrices, input| {
+            backend.mul_vec_many(matrices, input)
+        })?;
+        cache.commit(Vec::new(), Vec::new());
+        Ok(logits)
     }
 
     fn forward_token_ranges(

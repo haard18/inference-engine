@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use crate::metal_backend::MetalBackend;
+use crate::metal_backend::{MetalBackend, MetalKvCache};
 use crate::model::KvCache;
 use crate::{EngineError, Model};
 use std::mem::size_of;
@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 enum Backend<'a> {
     Cpu(std::marker::PhantomData<&'a Model>),
     #[cfg(target_os = "macos")]
-    Metal(Arc<Mutex<MetalBackend<'a>>>),
+    Metal {
+        backend: Arc<Mutex<MetalBackend<'a>>>,
+        cache: MetalKvCache,
+    },
 }
 
 /// State for one token-generation request.
@@ -50,10 +53,18 @@ impl<'a> GenerationSession<'a> {
         backend: Arc<Mutex<MetalBackend<'a>>>,
     ) -> Self {
         Self {
-            cache: KvCache::new(model.config().num_layers),
+            cache: KvCache::new(0),
             next_logits: None,
             model,
-            backend: Backend::Metal(backend),
+            backend: Backend::Metal {
+                backend,
+                cache: MetalKvCache::new(
+                    model.config().num_layers,
+                    model.config().num_key_value_heads
+                        * (model.config().hidden_size / model.config().num_attention_heads),
+                    model.config().max_positions,
+                ),
+            },
         }
     }
 
@@ -84,6 +95,11 @@ impl<'a> GenerationSession<'a> {
                 .next_logits
                 .as_ref()
                 .map_or(0, |logits| logits.capacity() * size_of::<f32>())
+            + match &self.backend {
+                Backend::Cpu(_) => 0,
+                #[cfg(target_os = "macos")]
+                Backend::Metal { cache, .. } => cache.allocated_bytes(),
+            }
     }
 
     pub fn prefill(&mut self, tokens: &[usize]) -> Result<(), EngineError> {
@@ -152,14 +168,12 @@ impl<'a> GenerationSession<'a> {
                     })
             }
             #[cfg(target_os = "macos")]
-            Backend::Metal(backend) => {
+            Backend::Metal { backend, cache } => {
+                let mut backend = backend
+                    .lock()
+                    .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?;
                 self.model
-                    .forward_token(token, &mut self.cache, |matrices, input| {
-                        backend
-                            .lock()
-                            .map_err(|_| EngineError::Backend("Metal runtime lock failed".into()))?
-                            .mul_vec_many(matrices, input)
-                    })
+                    .forward_token_metal(token, &mut self.cache, cache, &mut backend)
             }
         }
     }

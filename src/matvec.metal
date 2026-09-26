@@ -8,6 +8,14 @@ struct Params {
     uint reserved;
 };
 
+struct AttentionParams {
+    uint head_count;
+    uint kv_head_count;
+    uint head_size;
+    uint kv_size;
+    uint sequence_length;
+};
+
 static float half_at(device const uchar *bytes, uint offset) {
     ushort bits = ushort(bytes[offset]) | (ushort(bytes[offset + 1]) << 8);
     return float(as_type<half>(bits));
@@ -94,4 +102,51 @@ kernel void matvec(
         }
     }
     output[row] = sum;
+}
+
+kernel void attention_scores(
+    device const float *query [[buffer(0)]],
+    device const float *keys [[buffer(1)]],
+    device float *scores [[buffer(2)]],
+    constant AttentionParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    uint total = params.head_count * params.sequence_length;
+    if (index >= total) return;
+    uint head = index / params.sequence_length;
+    uint step = index % params.sequence_length;
+    uint kv_head = head / (params.head_count / params.kv_head_count);
+    uint query_start = head * params.head_size;
+    uint key_start = step * params.kv_size + kv_head * params.head_size;
+    float dot = 0.0f;
+    for (uint i = 0; i < params.head_size; ++i) {
+        dot += query[query_start + i] * keys[key_start + i];
+    }
+    scores[index] = dot * rsqrt(float(params.head_size));
+}
+
+kernel void attention_reduce(
+    device const float *scores [[buffer(0)]],
+    device const float *values [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant AttentionParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    uint hidden_size = params.head_count * params.head_size;
+    if (index >= hidden_size) return;
+    uint head = index / params.head_size;
+    uint offset = index % params.head_size;
+    uint kv_head = head / (params.head_count / params.kv_head_count);
+    uint value_offset = kv_head * params.head_size + offset;
+    uint score_start = head * params.sequence_length;
+    float maximum = -INFINITY;
+    for (uint step = 0; step < params.sequence_length; ++step) {
+        maximum = max(maximum, scores[score_start + step]);
+    }
+    float denominator = 0.0f;
+    float numerator = 0.0f;
+    for (uint step = 0; step < params.sequence_length; ++step) {
+        float weight = exp(scores[score_start + step] - maximum);
+        denominator += weight;
+        numerator += weight * values[step * params.kv_size + value_offset];
+    }
+    output[index] = numerator / denominator;
 }

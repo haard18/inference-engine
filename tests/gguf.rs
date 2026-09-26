@@ -177,19 +177,21 @@ fn real_gguf_metal_matches_cpu() {
         let model = load_gguf(directory.join(filename)).unwrap();
         let mut cpu = GenerationSession::new(&model);
         let mut metal = GenerationSession::on_metal(&model).expect("create Metal session");
-        cpu.prefill(&[1, 2, 3]).unwrap();
-        metal.prefill(&[1, 2, 3]).unwrap();
-        let cpu_scores = cpu.next_token_scores().unwrap();
-        let metal_scores = metal.next_token_scores().unwrap();
-        let largest_difference = cpu_scores
-            .iter()
-            .zip(metal_scores)
-            .map(|(left, right)| (left - right).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            largest_difference < 1e-3,
-            "{filename}: score difference {largest_difference}"
-        );
+        for (position, token) in [1, 2, 3, 30].into_iter().enumerate() {
+            cpu.prefill(&[token]).unwrap();
+            metal.prefill(&[token]).unwrap();
+            let largest_difference = cpu
+                .next_token_scores()
+                .unwrap()
+                .iter()
+                .zip(metal.next_token_scores().unwrap())
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                largest_difference < 1e-3,
+                "{filename}, position {position}: score difference {largest_difference}"
+            );
+        }
         assert_eq!(cpu.next_token().unwrap(), metal.next_token().unwrap());
     }
 }

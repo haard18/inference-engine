@@ -105,6 +105,32 @@ fn tiny_model_metal_matches_cpu() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn metal_attention_cache_grows_without_changing_scores() {
+    let model = model(32);
+    let runtime = MetalRuntime::new(&model).unwrap();
+    let mut cpu = GenerationSession::new(&model);
+    let mut metal = runtime.session();
+    for position in 0..20 {
+        let token = 1 + position % 6;
+        cpu.prefill(&[token]).unwrap();
+        metal.prefill(&[token]).unwrap();
+        for (index, (&actual, &expected)) in metal
+            .next_token_scores()
+            .unwrap()
+            .iter()
+            .zip(cpu.next_token_scores().unwrap())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "position {position}, score {index}: Metal {actual}, CPU {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn f16_model_metal_matches_cpu() {
     let square = Matrix::from_f16_bits(
         2,

@@ -29,6 +29,8 @@ Turn the engine library into a reliable local serving process. Preserve the engi
 - [ ] Explore model splitting across devices after whole-request routing works.
 - [ ] Improve the Metal path by keeping attention and KV state on the GPU and reducing synchronization.
 
+The Metal path now executes attention on the GPU and keeps per-session key/value state in growing Metal buffers. Normalization, rotary positions, and activation functions still run on the CPU, with a wait after each Metal operation. The remaining item is the synchronization and full-decoder work.
+
 ## Limits
 
 This API is an intentional subset of chat completions. It supports one model, one choice, greedy decoding, and text messages. It does not claim full OpenAI API compatibility. The local listener is loopback-only; an optional second listener accepts mutually approved peers over TLS. Pool routing is not implemented yet.

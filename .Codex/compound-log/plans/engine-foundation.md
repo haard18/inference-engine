@@ -40,6 +40,8 @@ Build the model execution core before device pooling. The core must produce corr
 - [x] Make uploaded Metal weights reusable across generation sessions.
 - [ ] Keep attention and KV state on the GPU and remove per-operation CPU/GPU synchronization.
 
+Metal attention and per-session key/value buffers now run through GPU commands. Matrix outputs still return to CPU for normalization, rotary positions, and activation functions, and each operation waits for completion. The remaining checkbox tracks removal of those synchronization points.
+
 ## Risks
 
 - Floating-point operation order can cause small differences. Record tolerances and compare intermediate outputs when needed.
